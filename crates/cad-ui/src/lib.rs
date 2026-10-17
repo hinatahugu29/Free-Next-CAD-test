@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use cad_core::{
     CadCommand, Document, DocumentController, FeatureId, FeatureKind, FeatureState, ParameterValue,
-    ScalarParam, SemanticReference, build_perforated_plate_mvp,
+    ScalarParam, SemanticReference, Sketch, build_perforated_plate_mvp,
 };
 use cad_geometry::{ShapeStore, TessellationOptions};
 use cad_render::{
@@ -76,6 +76,12 @@ pub struct FerroCadApp {
     /// Screen position where the floating on-canvas property editor should appear
     /// (set by double-clicking a face/edge directly in the 3D viewport).
     pub floating_editor_pos: Option<Pos2>,
+    /// When true, the central viewport switches from the 3D render to a flat 2D sketch
+    /// canvas: clicking places profile points (in millimeters on the sketch plane),
+    /// which are later closed into a loop and extruded via `cad_core`'s `Sketch` solver.
+    pub sketch_mode: bool,
+    pub sketch_points: Vec<[f64; 2]>,
+    pub sketch_depth: f64,
 }
 
 impl Default for FerroCadApp {
@@ -142,6 +148,9 @@ impl FerroCadApp {
             new_param_expr: String::new(),
             current_file_path: None,
             floating_editor_pos: None,
+            sketch_mode: false,
+            sketch_points: Vec::new(),
+            sketch_depth: 10.0,
         }
     }
 
@@ -368,6 +377,13 @@ impl FerroCadApp {
                         visible: true,
                         color_rgba: [0.75, 0.50, 0.85, 1.0],
                     });
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("✏ スケッチから押し出し... (2D描画)").clicked() {
+                    self.sketch_mode = true;
+                    self.sketch_points.clear();
+                    self.sketch_depth = 10.0;
                     ui.close_menu();
                 }
             });
@@ -836,6 +852,159 @@ impl FerroCadApp {
         }
     }
 
+    /// Flat 2D sketch canvas: click to place profile points on the sketch plane
+    /// (millimeters), then close the loop and extrude it into a real feature using
+    /// `cad_core`'s `Sketch` (the same constraint-solver-backed profile type the
+    /// parametric engine already understands — not a UI-only polygon).
+    fn render_sketch_canvas(&mut self, ctx: &Context, ui: &mut egui::Ui) {
+        const PX_PER_MM: f32 = 3.0;
+
+        let avail = ui.available_size();
+        let (rect, response) =
+            ui.allocate_exact_size(avail, Sense::click_and_drag());
+        let origin = rect.center();
+
+        let to_screen = |p: [f64; 2]| -> Pos2 {
+            Pos2::new(
+                origin.x + p[0] as f32 * PX_PER_MM,
+                origin.y - p[1] as f32 * PX_PER_MM,
+            )
+        };
+        let to_mm = |p: Pos2| -> [f64; 2] {
+            [
+                ((p.x - origin.x) / PX_PER_MM) as f64,
+                (-(p.y - origin.y) / PX_PER_MM) as f64,
+            ]
+        };
+
+        let painter = ui.painter();
+        painter.rect_filled(rect, 0.0, Color32::from_rgb(24, 27, 33));
+        // Light grid every 10mm so placed points can be read at a glance.
+        let grid_mm = 10.0;
+        let grid_px = grid_mm * PX_PER_MM;
+        let mut gx = origin.x % grid_px;
+        while gx < rect.width() {
+            let x = rect.min.x + gx;
+            painter.line_segment(
+                [Pos2::new(x, rect.min.y), Pos2::new(x, rect.max.y)],
+                egui::Stroke::new(1.0_f32, Color32::from_rgb(38, 42, 50)),
+            );
+            gx += grid_px;
+        }
+        let mut gy = origin.y % grid_px;
+        while gy < rect.height() {
+            let y = rect.min.y + gy;
+            painter.line_segment(
+                [Pos2::new(rect.min.x, y), Pos2::new(rect.max.x, y)],
+                egui::Stroke::new(1.0_f32, Color32::from_rgb(38, 42, 50)),
+            );
+            gy += grid_px;
+        }
+        painter.line_segment(
+            [Pos2::new(rect.min.x, origin.y), Pos2::new(rect.max.x, origin.y)],
+            egui::Stroke::new(1.5_f32, Color32::from_rgb(90, 60, 60)),
+        );
+        painter.line_segment(
+            [Pos2::new(origin.x, rect.min.y), Pos2::new(origin.x, rect.max.y)],
+            egui::Stroke::new(1.5_f32, Color32::from_rgb(60, 90, 60)),
+        );
+
+        if response.clicked()
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            self.sketch_points.push(to_mm(pos));
+        }
+
+        for pair in self.sketch_points.windows(2) {
+            painter.line_segment(
+                [to_screen(pair[0]), to_screen(pair[1])],
+                egui::Stroke::new(2.0_f32, Color32::from_rgb(120, 180, 255)),
+            );
+        }
+        if self.sketch_points.len() >= 3
+            && let (Some(first), Some(last)) =
+                (self.sketch_points.first(), self.sketch_points.last())
+        {
+            painter.line_segment(
+                [to_screen(*last), to_screen(*first)],
+                egui::Stroke::new(1.5_f32, Color32::from_rgb(120, 180, 255, ).gamma_multiply(0.5)),
+            );
+        }
+        for p in &self.sketch_points {
+            painter.circle_filled(to_screen(*p), 3.5, Color32::from_rgb(250, 200, 60));
+        }
+
+        let hud_rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 12.0), Vec2::new(420.0, 90.0));
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(hud_rect), |ui| {
+            egui::Frame::window(ui.style())
+                .fill(Color32::from_rgba_unmultiplied(22, 26, 34, 225))
+                .show(ui, |ui| {
+                    ui.label("✏ スケッチモード: クリックして輪郭の頂点を置いてください");
+                    ui.label(format!("頂点数: {}  (3点以上で押し出し可能)", self.sketch_points.len()));
+                    ui.horizontal(|ui| {
+                        ui.label("押し出し量:");
+                        ui.add(egui::DragValue::new(&mut self.sketch_depth).speed(0.5).suffix(" mm"));
+                    });
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                self.sketch_points.len() >= 3,
+                                egui::Button::new("✓ 閉じて押し出し"),
+                            )
+                            .clicked()
+                        {
+                            self.finish_sketch_extrude();
+                        }
+                        if ui.button("↶ 最後の点を取消").clicked() {
+                            self.sketch_points.pop();
+                        }
+                        if ui.button("✗ キャンセル (Esc)").clicked() {
+                            self.sketch_mode = false;
+                            self.sketch_points.clear();
+                        }
+                    });
+                });
+        });
+
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.sketch_mode = false;
+            self.sketch_points.clear();
+        }
+    }
+
+    /// Converts the in-progress 2D sketch polygon into a real `cad_core::Sketch` and
+    /// submits it as a `SketchExtrude` feature through the normal command pipeline, so it
+    /// participates in the dependency graph, undo/redo, and recompute like any other
+    /// feature.
+    fn finish_sketch_extrude(&mut self) {
+        if self.sketch_points.len() < 3 {
+            return;
+        }
+        let mut sketch = Sketch::new(format!(
+            "Sketch_{}",
+            self.controller.document.features.len() + 1
+        ));
+        let point_ids: Vec<_> = self
+            .sketch_points
+            .iter()
+            .map(|[x, y]| sketch.add_point(*x, *y))
+            .collect();
+        sketch.add_polyline(point_ids, true);
+
+        self.execute_cmd(CadCommand::AddFeature {
+            name: format!("SketchExtrude_{}", self.controller.document.features.len() + 1),
+            kind: FeatureKind::SketchExtrude {
+                sketch,
+                depth: ScalarParam::mm(self.sketch_depth.max(0.1)),
+            },
+            visible: true,
+            color_rgba: [0.55, 0.75, 0.95, 1.0],
+        });
+
+        self.sketch_mode = false;
+        self.sketch_points.clear();
+    }
+
     fn render_central_viewport(&mut self, ctx: &Context, ui: &mut egui::Ui) {
         let avail = ui.available_size();
         let width = (avail.x.max(64.0) as u32).min(2048);
@@ -1163,7 +1332,11 @@ impl eframe::App for FerroCadApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
-                self.render_central_viewport(ctx, ui);
+                if self.sketch_mode {
+                    self.render_sketch_canvas(ctx, ui);
+                } else {
+                    self.render_central_viewport(ctx, ui);
+                }
             });
 
         if self.show_command_palette {
