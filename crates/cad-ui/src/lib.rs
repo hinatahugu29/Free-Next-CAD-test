@@ -16,6 +16,46 @@ use egui::{
     TextureOptions, Vec2,
 };
 
+/// Installs a Japanese-capable font so UI text (feature names, status logs, parameter
+/// labels — all Japanese in this build) renders correctly instead of as tofu boxes.
+/// `egui`'s bundled default font has no CJK glyphs, so we load a system font file at
+/// startup and register it as a fallback behind the default proportional/monospace fonts.
+pub fn install_japanese_font(ctx: &egui::Context) {
+    const CANDIDATES: &[&str] = &[
+        r"C:\Windows\Fonts\NotoSansJP-Regular.ttf",
+        r"C:\Windows\Fonts\meiryo.ttc",
+        r"C:\Windows\Fonts\YuGothR.ttc",
+        r"C:\Windows\Fonts\msgothic.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+    ];
+
+    let Some(bytes) = CANDIDATES
+        .iter()
+        .find_map(|path| std::fs::read(path).ok())
+    else {
+        return;
+    };
+
+    let mut fonts = egui::FontDefinitions::default();
+    fonts
+        .font_data
+        .insert("jp_font".to_owned(), egui::FontData::from_owned(bytes).into());
+
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .push("jp_font".to_owned());
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .push("jp_font".to_owned());
+
+    ctx.set_fonts(fonts);
+}
+
 /// Main GUI application state for FerroCAD.
 pub struct FerroCadApp {
     pub controller: DocumentController,
