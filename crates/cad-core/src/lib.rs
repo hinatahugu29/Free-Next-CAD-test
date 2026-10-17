@@ -51,6 +51,13 @@ pub enum CoreError {
     NothingToRedo,
     #[error("Geometry error: {0}")]
     Geometry(#[from] GeometryError),
+    #[error(
+        "Feature {feature:?} could not re-identify a referenced edge/face after the upstream shape changed: {reason:?}"
+    )]
+    SemanticReferenceLost {
+        feature: FeatureId,
+        reason: ResolutionFailureReason,
+    },
 }
 
 /// Unique identifier for a [`Document`].
@@ -210,11 +217,19 @@ pub enum FeatureKind {
         input: FeatureId,
         radius: ScalarParam,
         edge_indices: Vec<u32>,
+        /// Stable semantic references captured when the edges were picked (Topological
+        /// Naming Problem mitigation); when present, these are re-resolved against the
+        /// upstream shape's *current* topology at recompute time instead of trusting
+        /// `edge_indices`, which can silently point at the wrong edge after upstream edits.
+        #[serde(default)]
+        semantic_refs: Vec<SemanticReference>,
     },
     Chamfer {
         input: FeatureId,
         distance: ScalarParam,
         edge_indices: Vec<u32>,
+        #[serde(default)]
+        semantic_refs: Vec<SemanticReference>,
     },
     LinearPattern {
         input: FeatureId,
@@ -989,6 +1004,38 @@ impl Document {
         Ok(report)
     }
 
+    /// Re-resolves stable [`SemanticReference`]s against an upstream feature's *current*
+    /// cached shape, returning the matching edge indices in the live topology. This is the
+    /// Topological Naming Problem mitigation surfaced to features: rather than trusting a
+    /// raw edge index that may now point at a different (or nonexistent) edge after an
+    /// upstream edit, each reference is re-identified by geometric signature, and any
+    /// ambiguous or missing match is reported as an explicit, actionable error instead of
+    /// silently filleting/chamfering the wrong edge.
+    fn resolve_semantic_edges(
+        &self,
+        upstream: FeatureId,
+        semantic_refs: &[SemanticReference],
+        store: &ShapeStore,
+    ) -> Result<Vec<u32>, CoreError> {
+        let shape_id = self
+            .features
+            .get(&upstream)
+            .and_then(|f| f.cached_shape)
+            .ok_or(CoreError::FeatureNotFound(upstream))?;
+
+        let mut resolved = Vec::with_capacity(semantic_refs.len());
+        for sem_ref in semantic_refs {
+            let edge = sem_ref
+                .resolve_edge(store, shape_id)
+                .map_err(|reason| CoreError::SemanticReferenceLost {
+                    feature: upstream,
+                    reason,
+                })?;
+            resolved.push(edge.index);
+        }
+        Ok(resolved)
+    }
+
     fn evaluate_feature_kind(
         &self,
         kind: &FeatureKind,
@@ -1128,10 +1175,14 @@ impl Document {
                 input,
                 radius,
                 edge_indices,
+                semantic_refs,
             } => {
                 let src = lookup_shape(*input)?;
                 let r = radius.evaluate(params)?;
-                if edge_indices.is_empty() {
+                if !semantic_refs.is_empty() {
+                    let resolved = self.resolve_semantic_edges(*input, semantic_refs, store)?;
+                    Ok(store.fillet_edges(src, &resolved, Length::mm(r))?)
+                } else if edge_indices.is_empty() {
                     Ok(store.fillet_all(src, Length::mm(r))?)
                 } else {
                     Ok(store.fillet_edges(src, edge_indices, Length::mm(r))?)
@@ -1141,10 +1192,14 @@ impl Document {
                 input,
                 distance,
                 edge_indices,
+                semantic_refs,
             } => {
                 let src = lookup_shape(*input)?;
                 let d = distance.evaluate(params)?;
-                if edge_indices.is_empty() {
+                if !semantic_refs.is_empty() {
+                    let resolved = self.resolve_semantic_edges(*input, semantic_refs, store)?;
+                    Ok(store.chamfer_edges(src, &resolved, Length::mm(d))?)
+                } else if edge_indices.is_empty() {
                     Ok(store.chamfer_all(src, Length::mm(d))?)
                 } else {
                     Ok(store.chamfer_edges(src, edge_indices, Length::mm(d))?)
@@ -1825,6 +1880,116 @@ fn parse_primary(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fillet/Chamfer features captured by [`SemanticReference`] re-identify their target
+    /// edge by geometric signature instead of a raw index, so they survive an upstream
+    /// dimension change; and when no edge matches any more, the failure is reported through
+    /// `CoreError::SemanticReferenceLost` rather than silently filleting the wrong edge.
+    #[test]
+    fn semantic_reference_survives_resize_and_reports_lost_reference() {
+        let mut store = ShapeStore::new();
+        let mut ctrl = DocumentController::new(Document::new("TNP Mitigation Test"));
+
+        let box_id = ctrl
+            .execute(
+                CadCommand::AddFeature {
+                    name: "Box".to_string(),
+                    kind: FeatureKind::Box {
+                        width: ScalarParam::mm(100.0),
+                        height: ScalarParam::mm(60.0),
+                        depth: ScalarParam::mm(10.0),
+                    },
+                    visible: true,
+                    color_rgba: [1.0, 1.0, 1.0, 1.0],
+                },
+                Some(&mut store),
+            )
+            .expect("add box")
+            .expect("box id");
+
+        ctrl.document
+            .recompute(&mut store, TessellationOptions::default())
+            .expect("recompute box");
+
+        let box_shape = ctrl.document.features[&box_id].cached_shape.expect("box shape");
+        let any_edge = store
+            .inspect_shape(box_shape)
+            .expect("inspect box")
+            .edges
+            .first()
+            .expect("box has edges")
+            .index;
+        let good_ref = SemanticReference::from_edge(box_id, &store, box_shape, any_edge)
+            .expect("capture semantic reference");
+
+        let fillet_id = ctrl
+            .execute(
+                CadCommand::AddFeature {
+                    name: "Fillet".to_string(),
+                    kind: FeatureKind::Fillet {
+                        input: box_id,
+                        radius: ScalarParam::mm(1.0),
+                        edge_indices: vec![any_edge],
+                        semantic_refs: vec![good_ref],
+                    },
+                    visible: true,
+                    color_rgba: [1.0, 1.0, 1.0, 1.0],
+                },
+                Some(&mut store),
+            )
+            .expect("add fillet")
+            .expect("fillet id");
+
+        let report1 = ctrl
+            .document
+            .recompute(&mut store, TessellationOptions::default())
+            .expect("recompute fillet");
+        assert!(
+            report1.is_all_clean(),
+            "fillet should resolve via semantic reference: {:?}",
+            report1.failed_features
+        );
+
+        // Resize the box: the raw edge index may now point at a different edge, but the
+        // semantic reference should still re-identify the geometrically equivalent edge.
+        ctrl.execute(
+            CadCommand::UpdateFeature {
+                id: box_id,
+                name: None,
+                kind: Some(FeatureKind::Box {
+                    width: ScalarParam::mm(180.0),
+                    height: ScalarParam::mm(90.0),
+                    depth: ScalarParam::mm(25.0),
+                }),
+                visible: None,
+                color_rgba: None,
+            },
+            Some(&mut store),
+        )
+        .expect("resize box");
+
+        let report2 = ctrl
+            .document
+            .recompute(&mut store, TessellationOptions::default())
+            .expect("recompute after resize");
+        assert!(
+            report2.is_all_clean(),
+            "fillet should survive resize via semantic reference: {:?}",
+            report2.failed_features
+        );
+        assert_eq!(ctrl.document.features[&fillet_id].state, FeatureState::Clean);
+
+        // A lost reference (e.g. the target shape disappeared) must surface as an
+        // explicit, actionable failure rather than silently filleting an arbitrary edge.
+        let bogus_err = CoreError::SemanticReferenceLost {
+            feature: box_id,
+            reason: ResolutionFailureReason::MissingTargetShape("shape removed".to_string()),
+        };
+        assert!(
+            bogus_err.to_string().contains("could not re-identify"),
+            "SemanticReferenceLost must produce a human-readable explanation: {bogus_err}"
+        );
+    }
 
     #[test]
     fn phase2_dag_incremental_recompute_and_blocked_state() {

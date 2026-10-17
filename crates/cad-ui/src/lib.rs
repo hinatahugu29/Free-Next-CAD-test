@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use cad_core::{
     CadCommand, Document, DocumentController, FeatureId, FeatureKind, FeatureState, ParameterValue,
-    ScalarParam, build_perforated_plate_mvp,
+    ScalarParam, SemanticReference, build_perforated_plate_mvp,
 };
 use cad_geometry::{ShapeStore, TessellationOptions};
 use cad_render::{
@@ -33,6 +33,9 @@ pub struct FerroCadApp {
     pub new_param_name: String,
     pub new_param_expr: String,
     pub current_file_path: Option<PathBuf>,
+    /// Screen position where the floating on-canvas property editor should appear
+    /// (set by double-clicking a face/edge directly in the 3D viewport).
+    pub floating_editor_pos: Option<Pos2>,
 }
 
 impl Default for FerroCadApp {
@@ -98,6 +101,7 @@ impl FerroCadApp {
             new_param_name: String::new(),
             new_param_expr: String::new(),
             current_file_path: None,
+            floating_editor_pos: None,
         }
     }
 
@@ -469,7 +473,10 @@ impl FerroCadApp {
         });
 
         ui.add_space(12.0);
-        ui.heading("🌳 フィーチャーツリー (Feature DAG)");
+        // A flat, chronological timeline rather than a nested tree: each feature is
+        // listed in the order it was created, so "what happened, in what order" stays
+        // readable without digging through nesting (UX concept B).
+        ui.heading("🕒 操作タイムライン (作成順)");
         ui.separator();
 
         let features_list: Vec<_> = self
@@ -729,12 +736,19 @@ impl FerroCadApp {
                     edge.centroid.x, edge.centroid.y, edge.centroid.z
                 ));
                 if ui.button("この辺に 1.5mm フィレットを追加").clicked() {
+                    // Capture a stable semantic reference for this edge (TNP mitigation):
+                    // later edits to upstream dimensions re-identify the edge by geometric
+                    // signature instead of trusting this raw index, which can drift.
+                    let semantic_refs = SemanticReference::from_edge(feat.id, &self.store, sid, edge_idx)
+                        .map(|r| vec![r])
+                        .unwrap_or_default();
                     self.execute_cmd(CadCommand::AddFeature {
                         name: format!("Fillet_Edge{edge_idx}"),
                         kind: FeatureKind::Fillet {
                             input: feat.id,
                             radius: ScalarParam::mm(1.5),
                             edge_indices: vec![edge_idx],
+                            semantic_refs,
                         },
                         visible: true,
                         color_rgba: feat.color_rgba,
@@ -823,8 +837,10 @@ impl FerroCadApp {
             }
         }
 
-        // 3D Raycast Picking on Click
-        if response.clicked()
+        // 3D Raycast Picking: single-click selects, double-click also opens
+        // a floating on-canvas property editor right at the clicked point
+        // (no need to go hunting through a side panel).
+        if (response.clicked() || response.double_clicked())
             && let Some(pos) = response.interact_pointer_pos()
         {
             let uv_x = ((pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
@@ -839,19 +855,26 @@ impl FerroCadApp {
                 self.render_config.selected_edge =
                     hit.nearest_edge_index.map(|eid| (hit.feature_id, eid));
                 self.status_logs.push(format!(
-                    "3D選択: Feature #{}, Face #{}{}",
-                    hit.feature_id.0,
-                    hit.face_index,
-                    hit.nearest_edge_index
-                        .map(|e| format!(", Edge #{e}"))
-                        .unwrap_or_default()
+                    "「{}」の面を選択しました",
+                    self.controller
+                        .document
+                        .features
+                        .get(&hit.feature_id)
+                        .map(|f| f.name.as_str())
+                        .unwrap_or("形状")
                 ));
+                if response.double_clicked() {
+                    self.floating_editor_pos = Some(pos);
+                }
             } else {
                 self.render_config.selected_face = None;
                 self.render_config.selected_edge = None;
+                self.floating_editor_pos = None;
             }
             self.viewport_dirty = true;
         }
+
+        self.render_floating_editor(ctx);
 
         // Top-Left HUD Overlay (View & Display Quick Controls)
         let hud_rect =
@@ -904,6 +927,88 @@ impl FerroCadApp {
                     });
                 });
         });
+    }
+
+    /// Floating property editor that appears directly at the point the user
+    /// double-clicked in the 3D viewport, so dimensions can be changed without
+    /// hunting through the side panel (UX concept C).
+    fn render_floating_editor(&mut self, ctx: &Context) {
+        let Some(pos) = self.floating_editor_pos else {
+            return;
+        };
+        let Some(fid) = self.render_config.selected_feature else {
+            self.floating_editor_pos = None;
+            return;
+        };
+        let Some(feat) = self.controller.document.features.get(&fid).cloned() else {
+            self.floating_editor_pos = None;
+            return;
+        };
+
+        let mut still_open = true;
+        let mut updated_kind = feat.kind.clone();
+        let mut kind_changed = false;
+
+        egui::Area::new(egui::Id::new("floating_property_editor"))
+            .fixed_pos(pos + Vec2::new(14.0, 14.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(220.0);
+                    ui.horizontal(|ui| {
+                        ui.strong(format!("{}", feat.name));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("×").clicked() {
+                                still_open = false;
+                            }
+                        });
+                    });
+                    ui.separator();
+                    match &mut updated_kind {
+                        FeatureKind::Box {
+                            width,
+                            height,
+                            depth,
+                        } => {
+                            kind_changed |= edit_scalar_param(ui, "幅", width);
+                            kind_changed |= edit_scalar_param(ui, "高さ", height);
+                            kind_changed |= edit_scalar_param(ui, "厚み", depth);
+                        }
+                        FeatureKind::Cylinder { radius, height } => {
+                            kind_changed |= edit_scalar_param(ui, "半径", radius);
+                            kind_changed |= edit_scalar_param(ui, "高さ", height);
+                        }
+                        FeatureKind::Sphere { radius } => {
+                            kind_changed |= edit_scalar_param(ui, "半径", radius);
+                        }
+                        FeatureKind::Fillet { radius, .. } => {
+                            kind_changed |= edit_scalar_param(ui, "フィレット半径", radius);
+                        }
+                        FeatureKind::Chamfer { distance, .. } => {
+                            kind_changed |= edit_scalar_param(ui, "面取り距離", distance);
+                        }
+                        _ => {
+                            ui.label("この形状はここでは編集できません。\n右側のプロパティパネルをご利用ください。");
+                        }
+                    }
+                    ui.add_space(4.0);
+                    ui.small("ダブルクリックした場所でそのまま編集できます");
+                });
+            });
+
+        if kind_changed {
+            self.execute_cmd(CadCommand::UpdateFeature {
+                id: feat.id,
+                name: None,
+                kind: Some(updated_kind),
+                visible: None,
+                color_rgba: None,
+            });
+        }
+
+        if !still_open || ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.floating_editor_pos = None;
+        }
     }
 }
 
