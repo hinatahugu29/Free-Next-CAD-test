@@ -488,7 +488,25 @@ impl FerroCadApp {
             .collect();
         let mut visibility_toggle: Option<(FeatureId, bool)> = None;
 
-        for feat in features_list {
+        // Dependency highlighting: only computed relative to the current selection, and
+        // only drawn as a lightweight tint + arrow note, so the timeline stays flat and
+        // readable instead of turning back into a nested tree (UX concept B).
+        let selected = self.render_config.selected_feature;
+        let direct_upstream: std::collections::HashSet<FeatureId> = selected
+            .and_then(|sid| self.controller.document.features.get(&sid))
+            .map(|f| f.kind.upstream_features().into_iter().collect())
+            .unwrap_or_default();
+        let direct_downstream: std::collections::HashSet<FeatureId> = selected
+            .map(|sid| {
+                features_list
+                    .iter()
+                    .filter(|f| f.kind.upstream_features().contains(&sid))
+                    .map(|f| f.id)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for feat in &features_list {
             ui.horizontal(|ui| {
                 let mut vis = feat.visible;
                 if ui
@@ -507,9 +525,25 @@ impl FerroCadApp {
                     FeatureState::Blocked { .. } => ("⊘ Blocked", Color32::from_rgb(235, 140, 60)),
                 };
 
-                let is_selected = self.render_config.selected_feature == Some(feat.id);
-                let label_text = format!("#{} {}", feat.id.0, feat.name);
-                if ui.selectable_label(is_selected, label_text).clicked() {
+                let is_selected = selected == Some(feat.id);
+                let rel_marker = if is_selected {
+                    ""
+                } else if direct_upstream.contains(&feat.id) {
+                    "↑ "
+                } else if direct_downstream.contains(&feat.id) {
+                    "↓ "
+                } else {
+                    "  "
+                };
+                let label_text = format!("{rel_marker}#{} {}", feat.id.0, feat.name);
+                let label = if direct_upstream.contains(&feat.id) {
+                    RichText::new(label_text).color(Color32::from_rgb(120, 180, 255))
+                } else if direct_downstream.contains(&feat.id) {
+                    RichText::new(label_text).color(Color32::from_rgb(255, 180, 110))
+                } else {
+                    RichText::new(label_text)
+                };
+                if ui.selectable_label(is_selected, label).clicked() {
                     self.render_config.selected_feature = Some(feat.id);
                     self.render_config.selected_face = None;
                     self.render_config.selected_edge = None;
@@ -517,6 +551,10 @@ impl FerroCadApp {
                 }
                 ui.colored_label(badge_color, badge);
             });
+        }
+        if selected.is_some() && (!direct_upstream.is_empty() || !direct_downstream.is_empty()) {
+            ui.add_space(4.0);
+            ui.small("↑ 選択中のフィーチャーが参照している元 / ↓ それを参照している先");
         }
 
         if let Some((fid, new_vis)) = visibility_toggle {
