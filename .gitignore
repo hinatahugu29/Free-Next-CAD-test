@@ -1,0 +1,34 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# C++ / CMake
+/build/
+/cmake-build-*/
+*.obj
+*.exe
+*.pdb
+*.dll
+*.lib
+
+# Reference large source repositories and archives
+/references/repos/
+/references/downloads/
+*.zip
+*.tar.gz
+*.tar.xz
+*.7z
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
