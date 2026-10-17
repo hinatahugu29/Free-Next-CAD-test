@@ -30,10 +30,10 @@ REPOSITORIES = {
     },
     "occt": {
         "name": "Open CASCADE Technology (OCCT)",
-        "url": "https://github.com/Open-CASCADE-Technology/OCCT.git",
-        "branch": "master",
+        "url": "https://github.com/Open-Cascade-SAS/OCCT.git",
+        "branch": "V7_8_1",
         "target_dir": "occt",
-        "description": "OCCT 公式ソースコード（B-Repカーネル・幾何演算・FFI参照用）"
+        "description": "OCCT 公式ソースコード v7.8.1（B-Repカーネル・幾何演算・FFI参照および最小ビルド用）"
     }
 }
 

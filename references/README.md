@@ -9,7 +9,7 @@
 | プロジェクト | リポジトリURL | 主な役割・参照目的 |
 |---|---|---|
 | **FreeCAD** | `https://github.com/FreeCAD/FreeCAD.git` | ・App/Guiの分離アーキテクチャ<br>・トポロジカルネーミング問題 (TNP) の追跡アルゴリズム<br>・Part / PartDesign / Sketcher のモデリングパイプライン |
-| **Open CASCADE (OCCT)** | `https://github.com/Open-CASCADE-Technology/OCCT.git` | ・幾何モデリングカーネル（B-Rep、ブーリアン演算、STEP入出力）<br>・C++ FFI境界設計に必要なヘッダー・クラス構造 |
+| **Open CASCADE (OCCT)** | `https://github.com/Open-Cascade-SAS/OCCT.git` (`V7_8_1`) | ・幾何モデリングカーネル（B-Rep、ブーリアン演算、STEP入出力）<br>・C++ FFI境界設計に必要なヘッダー・クラス構造 |
 | **opencascade.js / opencascade-rs** | `https://github.com/openscad/` など | ・Rustや他言語バインディングの先行設計例 |
 
 > **注意:** FreeCADやOCCTのリポジトリは履歴を含めると数GB〜十数GBのサイズになります。そのため、`references/repos/` は `.gitignore` に指定されており、**浅いクローン（`--depth 1`）** で取得することを推奨します。
