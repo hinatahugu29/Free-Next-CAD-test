@@ -1,0 +1,15 @@
+[package]
+name = "cad-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Headless CLI for FerroCAD verification, STEP I/O, and parametric modeling demos"
+
+[dependencies]
+cad-occt.workspace = true
+cad-geometry.workspace = true
+cad-core.workspace = true
+cad-render.workspace = true
+glam.workspace = true
+serde_json.workspace = true

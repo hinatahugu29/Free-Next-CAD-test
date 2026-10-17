@@ -1,0 +1,18 @@
+[package]
+name = "cad-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Desktop GUI for FerroCAD powered by egui / eframe and wgpu"
+
+[dependencies]
+cad-geometry.workspace = true
+cad-core.workspace = true
+cad-render.workspace = true
+eframe.workspace = true
+egui.workspace = true
+glam.workspace = true
+image.workspace = true
+rfd.workspace = true
+serde_json.workspace = true
