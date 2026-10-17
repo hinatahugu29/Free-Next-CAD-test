@@ -82,6 +82,11 @@ pub struct FerroCadApp {
     pub sketch_mode: bool,
     pub sketch_points: Vec<[f64; 2]>,
     pub sketch_depth: f64,
+    /// Snap new sketch points to the sketch's own vertices (to close loops exactly),
+    /// to the 10mm grid, and to the midpoints of edges belonging to other already-built
+    /// features (projected onto the sketch's XY plane) — a lightweight version of the
+    /// object-snap found in most CAD sketchers.
+    pub sketch_snap_enabled: bool,
 }
 
 impl Default for FerroCadApp {
@@ -151,7 +156,31 @@ impl FerroCadApp {
             sketch_mode: false,
             sketch_points: Vec::new(),
             sketch_depth: 10.0,
+            sketch_snap_enabled: true,
         }
+    }
+
+    /// Candidate snap points for the sketch canvas: midpoints of edges belonging to
+    /// every *other* feature's currently cached shape, projected onto the sketch's XY
+    /// plane (Z dropped). Centroids/midpoints are what `cad_geometry::Edge` exposes
+    /// today; true vertex endpoints would need the OCCT FFI bridge to additionally
+    /// report per-vertex positions, which it does not yet do.
+    fn sketch_snap_targets_from_existing_geometry(&self) -> Vec<[f64; 2]> {
+        let mut pts = Vec::new();
+        for feat in self.controller.document.features.values() {
+            if !feat.visible {
+                continue;
+            }
+            let Some(shape_id) = feat.cached_shape else {
+                continue;
+            };
+            if let Ok(shape) = self.store.inspect_shape(shape_id) {
+                for edge in &shape.edges {
+                    pts.push([edge.centroid.x, edge.centroid.y]);
+                }
+            }
+        }
+        pts
     }
 
     pub fn recompute_and_refresh(&mut self) {
@@ -909,10 +938,51 @@ impl FerroCadApp {
             egui::Stroke::new(1.5_f32, Color32::from_rgb(60, 90, 60)),
         );
 
+        // Snap candidates: the sketch's own vertices (closing the loop exactly), 10mm
+        // grid intersections, and edge midpoints of other already-built features.
+        const SNAP_RADIUS_PX: f32 = 9.0;
+        let existing_geometry_snaps = if self.sketch_snap_enabled {
+            self.sketch_snap_targets_from_existing_geometry()
+        } else {
+            Vec::new()
+        };
+        if self.sketch_snap_enabled {
+            for p in &existing_geometry_snaps {
+                let s = to_screen(*p);
+                if rect.contains(s) {
+                    let stroke = egui::Stroke::new(1.5_f32, Color32::from_rgb(90, 230, 210));
+                    painter.line_segment([s - Vec2::new(5.0, 0.0), s + Vec2::new(5.0, 0.0)], stroke);
+                    painter.line_segment([s - Vec2::new(0.0, 5.0), s + Vec2::new(0.0, 5.0)], stroke);
+                }
+            }
+        }
+
         if response.clicked()
             && let Some(pos) = response.interact_pointer_pos()
         {
-            self.sketch_points.push(to_mm(pos));
+            let mut snapped = to_mm(pos);
+            if self.sketch_snap_enabled {
+                let mut best: Option<(f32, [f64; 2])> = None;
+                let mut consider = |cand: [f64; 2]| {
+                    let d = to_screen(cand).distance(pos);
+                    if d <= SNAP_RADIUS_PX && best.is_none_or(|(bd, _)| d < bd) {
+                        best = Some((d, cand));
+                    }
+                };
+                for p in &self.sketch_points {
+                    consider(*p);
+                }
+                for p in &existing_geometry_snaps {
+                    consider(*p);
+                }
+                let grid_x = (snapped[0] / grid_mm as f64).round() * grid_mm as f64;
+                let grid_y = (snapped[1] / grid_mm as f64).round() * grid_mm as f64;
+                consider([grid_x, grid_y]);
+                if let Some((_, p)) = best {
+                    snapped = p;
+                }
+            }
+            self.sketch_points.push(snapped);
         }
 
         for pair in self.sketch_points.windows(2) {
@@ -934,17 +1004,42 @@ impl FerroCadApp {
             painter.circle_filled(to_screen(*p), 3.5, Color32::from_rgb(250, 200, 60));
         }
 
-        let hud_rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 12.0), Vec2::new(420.0, 90.0));
+        let hud_rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 12.0), Vec2::new(420.0, 150.0));
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(hud_rect), |ui| {
             egui::Frame::window(ui.style())
                 .fill(Color32::from_rgba_unmultiplied(22, 26, 34, 225))
                 .show(ui, |ui| {
                     ui.label("✏ スケッチモード: クリックして輪郭の頂点を置いてください");
                     ui.label(format!("頂点数: {}  (3点以上で押し出し可能)", self.sketch_points.len()));
-                    ui.horizontal(|ui| {
-                        ui.label("押し出し量:");
-                        ui.add(egui::DragValue::new(&mut self.sketch_depth).speed(0.5).suffix(" mm"));
-                    });
+                    ui.checkbox(
+                        &mut self.sketch_snap_enabled,
+                        "スナップ (自分の頂点 / 10mmグリッド / 他フィーチャーの辺の中点 ✛)",
+                    );
+
+                    // Inline dimensioning for the most recently drawn segment: typing an
+                    // exact length moves the last point along the segment's direction to
+                    // match it (the segment's endpoints are what gets written into the
+                    // final Sketch, so this is a real, baked-in length constraint).
+                    if self.sketch_points.len() >= 2 {
+                        let n = self.sketch_points.len();
+                        let [ax, ay] = self.sketch_points[n - 2];
+                        let [bx, by] = self.sketch_points[n - 1];
+                        let (dx, dy) = (bx - ax, by - ay);
+                        let mut len = (dx * dx + dy * dy).sqrt();
+                        ui.horizontal(|ui| {
+                            ui.label("最後の辺の長さ (拘束):");
+                            if ui
+                                .add(egui::DragValue::new(&mut len).speed(0.5).suffix(" mm").range(0.01..=100000.0))
+                                .changed()
+                                && (dx.abs() > 1e-9 || dy.abs() > 1e-9)
+                            {
+                                let seg_len = (dx * dx + dy * dy).sqrt().max(1e-9);
+                                let (ux, uy) = (dx / seg_len, dy / seg_len);
+                                self.sketch_points[n - 1] = [ax + ux * len, ay + uy * len];
+                            }
+                        });
+                    }
+
                     ui.horizontal(|ui| {
                         if ui
                             .add_enabled(
