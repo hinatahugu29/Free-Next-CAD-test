@@ -126,6 +126,7 @@ impl FerroCadApp {
                 let Ok(face) = SemanticReference::from_face(fid, &self.store, shape, index) else { return; };
                 ToolPanel::PushPull { input: fid, face, distance: 5.0 }
             }
+            ToolKind::SweepCircle => ToolPanel::SweepCircle { radius: 5.0, path: [0.0, 0.0, 50.0] },
         });
     }
 
@@ -158,6 +159,7 @@ impl FerroCadApp {
             ToolPanel::Heal { .. } => "✚ 形状を修復",
             ToolPanel::Loft { .. } => "⌁ ロフト",
             ToolPanel::PushPull { .. } => "↕ 面を押出し・引込み",
+            ToolPanel::SweepCircle { .. } => "⌒ Sweep（円形・直線）",
         };
         let mut confirm = false;
         let mut cancel = false;
@@ -366,6 +368,14 @@ impl FerroCadApp {
                         ui.label(format!("対象: 「{}」", self.feature_name(*input)));
                         ui.horizontal(|ui| { ui.label("距離:"); ui.add(egui::DragValue::new(distance).speed(0.5).suffix(" mm")); });
                         ui.small("プラスは法線方向へ追加、マイナスは引き込みます。平面面のみ対応です。");
+                    }
+                    ToolPanel::SweepCircle { radius, path } => {
+                        ui.horizontal(|ui| { ui.label("半径:"); ui.add(egui::DragValue::new(radius).range(0.01..=10000.0).suffix(" mm")); });
+                        ui.horizontal(|ui| {
+                            ui.label("パス XYZ:");
+                            for value in path { ui.add(egui::DragValue::new(value).speed(0.5).suffix(" mm")); }
+                        });
+                        ui.small("原点の円形断面を、指定した一本の直線パスへ沿って掃引します。");
                     }
                 }
 
@@ -607,6 +617,11 @@ impl FerroCadApp {
             ToolPanel::PushPull { input, face, distance } => self.add_replacing(
                 format!("PushPull_{n}"), FeatureKind::PushPull { input, face, distance: ScalarParam::Literal(distance) }, input, &[input],
             ),
+            ToolPanel::SweepCircle { radius, path } => self.execute_cmd(CadCommand::AddFeature {
+                name: format!("Sweep_{n}"),
+                kind: FeatureKind::SweepCircle { radius: ScalarParam::Literal(radius), dx: ScalarParam::Literal(path[0]), dy: ScalarParam::Literal(path[1]), dz: ScalarParam::Literal(path[2]) },
+                visible: true, color_rgba: [0.5, 0.75, 0.9, 1.0],
+            }),
         }
     }
 }

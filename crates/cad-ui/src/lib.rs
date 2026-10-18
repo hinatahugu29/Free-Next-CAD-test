@@ -256,6 +256,7 @@ pub enum ToolKind {
     Heal,
     Loft,
     PushPull,
+    SweepCircle,
 }
 
 /// What the sketch being started will become.
@@ -320,6 +321,7 @@ pub enum ToolPanel {
     Heal { input: FeatureId },
     Loft { lower: FeatureId, upper: Option<FeatureId>, distance: f64 },
     PushPull { input: FeatureId, face: SemanticReference, distance: f64 },
+    SweepCircle { radius: f64, path: [f64; 3] },
 }
 
 /// Action chosen from a timeline chip's right-click menu.
@@ -941,6 +943,9 @@ impl FerroCadApp {
                     }
                     if ribbon_button(ui, "↕", "押出し面", face_selected, "選択面を法線方向へ押出し・引込みます") {
                         self.open_tool_panel(ToolKind::PushPull);
+                    }
+                    if ribbon_button(ui, "⌒", "Sweep", feature_selected, "円形断面を直線パスに沿って掃引します") {
+                        self.open_tool_panel(ToolKind::SweepCircle);
                     }
                 });
                 ribbon_group(ui, "パターン・組み合わせ", |ui| {
