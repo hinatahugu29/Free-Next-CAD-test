@@ -322,6 +322,189 @@ fn point_in_polygon(p: [f64; 2], poly: &[[f64; 2]]) -> bool {
     inside
 }
 
+/// Revolve axis in sketch coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SketchAxis {
+    /// The sketch's vertical axis through its origin.
+    #[default]
+    Y,
+    /// The sketch's horizontal axis through its origin.
+    X,
+    /// A line of the sketch, given by its two points (follows the solved sketch).
+    Line { a: PointId, b: PointId },
+}
+
+/// Arrangement of pattern instances.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum PatternLayout {
+    /// `count` instances around an axis; a 360° total spaces them evenly with no
+    /// duplicate at the end, a smaller total spans first to last instance.
+    Circular {
+        axis_origin: [f64; 3],
+        axis_dir: [f64; 3],
+        count: u32,
+        total_angle_deg: ScalarParam,
+    },
+    /// `count` instances along `direction`, `spacing` apart.
+    Linear {
+        direction: [f64; 3],
+        spacing: ScalarParam,
+        count: u32,
+    },
+}
+
+impl PatternLayout {
+    fn instances(&self, params: &BTreeMap<String, f64>) -> Result<Vec<Instance>, CoreError> {
+        let bad = |reason: &str| {
+            CoreError::Geometry(GeometryError::InvalidParameter {
+                name: "pattern".to_string(),
+                reason: reason.to_string(),
+            })
+        };
+        match self {
+            Self::Circular {
+                axis_origin,
+                axis_dir,
+                count,
+                total_angle_deg,
+            } => {
+                if *count < 1 {
+                    return Err(bad("count must be >= 1"));
+                }
+                let total = total_angle_deg.evaluate(params)?;
+                let step = if (total.abs() - 360.0).abs() < 1e-6 || *count == 1 {
+                    total / *count as f64
+                } else {
+                    total / (*count - 1) as f64
+                };
+                Ok((0..*count)
+                    .map(|i| match i {
+                        0 => Instance::Identity,
+                        _ => Instance::Rotate {
+                            origin: DVec3::from_array(*axis_origin),
+                            axis: DVec3::from_array(*axis_dir),
+                            angle_deg: step * i as f64,
+                        },
+                    })
+                    .collect())
+            }
+            Self::Linear {
+                direction,
+                spacing,
+                count,
+            } => {
+                if *count < 1 {
+                    return Err(bad("count must be >= 1"));
+                }
+                let dir = DVec3::from_array(*direction)
+                    .try_normalize()
+                    .ok_or_else(|| bad("direction must be non-zero"))?;
+                let s = spacing.evaluate(params)?;
+                Ok((0..*count)
+                    .map(|i| match i {
+                        0 => Instance::Identity,
+                        _ => Instance::Translate(dir * s * i as f64),
+                    })
+                    .collect())
+            }
+        }
+    }
+}
+
+/// One placement of a repeated tool or body.
+#[derive(Debug, Clone, Copy)]
+enum Instance {
+    Identity,
+    Translate(DVec3),
+    Rotate {
+        origin: DVec3,
+        axis: DVec3,
+        angle_deg: f64,
+    },
+    Mirror {
+        origin: DVec3,
+        normal: DVec3,
+    },
+}
+
+impl Instance {
+    fn apply(&self, store: &mut ShapeStore, src: ShapeId) -> Result<ShapeId, CoreError> {
+        Ok(match *self {
+            Self::Identity => store.clone_shape(src)?,
+            Self::Translate(d) => store.translate(src, d.x, d.y, d.z)?,
+            Self::Rotate {
+                origin,
+                axis,
+                angle_deg,
+            } => store.rotate(src, origin, axis, Angle::deg(angle_deg))?,
+            Self::Mirror { origin, normal } => store.mirror(src, origin, normal)?,
+        })
+    }
+}
+
+/// Solves a sketch and returns its closed loops, with plain errors when it can't.
+fn solved_loops(sketch: &Sketch) -> Result<(Sketch, Vec<Vec<[f64; 2]>>), CoreError> {
+    let mut solved = sketch.clone();
+    let report = solved.solve(60, 1e-7);
+    if matches!(
+        report.status,
+        SketchStatus::OverConstrained { .. } | SketchStatus::SolverFailed { .. }
+    ) {
+        return Err(CoreError::Geometry(GeometryError::InvalidParameter {
+            name: solved.name.clone(),
+            reason: format!("Sketch solver failed with status: {:?}", report.status),
+        }));
+    }
+    let loops = solved.extract_closed_profiles();
+    if loops.is_empty() {
+        return Err(CoreError::Geometry(GeometryError::InvalidParameter {
+            name: solved.name.clone(),
+            reason: "Sketch does not contain a valid closed 2D profile".to_string(),
+        }));
+    }
+    Ok((solved, loops))
+}
+
+/// Revolves loops given as (radius, height) about +Z; nested loops become holes.
+fn revolve_loops(store: &mut ShapeStore, loops: &[Vec<[f64; 2]>], angle_deg: f64) -> Result<ShapeId, CoreError> {
+    let depth_of = |i: usize| {
+        loops
+            .iter()
+            .enumerate()
+            .filter(|&(j, other)| j != i && point_in_polygon(loops[i][0], other))
+            .count()
+    };
+    let (holes, outers): (Vec<usize>, Vec<usize>) =
+        (0..loops.len()).partition(|&i| depth_of(i) % 2 == 1);
+    let mut body: Option<ShapeId> = None;
+    for i in outers {
+        let rev = store.revolve_polygon(&loops[i], Angle::deg(angle_deg))?;
+        body = Some(match body {
+            None => rev,
+            Some(b) => {
+                let fused = store.fuse(b, rev)?;
+                let _ = store.remove(b);
+                let _ = store.remove(rev);
+                fused
+            }
+        });
+    }
+    let mut body = body.ok_or_else(|| {
+        CoreError::Geometry(GeometryError::InvalidParameter {
+            name: "sketch".to_string(),
+            reason: "Sketch contains only hole loops and no outer boundary".to_string(),
+        })
+    })?;
+    for i in holes {
+        let tool = store.revolve_polygon(&loops[i], Angle::deg(angle_deg))?;
+        let cut = store.cut(body, tool)?;
+        let _ = store.remove(body);
+        let _ = store.remove(tool);
+        body = cut;
+    }
+    Ok(body)
+}
+
 /// How an extruded sketch profile is combined with existing geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ExtrudeMode {
@@ -379,6 +562,36 @@ pub enum FeatureKind {
         /// Extrude half the depth to each side of the plane (overrides `reversed`).
         #[serde(default)]
         symmetric: bool,
+        /// Ignore `depth` and go all the way through the target body (Join/Cut only).
+        #[serde(default)]
+        through_all: bool,
+    },
+    /// Revolves a sketch's closed loops around an axis lying in the sketch plane.
+    SketchRevolve {
+        sketch: Sketch,
+        plane: SketchPlane,
+        axis: SketchAxis,
+        angle_deg: ScalarParam,
+        mode: ExtrudeMode,
+    },
+    /// Repeats a feature. A sketch Join/Cut feature has its tool repeated on its target
+    /// (e.g. a ring of holes); any other feature has its body repeated and fused.
+    Pattern {
+        input: FeatureId,
+        layout: PatternLayout,
+    },
+    /// Mirrors a feature across a plane. A sketch Join/Cut feature gets its tool mirrored
+    /// onto its target; a body is mirrored, and with `merge` fused with the original.
+    Mirror {
+        input: FeatureId,
+        plane: SketchPlane,
+        merge: bool,
+    },
+    /// Hollows a body inward to a wall thickness, opening the given faces.
+    Shell {
+        input: FeatureId,
+        thickness: ScalarParam,
+        open_faces: Vec<SemanticReference>,
     },
     ExtrudeCircle {
         radius: ScalarParam,
@@ -441,7 +654,21 @@ impl FeatureKind {
             | Self::ExtrudePolygon { .. }
             | Self::ExtrudeCircle { .. }
             | Self::RevolvePolygon { .. } => Vec::new(),
-            Self::SketchExtrude { plane, mode, .. } => {
+            Self::Pattern { input, .. } | Self::Mirror { input, plane: SketchPlane::XY | SketchPlane::XZ | SketchPlane::YZ, .. } | Self::Shell { input, .. } => {
+                vec![*input]
+            }
+            Self::Mirror {
+                input,
+                plane: SketchPlane::Face { feature, .. },
+                ..
+            } => {
+                if input == feature {
+                    vec![*input]
+                } else {
+                    vec![*input, *feature]
+                }
+            }
+            Self::SketchExtrude { plane, mode, .. } | Self::SketchRevolve { plane, mode, .. } => {
                 let mut deps = Vec::new();
                 for id in [plane.feature(), mode.target()].into_iter().flatten() {
                     if !deps.contains(&id) {
@@ -475,7 +702,10 @@ impl FeatureKind {
             | Self::Chamfer { input, .. }
             | Self::LinearPattern { input, .. } => Some(*input),
             Self::Boolean { primary, .. } => Some(*primary),
-            Self::SketchExtrude { mode, .. } => mode.target(),
+            Self::SketchExtrude { mode, .. } | Self::SketchRevolve { mode, .. } => mode.target(),
+            Self::Pattern { input, .. } | Self::Mirror { input, .. } | Self::Shell { input, .. } => {
+                Some(*input)
+            }
             _ => None,
         }
     }
@@ -567,6 +797,13 @@ impl FeatureKind {
                 add(spacing_y);
                 add(spacing_z);
             }
+            Self::SketchRevolve { angle_deg, .. } => add(angle_deg),
+            Self::Pattern { layout, .. } => match layout {
+                PatternLayout::Circular { total_angle_deg, .. } => add(total_angle_deg),
+                PatternLayout::Linear { spacing, .. } => add(spacing),
+            },
+            Self::Mirror { .. } => {}
+            Self::Shell { thickness, .. } => add(thickness),
         }
         set
     }
@@ -1333,6 +1570,224 @@ impl Document {
         Ok(resolved)
     }
 
+    fn feature_shape(&self, id: FeatureId) -> Result<ShapeId, CoreError> {
+        self.features
+            .get(&id)
+            .and_then(|f| f.cached_shape)
+            .ok_or(CoreError::FeatureNotFound(id))
+    }
+
+    /// True for sketch features that add to / cut from a target (their tool can be
+    /// repeated onto the target instead of repeating the whole body).
+    fn is_sketch_tool_feature(&self, id: FeatureId) -> bool {
+        self.features.get(&id).is_some_and(|f| match &f.kind {
+            FeatureKind::SketchExtrude { mode, .. } | FeatureKind::SketchRevolve { mode, .. } => {
+                *mode != ExtrudeMode::NewBody
+            }
+            _ => false,
+        })
+    }
+
+    /// The solid a sketch feature produces before it is combined with its target: the
+    /// placed extrusion or revolution of the sketch's loops.
+    fn sketch_tool(
+        &self,
+        kind: &FeatureKind,
+        params: &BTreeMap<String, f64>,
+        store: &mut ShapeStore,
+    ) -> Result<ShapeId, CoreError> {
+        match kind {
+            FeatureKind::SketchExtrude {
+                sketch,
+                depth,
+                plane,
+                mode,
+                reversed,
+                symmetric,
+                through_all,
+            } => {
+                let (_, loops) = solved_loops(sketch)?;
+                let mut d = depth.evaluate(params)?;
+                if *through_all && let Some(target) = mode.target() {
+                    let bbox = store.bounding_box(self.feature_shape(target)?)?;
+                    d = bbox.diagonal_length() * 2.0 + 1.0;
+                }
+                let frame = self.sketch_plane_frame(plane, store)?;
+                let prism = extrude_loops(store, &loops, d)?;
+                let z_shift = if *symmetric {
+                    -d * 0.5
+                } else if *reversed {
+                    -d
+                } else {
+                    0.0
+                };
+                place_on_frame(store, prism, &frame, z_shift)
+            }
+            FeatureKind::SketchRevolve {
+                sketch,
+                plane,
+                axis,
+                angle_deg,
+                ..
+            } => {
+                let (solved, loops) = solved_loops(sketch)?;
+                let pos = |p: &PointId| -> Result<DVec3, CoreError> {
+                    solved
+                        .points
+                        .get(p)
+                        .map(|q| DVec3::new(q.x, q.y, 0.0))
+                        .ok_or_else(|| {
+                            CoreError::Geometry(GeometryError::InvalidParameter {
+                                name: solved.name.clone(),
+                                reason: "Revolve axis refers to a point that no longer exists".to_string(),
+                            })
+                        })
+                };
+                let (a, dir) = match axis {
+                    SketchAxis::X => (DVec3::ZERO, DVec3::X),
+                    SketchAxis::Y => (DVec3::ZERO, DVec3::Y),
+                    SketchAxis::Line { a, b } => {
+                        let (pa, pb) = (pos(a)?, pos(b)?);
+                        (pa, (pb - pa).normalize_or_zero())
+                    }
+                };
+                if dir == DVec3::ZERO {
+                    return Err(CoreError::Geometry(GeometryError::InvalidParameter {
+                        name: solved.name.clone(),
+                        reason: "Revolve axis has zero length".to_string(),
+                    }));
+                }
+                // Express each loop as (distance from axis, position along axis).
+                let mut side = DVec3::new(dir.y, -dir.x, 0.0);
+                let rz: Vec<Vec<[f64; 2]>> = loops
+                    .iter()
+                    .map(|l| {
+                        l.iter()
+                            .map(|p| {
+                                let v = DVec3::new(p[0], p[1], 0.0) - a;
+                                [v.dot(side), v.dot(dir)]
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let (neg, posi) = rz.iter().flatten().fold((false, false), |(n, p), q| {
+                    (n || q[0] < -1e-7, p || q[0] > 1e-7)
+                });
+                if neg && posi {
+                    return Err(CoreError::Geometry(GeometryError::InvalidParameter {
+                        name: solved.name.clone(),
+                        reason: "The profile crosses the revolve axis; keep it on one side".to_string(),
+                    }));
+                }
+                let rz: Vec<Vec<[f64; 2]>> = if neg {
+                    side = -side;
+                    rz.into_iter()
+                        .map(|l| l.into_iter().map(|[r, z]| [-r, z]).collect())
+                        .collect()
+                } else {
+                    rz
+                };
+                let solid = revolve_loops(store, &rz, angle_deg.evaluate(params)?)?;
+                let frame = self.sketch_plane_frame(plane, store)?;
+                let to3 = |v: DVec3| frame.x_axis * v.x + frame.y_axis * v.y;
+                let (x3, z3) = (to3(side), to3(dir));
+                let placement = PlaneFrame {
+                    origin: frame.to_world(a.x, a.y),
+                    x_axis: x3,
+                    y_axis: z3.cross(x3),
+                    normal: z3,
+                };
+                place_on_frame(store, solid, &placement, 0.0)
+            }
+            _ => Err(CoreError::Geometry(GeometryError::InvalidParameter {
+                name: "feature".to_string(),
+                reason: "not a sketch feature".to_string(),
+            })),
+        }
+    }
+
+    fn combine_with_target(
+        &self,
+        tool: ShapeId,
+        mode: ExtrudeMode,
+        store: &mut ShapeStore,
+    ) -> Result<ShapeId, CoreError> {
+        match mode {
+            ExtrudeMode::NewBody => Ok(tool),
+            ExtrudeMode::Join { target } | ExtrudeMode::Cut { target } => {
+                let base = self.feature_shape(target)?;
+                let combined = if matches!(mode, ExtrudeMode::Cut { .. }) {
+                    store.cut(base, tool)
+                } else {
+                    store.fuse(base, tool)
+                };
+                let _ = store.remove(tool);
+                Ok(combined?)
+            }
+        }
+    }
+
+    /// Applies `instances` of a feature. For a sketch Join/Cut feature the tool is
+    /// placed at every instance on the feature's target; otherwise the feature's body is
+    /// placed at every instance and the copies are fused.
+    fn replicate(
+        &self,
+        input: FeatureId,
+        instances: &[Instance],
+        params: &BTreeMap<String, f64>,
+        store: &mut ShapeStore,
+    ) -> Result<ShapeId, CoreError> {
+        let feat = self.features.get(&input).ok_or(CoreError::FeatureNotFound(input))?;
+        if self.is_sketch_tool_feature(input) {
+            let mode = match &feat.kind {
+                FeatureKind::SketchExtrude { mode, .. } | FeatureKind::SketchRevolve { mode, .. } => *mode,
+                _ => unreachable!(),
+            };
+            let tool = self.sketch_tool(&feat.kind, params, store)?;
+            let mut current = self.feature_shape(mode.target().unwrap())?;
+            let mut owned = false;
+            for inst in instances {
+                let placed = inst.apply(store, tool)?;
+                let next = if matches!(mode, ExtrudeMode::Cut { .. }) {
+                    store.cut(current, placed)
+                } else {
+                    store.fuse(current, placed)
+                };
+                let _ = store.remove(placed);
+                if owned {
+                    let _ = store.remove(current);
+                }
+                current = next?;
+                owned = true;
+            }
+            let _ = store.remove(tool);
+            if !owned {
+                current = store.clone_shape(current)?;
+            }
+            return Ok(current);
+        }
+        let src = self.feature_shape(input)?;
+        let mut acc: Option<ShapeId> = None;
+        for inst in instances {
+            let placed = inst.apply(store, src)?;
+            acc = Some(match acc {
+                None => placed,
+                Some(prev) => {
+                    let fused = store.fuse(prev, placed)?;
+                    let _ = store.remove(prev);
+                    let _ = store.remove(placed);
+                    fused
+                }
+            });
+        }
+        acc.ok_or_else(|| {
+            CoreError::Geometry(GeometryError::InvalidParameter {
+                name: "pattern".to_string(),
+                reason: "no instances".to_string(),
+            })
+        })
+    }
+
     fn evaluate_feature_kind(
         &self,
         kind: &FeatureKind,
@@ -1384,56 +1839,45 @@ impl Document {
                 let d = depth.evaluate(params)?;
                 Ok(store.extrude_polygon(&pts, Length::mm(d))?)
             }
-            FeatureKind::SketchExtrude {
-                sketch,
-                depth,
-                plane,
-                mode,
-                reversed,
-                symmetric,
-            } => {
-                let mut solved = sketch.clone();
-                let report = solved.solve(60, 1e-7);
-                if matches!(
-                    report.status,
-                    SketchStatus::OverConstrained { .. } | SketchStatus::SolverFailed { .. }
-                ) {
-                    return Err(CoreError::Geometry(GeometryError::InvalidParameter {
-                        name: solved.name.clone(),
-                        reason: format!("Sketch solver failed with status: {:?}", report.status),
-                    }));
-                }
-                let loops = solved.extract_closed_profiles();
-                if loops.is_empty() {
-                    return Err(CoreError::Geometry(GeometryError::InvalidParameter {
-                        name: solved.name.clone(),
-                        reason: "Sketch does not contain a valid closed 2D profile".to_string(),
-                    }));
-                }
-                let d = depth.evaluate(params)?;
+            FeatureKind::SketchExtrude { mode, .. } | FeatureKind::SketchRevolve { mode, .. } => {
+                let tool = self.sketch_tool(kind, params, store)?;
+                self.combine_with_target(tool, *mode, store)
+            }
+            FeatureKind::Pattern { input, layout } => {
+                let instances = layout.instances(params)?;
+                self.replicate(*input, &instances, params, store)
+            }
+            FeatureKind::Mirror { input, plane, merge } => {
                 let frame = self.sketch_plane_frame(plane, store)?;
-                let prism = extrude_loops(store, &loops, d)?;
-                let z_shift = if *symmetric {
-                    -d * 0.5
-                } else if *reversed {
-                    -d
-                } else {
-                    0.0
+                let mirror = Instance::Mirror {
+                    origin: frame.origin,
+                    normal: frame.normal,
                 };
-                let tool = place_on_frame(store, prism, &frame, z_shift)?;
-                match mode {
-                    ExtrudeMode::NewBody => Ok(tool),
-                    ExtrudeMode::Join { target } | ExtrudeMode::Cut { target } => {
-                        let base = lookup_shape(*target)?;
-                        let combined = if matches!(mode, ExtrudeMode::Cut { .. }) {
-                            store.cut(base, tool)
-                        } else {
-                            store.fuse(base, tool)
-                        };
-                        let _ = store.remove(tool);
-                        Ok(combined?)
-                    }
+                let instances = if *merge || self.is_sketch_tool_feature(*input) {
+                    vec![Instance::Identity, mirror]
+                } else {
+                    vec![mirror]
+                };
+                self.replicate(*input, &instances, params, store)
+            }
+            FeatureKind::Shell {
+                input,
+                thickness,
+                open_faces,
+            } => {
+                let src = lookup_shape(*input)?;
+                let t = thickness.evaluate(params)?;
+                let mut indices = Vec::with_capacity(open_faces.len());
+                for face in open_faces {
+                    let resolved = face.resolve_face(store, src).map_err(|reason| {
+                        CoreError::SemanticReferenceLost {
+                            feature: *input,
+                            reason,
+                        }
+                    })?;
+                    indices.push(resolved.index);
                 }
+                Ok(store.thick_solid(src, &indices, Length::mm(t))?)
             }
             FeatureKind::ExtrudeCircle { radius, depth } => {
                 let r = radius.evaluate(params)?;
@@ -2364,6 +2808,7 @@ mod tests {
                     mode: ExtrudeMode::Cut { target: plate },
                     reversed: true,
                     symmetric: false,
+                    through_all: false,
                 },
                 true,
                 [1.0; 4],
@@ -2422,6 +2867,7 @@ mod tests {
                     mode: ExtrudeMode::NewBody,
                     reversed: false,
                     symmetric: false,
+                    through_all: false,
                 },
                 true,
                 [1.0; 4],
@@ -2463,6 +2909,7 @@ mod tests {
                     mode: ExtrudeMode::NewBody,
                     reversed: false,
                     symmetric: false,
+                    through_all: false,
                 },
                 true,
                 [1.0; 4],
@@ -2493,6 +2940,189 @@ mod tests {
         let loops = d.extract_closed_profiles();
         assert_eq!(loops.len(), 1);
         assert!(loops[0].len() > 10, "arc should be discretised");
+    }
+
+    /// M4: a flange revolved from an L-profile, one through-hole, a circular pattern of
+    /// that hole; a mirrored+merged box; a shelled box; a revolve about a sketch line.
+    #[test]
+    fn m4_flange_pattern_mirror_shell() {
+        let tess = TessellationOptions::default();
+        let mut store = ShapeStore::new();
+        let mut doc = Document::new("M4");
+        let vol = |doc: &Document, id: FeatureId| doc.features[&id].cached_summary.unwrap().volume_mm3;
+        let pi = std::f64::consts::PI;
+
+        // Flange: disk r10..50 x 8 thick plus hub r10..20 up to 25, revolved about Z.
+        let mut profile = Sketch::new("FlangeProfile");
+        let pts: Vec<PointId> = [[10.0, 0.0], [50.0, 0.0], [50.0, 8.0], [20.0, 8.0], [20.0, 25.0], [10.0, 25.0]]
+            .iter()
+            .map(|p| profile.add_point(p[0], p[1]))
+            .collect();
+        profile.add_polyline(pts, true);
+        let flange = doc
+            .add_feature(
+                "Flange",
+                FeatureKind::SketchRevolve {
+                    sketch: profile,
+                    plane: SketchPlane::XZ,
+                    axis: SketchAxis::Y,
+                    angle_deg: ScalarParam::mm(360.0),
+                    mode: ExtrudeMode::NewBody,
+                },
+                true,
+                [1.0; 4],
+            )
+            .unwrap();
+        let report = doc.recompute(&mut store, tess).unwrap();
+        assert!(report.is_all_clean(), "{:?}", report.failed_features);
+        let flange_vol = 24_300.0 * pi;
+        assert!((vol(&doc, flange) - flange_vol).abs() < 1.0, "{}", vol(&doc, flange));
+        let b = doc.features[&flange].cached_summary.unwrap().bounds;
+        assert!((b.max.x - 50.0).abs() < 1e-6 && (b.max.z - 25.0).abs() < 1e-6 && (b.min.z).abs() < 1e-6);
+
+        // One bolt hole through everything at r=35, then a ring of 6.
+        let mut hole = Sketch::new("Bolt");
+        let c = hole.add_point(35.0, 0.0);
+        hole.add_circle(c, 4.0);
+        let bolt = doc
+            .add_feature(
+                "BoltHole",
+                FeatureKind::SketchExtrude {
+                    sketch: hole,
+                    depth: ScalarParam::mm(1.0),
+                    plane: SketchPlane::XY,
+                    mode: ExtrudeMode::Cut { target: flange },
+                    reversed: false,
+                    symmetric: false,
+                    through_all: true,
+                },
+                true,
+                [1.0; 4],
+            )
+            .unwrap();
+        let ring = doc
+            .add_feature(
+                "BoltRing",
+                FeatureKind::Pattern {
+                    input: bolt,
+                    layout: PatternLayout::Circular {
+                        axis_origin: [0.0, 0.0, 0.0],
+                        axis_dir: [0.0, 0.0, 1.0],
+                        count: 6,
+                        total_angle_deg: ScalarParam::mm(360.0),
+                    },
+                },
+                true,
+                [1.0; 4],
+            )
+            .unwrap();
+        let report = doc.recompute(&mut store, tess).unwrap();
+        assert!(report.is_all_clean(), "{:?}", report.failed_features);
+        let hole_area = 0.5 * 48.0 * 16.0 * (std::f64::consts::TAU / 48.0).sin();
+        assert!((vol(&doc, bolt) - (flange_vol - hole_area * 8.0)).abs() < 1.0);
+        assert!((vol(&doc, ring) - (flange_vol - 6.0 * hole_area * 8.0)).abs() < 1.0, "{}", vol(&doc, ring));
+
+        // Mirror a box touching the YZ plane and merge: one solid twice the size.
+        let block = doc
+            .add_feature(
+                "Block",
+                FeatureKind::Box {
+                    width: ScalarParam::mm(20.0),
+                    height: ScalarParam::mm(10.0),
+                    depth: ScalarParam::mm(5.0),
+                },
+                true,
+                [1.0; 4],
+            )
+            .unwrap();
+        let mirrored = doc
+            .add_feature(
+                "Mirrored",
+                FeatureKind::Mirror {
+                    input: block,
+                    plane: SketchPlane::YZ,
+                    merge: true,
+                },
+                true,
+                [1.0; 4],
+            )
+            .unwrap();
+        // Shell a 40x30x20 box with its top face open, 2mm walls.
+        let tub = doc
+            .add_feature(
+                "Tub",
+                FeatureKind::Box {
+                    width: ScalarParam::mm(40.0),
+                    height: ScalarParam::mm(30.0),
+                    depth: ScalarParam::mm(20.0),
+                },
+                true,
+                [1.0; 4],
+            )
+            .unwrap();
+        doc.recompute(&mut store, tess).unwrap();
+        let tub_shape = doc.features[&tub].cached_shape.unwrap();
+        let top = store.resolve_face_by_signature(tub_shape, DVec3::Z, None, 0.99).unwrap();
+        let top_ref = SemanticReference::from_face(tub, &store, tub_shape, top.index).unwrap();
+        let shell = doc
+            .add_feature(
+                "Shell",
+                FeatureKind::Shell {
+                    input: tub,
+                    thickness: ScalarParam::mm(2.0),
+                    open_faces: vec![top_ref],
+                },
+                true,
+                [1.0; 4],
+            )
+            .unwrap();
+        // Revolve about a sketch line: a 10x20 rectangle around its left side -> cylinder.
+        let mut rect = Sketch::new("Cyl");
+        let (_, [p0, _, _, p3]) = rect.add_rectangle(0.0, 0.0, 10.0, 20.0);
+        let cyl = doc
+            .add_feature(
+                "Cyl",
+                FeatureKind::SketchRevolve {
+                    sketch: rect,
+                    plane: SketchPlane::XY,
+                    axis: SketchAxis::Line { a: p0, b: p3 },
+                    angle_deg: ScalarParam::mm(360.0),
+                    mode: ExtrudeMode::NewBody,
+                },
+                true,
+                [1.0; 4],
+            )
+            .unwrap();
+        let report = doc.recompute(&mut store, tess).unwrap();
+        assert!(report.is_all_clean(), "{:?}", report.failed_features);
+        assert!((vol(&doc, mirrored) - 2000.0).abs() < 1e-3);
+        let mb = doc.features[&mirrored].cached_summary.unwrap();
+        assert_eq!(mb.solids, 1);
+        assert!((mb.bounds.min.x + 20.0).abs() < 1e-6 && (mb.bounds.max.x - 20.0).abs() < 1e-6);
+        assert!((vol(&doc, shell) - (24_000.0 - 36.0 * 26.0 * 18.0)).abs() < 1e-2, "{}", vol(&doc, shell));
+        assert!((vol(&doc, cyl) - 2000.0 * pi).abs() < 1.0, "{}", vol(&doc, cyl));
+
+        // A profile straddling the axis is refused with a clear reason.
+        let mut bad = Sketch::new("Bad");
+        bad.add_rectangle(-5.0, 0.0, 5.0, 10.0);
+        let bad_id = doc
+            .add_feature(
+                "Bad",
+                FeatureKind::SketchRevolve {
+                    sketch: bad,
+                    plane: SketchPlane::XY,
+                    axis: SketchAxis::Y,
+                    angle_deg: ScalarParam::mm(360.0),
+                    mode: ExtrudeMode::NewBody,
+                },
+                true,
+                [1.0; 4],
+            )
+            .unwrap();
+        let report = doc.recompute(&mut store, tess).unwrap();
+        assert_eq!(report.failed_features.len(), 1);
+        assert_eq!(report.failed_features[0].0, bad_id);
+        assert!(report.failed_features[0].1.contains("crosses the revolve axis"));
     }
 
     #[test]
@@ -2655,6 +3285,7 @@ mod tests {
                     mode: ExtrudeMode::NewBody,
                     reversed: false,
                     symmetric: false,
+                    through_all: false,
                 },
                 true,
                 [0.3, 0.7, 0.9, 1.0],

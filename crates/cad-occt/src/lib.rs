@@ -121,6 +121,20 @@ mod ffi {
             cz: f64,
             factor: f64,
         ) -> Result<UniquePtr<OcctShapeHandle>>;
+        fn mirror_shape(
+            handle: &OcctShapeHandle,
+            ox: f64,
+            oy: f64,
+            oz: f64,
+            nx: f64,
+            ny: f64,
+            nz: f64,
+        ) -> Result<UniquePtr<OcctShapeHandle>>;
+        fn make_thick_solid(
+            handle: &OcctShapeHandle,
+            removed_face_indices: &[u32],
+            thickness: f64,
+        ) -> Result<UniquePtr<OcctShapeHandle>>;
 
         fn fillet_all_edges(
             handle: &OcctShapeHandle,
@@ -306,6 +320,24 @@ impl OcctShape {
             center[2],
             factor,
         )?)
+    }
+
+    /// Mirror image of the shape across the plane through `origin` with `normal`.
+    pub fn mirror(&self, origin: [f64; 3], normal: [f64; 3]) -> Result<Self, OcctError> {
+        Self::from_ptr(ffi::mirror_shape(
+            self.as_ref()?,
+            origin[0],
+            origin[1],
+            origin[2],
+            normal[0],
+            normal[1],
+            normal[2],
+        )?)
+    }
+
+    /// Hollows the solid inward to wall `thickness`, opening the given faces (0-based).
+    pub fn thick_solid(&self, removed_face_indices: &[u32], thickness: f64) -> Result<Self, OcctError> {
+        Self::from_ptr(ffi::make_thick_solid(self.as_ref()?, removed_face_indices, thickness)?)
     }
 
     /// Fillets all edges of the shape with constant `radius`.

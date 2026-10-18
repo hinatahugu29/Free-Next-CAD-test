@@ -577,6 +577,26 @@ impl ShapeStore {
         self.insert(res)
     }
 
+    /// Mirror image of a shape across the plane through `origin` with `normal`.
+    pub fn mirror(&mut self, id: ShapeId, origin: DVec3, normal: DVec3) -> Result<ShapeId, GeometryError> {
+        let s = self.get(id)?;
+        let res = s.mirror(origin.to_array(), normal.to_array())?;
+        self.insert(res)
+    }
+
+    /// Hollows a solid inward to wall `thickness`, opening the given faces (0-based).
+    pub fn thick_solid(
+        &mut self,
+        id: ShapeId,
+        removed_face_indices: &[u32],
+        thickness: Length,
+    ) -> Result<ShapeId, GeometryError> {
+        let t = thickness.ensure_positive("thickness")?;
+        let s = self.get(id)?;
+        let res = s.thick_solid(removed_face_indices, t)?;
+        self.insert(res)
+    }
+
     /// Applies a composite [`Transform`] to a shape.
     pub fn apply_transform(
         &mut self,

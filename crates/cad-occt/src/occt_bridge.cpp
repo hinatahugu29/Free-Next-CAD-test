@@ -35,6 +35,8 @@
 #include <BRepAlgoAPI_Cut.hxx>
 #include <BRepAlgoAPI_Common.hxx>
 
+#include <BRepOffsetAPI_MakeThickSolid.hxx>
+#include <TopTools_ListOfShape.hxx>
 #include <BRepFilletAPI_MakeFillet.hxx>
 #include <BRepFilletAPI_MakeChamfer.hxx>
 
@@ -358,6 +360,62 @@ std::unique_ptr<OcctShapeHandle> scale_shape(
             throw std::runtime_error("BRepBuilderAPI_Transform (scale) failed");
         }
         return std::make_unique<OcctShapeHandle>(xform.Shape());
+    } catch (const Standard_Failure& e) {
+        rethrow_occt_exception(e);
+    }
+}
+
+std::unique_ptr<OcctShapeHandle> mirror_shape(
+    const OcctShapeHandle& handle,
+    double ox,
+    double oy,
+    double oz,
+    double nx,
+    double ny,
+    double nz
+) {
+    double len = std::sqrt(nx * nx + ny * ny + nz * nz);
+    if (!std::isfinite(len) || len <= 1e-9) {
+        throw std::invalid_argument("Invalid mirror plane normal");
+    }
+    try {
+        gp_Trsf trsf;
+        trsf.SetMirror(gp_Ax2(gp_Pnt(ox, oy, oz), gp_Dir(nx / len, ny / len, nz / len)));
+        BRepBuilderAPI_Transform xform(handle.shape(), trsf, Standard_True);
+        if (!xform.IsDone()) {
+            throw std::runtime_error("BRepBuilderAPI_Transform (mirror) failed");
+        }
+        return std::make_unique<OcctShapeHandle>(xform.Shape());
+    } catch (const Standard_Failure& e) {
+        rethrow_occt_exception(e);
+    }
+}
+
+std::unique_ptr<OcctShapeHandle> make_thick_solid(
+    const OcctShapeHandle& handle,
+    rust::Slice<const uint32_t> removed_face_indices,
+    double thickness
+) {
+    ensure_valid_positive(thickness, "shell thickness");
+    try {
+        TopTools_IndexedMapOfShape face_map;
+        TopExp::MapShapes(handle.shape(), TopAbs_FACE, face_map);
+        TopTools_ListOfShape removed;
+        for (uint32_t idx : removed_face_indices) {
+            int one_based = static_cast<int>(idx) + 1;
+            if (one_based < 1 || one_based > face_map.Extent()) {
+                throw std::out_of_range("Face index out of range for shell");
+            }
+            removed.Append(face_map(one_based));
+        }
+        BRepOffsetAPI_MakeThickSolid maker;
+        // Negative offset hollows the solid inward, keeping the outer dimensions.
+        maker.MakeThickSolidByJoin(handle.shape(), removed, -thickness, 1.0e-3);
+        maker.Build();
+        if (!maker.IsDone()) {
+            throw std::runtime_error("BRepOffsetAPI_MakeThickSolid failed (wall may be too thick for this shape)");
+        }
+        return std::make_unique<OcctShapeHandle>(maker.Shape());
     } catch (const Standard_Failure& e) {
         rethrow_occt_exception(e);
     }

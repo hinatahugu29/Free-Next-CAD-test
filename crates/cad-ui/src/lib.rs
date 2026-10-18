@@ -1,6 +1,7 @@
 //! Desktop CAD GUI for FerroCAD powered by `egui` / `eframe` and `cad-render` (Phase 3 & Phase 4).
 
 mod sketch_editor;
+mod tools;
 
 use std::path::PathBuf;
 
@@ -150,6 +151,64 @@ pub struct FerroCadApp {
     pub rename_target: Option<(FeatureId, String)>,
     /// Sketch canvas view: centre (sketch mm) and zoom (px per mm). `None` = fit on next frame.
     pub sketch_view: Option<([f64; 2], f32)>,
+    /// Finish the sketch as a revolve instead of an extrude.
+    pub sketch_revolve: bool,
+    pub sketch_axis: cad_core::SketchAxis,
+    pub sketch_angle: f64,
+    pub sketch_through_all: bool,
+    /// Open "select → adjust → confirm" panel for a modify tool.
+    pub tool_panel: Option<ToolPanel>,
+    pub sketch_start: SketchStart,
+}
+
+/// Which modify tool a ribbon button opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolKind {
+    CircularPattern,
+    LinearPattern,
+    Mirror,
+    Boolean,
+    Shell,
+}
+
+/// What the sketch being started will become.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SketchStart {
+    Extrude,
+    Revolve,
+    Hole,
+}
+
+/// State of an open modify-tool panel.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolPanel {
+    CircularPattern {
+        input: FeatureId,
+        axis: usize,
+        center: [f64; 3],
+        count: u32,
+        angle: f64,
+    },
+    LinearPattern {
+        input: FeatureId,
+        direction: usize,
+        spacing: f64,
+        count: u32,
+    },
+    Mirror {
+        input: FeatureId,
+        plane: usize,
+        merge: bool,
+    },
+    Boolean {
+        a: FeatureId,
+        b: Option<FeatureId>,
+        op: cad_core::BooleanOp,
+    },
+    Shell {
+        input: FeatureId,
+        thickness: f64,
+    },
 }
 
 /// Action chosen from a timeline chip's right-click menu.
@@ -273,6 +332,12 @@ impl FerroCadApp {
             sketch_symmetric: false,
             rename_target: None,
             sketch_view: None,
+            sketch_revolve: false,
+            sketch_axis: cad_core::SketchAxis::Y,
+            sketch_angle: 360.0,
+            sketch_through_all: false,
+            tool_panel: None,
+            sketch_start: SketchStart::Extrude,
         }
     }
 
@@ -286,10 +351,12 @@ impl FerroCadApp {
     }
 
     /// First step of a sketch: ask for a plane (base plane button or face click).
-    fn start_sketch(&mut self) {
+    fn start_sketch_with(&mut self, kind: SketchStart) {
+        self.sketch_start = kind;
         self.sketch_plane_picking = true;
         self.hover_face = None;
         self.floating_editor_pos = None;
+        self.tool_panel = None;
     }
 
     fn cancel_sketch(&mut self) {
@@ -332,8 +399,19 @@ impl FerroCadApp {
         self.sketch_depth = 10.0;
         self.sketch_depth_expr = None;
         self.sketch_editing = None;
+        self.sketch_revolve = self.sketch_start == SketchStart::Revolve;
+        self.sketch_axis = cad_core::SketchAxis::Y;
+        self.sketch_angle = 360.0;
+        self.sketch_through_all = false;
         let name = format!("Sketch_{}", self.controller.document.features.len() + 1);
         self.open_sketch_editor(Sketch::new(name));
+        if self.sketch_start == SketchStart::Hole {
+            self.sketch_tool = SketchTool::Circle;
+            if self.sketch_target.is_some() {
+                self.set_sketch_op(SketchOp::Cut);
+                self.sketch_through_all = true;
+            }
+        }
     }
 
     /// Shows the 2D editor for `sketch` on the already-set plane/frame.
@@ -360,18 +438,50 @@ impl FerroCadApp {
         let Some(feat) = self.controller.document.features.get(&id).cloned() else {
             return;
         };
-        let FeatureKind::SketchExtrude {
-            sketch,
-            depth,
-            plane,
-            mode,
-            reversed,
-            symmetric,
-        } = feat.kind
-        else {
-            self.status_logs
-                .push(format!("「{}」はスケッチから作られていないため、スケッチ編集はできません", feat.name));
-            return;
+        let (sketch, plane, mode) = match feat.kind {
+            FeatureKind::SketchExtrude {
+                sketch,
+                depth,
+                plane,
+                mode,
+                reversed,
+                symmetric,
+                through_all,
+            } => {
+                self.sketch_revolve = false;
+                self.sketch_reversed = reversed;
+                self.sketch_symmetric = symmetric;
+                self.sketch_through_all = through_all;
+                match depth {
+                    ScalarParam::Literal(v) => {
+                        self.sketch_depth = v;
+                        self.sketch_depth_expr = None;
+                    }
+                    ScalarParam::Expr(e) => self.sketch_depth_expr = Some(e),
+                }
+                (sketch, plane, mode)
+            }
+            FeatureKind::SketchRevolve {
+                sketch,
+                plane,
+                axis,
+                angle_deg,
+                mode,
+            } => {
+                self.sketch_revolve = true;
+                self.sketch_axis = axis;
+                self.sketch_angle = match angle_deg {
+                    ScalarParam::Literal(v) => v,
+                    ScalarParam::Expr(_) => 360.0,
+                };
+                self.sketch_depth_expr = None;
+                (sketch, plane, mode)
+            }
+            _ => {
+                self.status_logs
+                    .push(format!("「{}」はスケッチから作られていないため、スケッチ編集はできません", feat.name));
+                return;
+            }
         };
         let frame = match self.controller.document.sketch_plane_frame(&plane, &self.store) {
             Ok(frame) => frame,
@@ -392,23 +502,24 @@ impl FerroCadApp {
         };
         self.sketch_target = target;
         self.sketch_op = op;
-        self.sketch_reversed = reversed;
-        self.sketch_symmetric = symmetric;
-        match depth {
-            ScalarParam::Literal(v) => {
-                self.sketch_depth = v;
-                self.sketch_depth_expr = None;
-            }
-            ScalarParam::Expr(e) => self.sketch_depth_expr = Some(e),
-        }
         self.open_sketch_editor(sketch);
         self.sketch_editing = Some(id);
     }
 
-    /// Cut defaults to extruding into the material (against the face's outward normal).
+    /// Sets the result type and a sensible default direction: a cut heads toward the
+    /// target body, a join heads away from it (works for faces and base planes alike).
     fn set_sketch_op(&mut self, op: SketchOp) {
         self.sketch_op = op;
-        self.sketch_reversed = op == SketchOp::Cut;
+        let body_side = self
+            .sketch_target
+            .and_then(|t| self.controller.document.features.get(&t))
+            .and_then(|f| f.cached_summary.or(f.last_valid_summary))
+            .map(|s| (s.bounds.center() - self.sketch_frame.origin).dot(self.sketch_frame.normal));
+        self.sketch_reversed = match (op, body_side) {
+            (SketchOp::Cut, Some(side)) => side < 0.0,
+            (SketchOp::Join, Some(side)) => side > 0.0,
+            _ => false,
+        };
     }
 
     fn begin_sketch_on_face(&mut self, fid: FeatureId, face_index: u32) {
@@ -540,8 +651,14 @@ impl FerroCadApp {
         ui.horizontal(|ui| match self.ribbon_tab {
             RibbonTab::Solid => {
                 ribbon_group(ui, "スケッチ", |ui| {
-                    if ribbon_button(ui, "✏", "スケッチ", true, "2Dで輪郭を描いて押し出し") {
-                        self.start_sketch();
+                    if ribbon_button(ui, "✏", "押し出し", true, "平面を選んで輪郭を描き、押し出します") {
+                        self.start_sketch_with(SketchStart::Extrude);
+                    }
+                    if ribbon_button(ui, "⟳", "回転", true, "平面を選んで輪郭を描き、軸の周りに回転させます") {
+                        self.start_sketch_with(SketchStart::Revolve);
+                    }
+                    if ribbon_button(ui, "○", "穴", true, "面をクリックして円を描くと、その位置に貫通穴を開けます") {
+                        self.start_sketch_with(SketchStart::Hole);
                     }
                 });
                 ribbon_group(ui, "作成", |ui| {
@@ -598,6 +715,36 @@ impl FerroCadApp {
                     }
                     if ribbon_button(ui, "◣", "面取り", edge_selected, hint) {
                         self.add_edge_modifier_on_selection(true);
+                    }
+                    let face_selected = self.render_config.selected_face.is_some();
+                    if ribbon_button(
+                        ui,
+                        "□",
+                        "シェル",
+                        face_selected,
+                        if face_selected {
+                            "選択中の面を開口にして、内側をくり抜きます"
+                        } else {
+                            "先に3Dビューで開口にしたい面をクリックしてください"
+                        },
+                    ) {
+                        self.open_tool_panel(ToolKind::Shell);
+                    }
+                });
+                let feature_selected = self.render_config.selected_feature.is_some();
+                let need = "先にタイムラインか3Dビューで対象を選択してください";
+                ribbon_group(ui, "パターン・組み合わせ", |ui| {
+                    if ribbon_button(ui, "⟲", "円形", feature_selected, if feature_selected { "選択中の形状（穴なら穴）を円周上に並べます" } else { need }) {
+                        self.open_tool_panel(ToolKind::CircularPattern);
+                    }
+                    if ribbon_button(ui, "…", "直線", feature_selected, if feature_selected { "選択中の形状（穴なら穴）を一直線に並べます" } else { need }) {
+                        self.open_tool_panel(ToolKind::LinearPattern);
+                    }
+                    if ribbon_button(ui, "∥", "ミラー", feature_selected, if feature_selected { "選択中の形状を平面で鏡映します" } else { need }) {
+                        self.open_tool_panel(ToolKind::Mirror);
+                    }
+                    if ribbon_button(ui, "◆", "ブーリアン", feature_selected, if feature_selected { "2つのボディを足す・引く・重なりを取る" } else { need }) {
+                        self.open_tool_panel(ToolKind::Boolean);
                     }
                 });
             }
@@ -1019,7 +1166,7 @@ impl FerroCadApp {
                                 } else {
                                     RichText::new(&feat.name)
                                 };
-                                let is_sketch = matches!(feat.kind, FeatureKind::SketchExtrude { .. });
+                                let is_sketch = matches!(feat.kind, FeatureKind::SketchExtrude { .. } | FeatureKind::SketchRevolve { .. });
                                 let resp = ui.selectable_label(is_selected, name);
                                 let resp = if let FeatureState::Failed(msg) = &feat.state {
                                     resp.on_hover_text(msg)
@@ -1218,6 +1365,12 @@ impl FerroCadApp {
             }
             FeatureKind::SketchExtrude { depth, .. } | FeatureKind::ExtrudePolygon { depth, .. } => {
                 kind_changed |= edit_scalar_param(ui, "押し出し量", depth);
+            }
+            k @ (FeatureKind::SketchRevolve { .. }
+            | FeatureKind::Pattern { .. }
+            | FeatureKind::Mirror { .. }
+            | FeatureKind::Shell { .. }) => {
+                kind_changed |= edit_operation_params(ui, k);
             }
             FeatureKind::ExtrudeCircle { radius, depth } => {
                 kind_changed |= edit_scalar_param(ui, "半径", radius);
@@ -1615,6 +1768,12 @@ impl FerroCadApp {
                         | FeatureKind::ExtrudePolygon { depth, .. } => {
                             kind_changed |= edit_scalar_param(ui, "押し出し量", depth);
                         }
+                        k @ (FeatureKind::SketchRevolve { .. }
+                        | FeatureKind::Pattern { .. }
+                        | FeatureKind::Mirror { .. }
+                        | FeatureKind::Shell { .. }) => {
+                            kind_changed |= edit_operation_params(ui, k);
+                        }
                         FeatureKind::ExtrudeCircle { radius, depth } => {
                             kind_changed |= edit_scalar_param(ui, "半径", radius);
                             kind_changed |= edit_scalar_param(ui, "押し出し量", depth);
@@ -1645,13 +1804,17 @@ impl FerroCadApp {
 }
 
 fn edit_scalar_param(ui: &mut egui::Ui, label: &str, param: &mut ScalarParam) -> bool {
+    edit_scalar_param_unit(ui, label, param, " mm")
+}
+
+fn edit_scalar_param_unit(ui: &mut egui::Ui, label: &str, param: &mut ScalarParam, unit: &str) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
         ui.label(label);
         match param {
             ScalarParam::Literal(val) => {
                 if ui
-                    .add(egui::DragValue::new(val).speed(0.5).suffix(" mm"))
+                    .add(egui::DragValue::new(val).speed(0.5).suffix(unit))
                     .changed()
                 {
                     changed = true;
@@ -1665,6 +1828,45 @@ fn edit_scalar_param(ui: &mut egui::Ui, label: &str, param: &mut ScalarParam) ->
             }
         }
     });
+    changed
+}
+
+/// Editors for revolve / pattern / mirror / shell parameters (shared by the property
+/// panel and the floating editor).
+fn edit_operation_params(ui: &mut egui::Ui, kind: &mut FeatureKind) -> bool {
+    let mut changed = false;
+    match kind {
+        FeatureKind::SketchRevolve { angle_deg, .. } => {
+            changed |= edit_scalar_param_unit(ui, "回転角度", angle_deg, "°");
+        }
+        FeatureKind::Pattern { layout, .. } => match layout {
+            cad_core::PatternLayout::Circular {
+                count,
+                total_angle_deg,
+                ..
+            } => {
+                ui.horizontal(|ui| {
+                    ui.label("個数");
+                    changed |= ui.add(egui::DragValue::new(count).range(2..=360)).changed();
+                });
+                changed |= edit_scalar_param_unit(ui, "全体の角度", total_angle_deg, "°");
+            }
+            cad_core::PatternLayout::Linear { count, spacing, .. } => {
+                ui.horizontal(|ui| {
+                    ui.label("個数");
+                    changed |= ui.add(egui::DragValue::new(count).range(2..=200)).changed();
+                });
+                changed |= edit_scalar_param(ui, "間隔", spacing);
+            }
+        },
+        FeatureKind::Mirror { merge, .. } => {
+            changed |= ui.checkbox(merge, "元の形状と結合する").changed();
+        }
+        FeatureKind::Shell { thickness, .. } => {
+            changed |= edit_scalar_param(ui, "壁の厚さ", thickness);
+        }
+        _ => {}
+    }
     changed
 }
 
@@ -1734,6 +1936,10 @@ impl eframe::App for FerroCadApp {
                     self.render_central_viewport(ctx, ui);
                 }
             });
+
+        if !self.sketch_mode {
+            self.render_tool_panel(ctx);
+        }
 
         if let Some((id, mut name)) = self.rename_target.take() {
             let mut keep_open = true;
@@ -1864,7 +2070,7 @@ mod tests {
             .unwrap()
             .volume_mm3;
 
-        app.start_sketch();
+        app.start_sketch_with(SketchStart::Extrude);
         assert!(app.sketch_plane_picking);
         app.begin_sketch_on_face(plate, top.index);
         assert!(app.sketch_mode && !app.sketch_plane_picking);
@@ -1914,7 +2120,7 @@ mod tests {
         };
 
         shoot("main.png", &|_| {});
-        shoot("plane_picker.png", &|app| app.start_sketch());
+        shoot("plane_picker.png", &|app| app.start_sketch_with(SketchStart::Extrude));
         shoot("sketch_editor.png", &|app| {
             let plate = FeatureId(5);
             let shape = app.controller.document.features[&plate].cached_shape.unwrap();
@@ -1922,7 +2128,7 @@ mod tests {
                 .store
                 .resolve_face_by_signature(shape, glam::DVec3::Z, None, 0.99)
                 .unwrap();
-            app.start_sketch();
+            app.start_sketch_with(SketchStart::Extrude);
             app.begin_sketch_on_face(plate, top.index);
             let (_, [p0, p1, _, p3]) = app.sketch.add_rectangle(32.0, 18.0, 68.0, 42.0);
             let c = app.sketch.add_point(50.0, 30.0);
@@ -1934,6 +2140,126 @@ mod tests {
             app.sketch_selection = vec![SketchSel::Segment(p0, p1)];
             app.set_sketch_op(SketchOp::Cut);
         });
+
+        // M4: a flange with a ring of bolt holes, built through the app's own tools.
+        let build_flange = |app: &mut FerroCadApp| -> FeatureId {
+            for id in app.controller.document.features.keys().copied().collect::<Vec<_>>() {
+                app.execute_cmd(CadCommand::UpdateFeature {
+                    id,
+                    name: None,
+                    kind: None,
+                    visible: Some(false),
+                    color_rgba: None,
+                });
+            }
+            app.start_sketch_with(SketchStart::Revolve);
+            app.begin_sketch(SketchPlane::XZ, None);
+            let pts: Vec<_> = [[10.0, 0.0], [50.0, 0.0], [50.0, 8.0], [20.0, 8.0], [20.0, 25.0], [10.0, 25.0]]
+                .iter()
+                .map(|p| app.sketch.add_point(p[0], p[1]))
+                .collect();
+            app.sketch.add_polyline(pts, true);
+            app.finish_sketch_extrude();
+            let flange = *app.controller.document.features.keys().next_back().unwrap();
+            app.sketch_target = Some(flange);
+            app.start_sketch_with(SketchStart::Hole);
+            app.begin_sketch(SketchPlane::XY, Some(flange));
+            app.set_sketch_op(SketchOp::Cut);
+            assert!(!app.sketch_reversed, "the flange is above XY, so the cut must head +Z");
+            app.sketch_through_all = true;
+            let c = app.sketch.add_point(35.0, 0.0);
+            app.sketch.add_circle(c, 4.0);
+            app.finish_sketch_extrude();
+            *app.controller.document.features.keys().next_back().unwrap()
+        };
+        shoot("m4_flange.png", &|app| {
+            let hole = build_flange(app);
+            app.render_config.selected_feature = Some(hole);
+            app.open_tool_panel(ToolKind::CircularPattern);
+            let panel = app.tool_panel.take().unwrap();
+            app.confirm_tool(panel);
+            app.render_config.selected_feature = None;
+            app.fit_all();
+        });
+        shoot("m4_pattern_panel.png", &|app| {
+            let hole = build_flange(app);
+            app.render_config.selected_feature = Some(hole);
+            app.fit_all();
+            app.open_tool_panel(ToolKind::CircularPattern);
+        });
+        shoot("m4_revolve_sketch.png", &|app| {
+            app.start_sketch_with(SketchStart::Revolve);
+            app.begin_sketch(SketchPlane::XZ, None);
+            let pts: Vec<_> = [[10.0, 0.0], [50.0, 0.0], [50.0, 8.0], [20.0, 8.0], [20.0, 25.0], [10.0, 25.0]]
+                .iter()
+                .map(|p| app.sketch.add_point(p[0], p[1]))
+                .collect();
+            app.sketch.add_polyline(pts, true);
+            app.resolve_sketch();
+            app.sketch_tool = SketchTool::Select;
+        });
+    }
+
+    /// M4 flow through the app: revolve a flange on the XZ plane, drill one hole with
+    /// the 穴 tool, ring it with a circular pattern panel, then mirror a block and shell
+    /// a box via their panels.
+    #[test]
+    fn m4_flange_via_tools() {
+        let mut app = FerroCadApp::new_with_mvp_demo();
+        let vol = |app: &FerroCadApp, id: FeatureId| {
+            app.controller.document.features[&id].cached_summary.expect("computed").volume_mm3
+        };
+        let last = |app: &FerroCadApp| *app.controller.document.features.keys().next_back().unwrap();
+
+        // Revolve: L-profile on XZ about the sketch's vertical axis (world Z).
+        app.start_sketch_with(SketchStart::Revolve);
+        app.begin_sketch(SketchPlane::XZ, None);
+        assert!(app.sketch_revolve);
+        let pts: Vec<_> = [[10.0, 0.0], [50.0, 0.0], [50.0, 8.0], [20.0, 8.0], [20.0, 25.0], [10.0, 25.0]]
+            .iter()
+            .map(|p| app.sketch.add_point(p[0], p[1]))
+            .collect();
+        app.sketch.add_polyline(pts, true);
+        app.finish_sketch_extrude();
+        let flange = last(&app);
+        let flange_vol = 24_300.0 * std::f64::consts::PI;
+        assert!((vol(&app, flange) - flange_vol).abs() < 1.0);
+
+        // 穴 tool: the face picked is the flange's bottom; through-all cut by default.
+        let shape = app.controller.document.features[&flange].cached_shape.unwrap();
+        let bottom = app
+            .store
+            .resolve_face_by_signature(shape, glam::DVec3::NEG_Z, None, 0.99)
+            .unwrap();
+        app.start_sketch_with(SketchStart::Hole);
+        app.begin_sketch_on_face(flange, bottom.index);
+        assert_eq!(app.sketch_tool, SketchTool::Circle);
+        assert_eq!(app.sketch_op, SketchOp::Cut);
+        assert!(app.sketch_through_all);
+        // Bottom face is viewed from below, so sketch X runs along world X: (35, 0).
+        let c = app.sketch.add_point(35.0, 0.0);
+        app.sketch.add_circle(c, 4.0);
+        app.finish_sketch_extrude();
+        let hole = last(&app);
+        let hole_area = 0.5 * 48.0 * 16.0 * (std::f64::consts::TAU / 48.0).sin();
+        assert!((vol(&app, hole) - (flange_vol - hole_area * 8.0)).abs() < 1.0, "{}", vol(&app, hole));
+
+        // Circular pattern panel: defaults to the target's centre, axis Z, 6 x 360°.
+        app.render_config.selected_feature = Some(hole);
+        app.open_tool_panel(ToolKind::CircularPattern);
+        let panel = app.tool_panel.take().unwrap();
+        match &panel {
+            ToolPanel::CircularPattern { axis, center, count, .. } => {
+                assert_eq!((*axis, *count), (2, 6));
+                assert!(center[0].abs() < 1e-6 && center[1].abs() < 1e-6);
+            }
+            other => panic!("unexpected panel {other:?}"),
+        }
+        app.confirm_tool(panel);
+        let ring = last(&app);
+        assert!((vol(&app, ring) - (flange_vol - 6.0 * hole_area * 8.0)).abs() < 1.0, "{}", vol(&app, ring));
+        assert!(!app.controller.document.features[&hole].visible);
+        assert!(app.controller.document.features[&ring].visible);
     }
 
     /// M3 flow: draw a rectangle with a circle inside, constrain it fully with
@@ -1945,7 +2271,7 @@ mod tests {
         use cad_core::{SketchConstraint, SketchStatus};
 
         let mut app = FerroCadApp::new_with_mvp_demo();
-        app.start_sketch();
+        app.start_sketch_with(SketchStart::Extrude);
         app.begin_sketch(SketchPlane::XY, None);
         let (_, [p0, p1, p2, p3]) = app.sketch.add_rectangle(200.0, 0.0, 280.0, 50.0);
         let c = app.sketch.add_point(240.0, 25.0);
@@ -1986,7 +2312,7 @@ mod tests {
             .store
             .resolve_face_by_signature(shape, glam::DVec3::Z, None, 0.99)
             .unwrap();
-        app.start_sketch();
+        app.start_sketch_with(SketchStart::Extrude);
         app.begin_sketch_on_face(base, top.index);
         app.sketch.add_rectangle(205.0, 5.0, 215.0, 15.0);
         app.set_sketch_op(SketchOp::Cut);

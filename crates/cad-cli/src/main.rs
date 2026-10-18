@@ -119,6 +119,7 @@ fn run_m2_demo(output_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
             mode: ExtrudeMode::Cut { target: plate },
             reversed: true,
             symmetric: false,
+            through_all: false,
         },
         true,
         [0.55, 0.72, 0.9, 1.0],

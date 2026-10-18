@@ -137,7 +137,7 @@ impl FerroCadApp {
     }
 
     /// Solves the sketch in place and records the result.
-    fn resolve_sketch(&mut self) {
+    pub(crate) fn resolve_sketch(&mut self) {
         self.sketch_report = Some(self.sketch.solve(80, 1e-10));
     }
 
@@ -496,6 +496,28 @@ impl FerroCadApp {
             }
         }
         self.draw_constraint_glyphs(&painter, view);
+
+        // Revolve axis, extended across the canvas.
+        if self.sketch_revolve {
+            let (a, d) = match self.sketch_axis {
+                cad_core::SketchAxis::Y => ([0.0, 0.0], [0.0, 1.0]),
+                cad_core::SketchAxis::X => ([0.0, 0.0], [1.0, 0.0]),
+                cad_core::SketchAxis::Line { a, b } => {
+                    let (pa, pb) = (self.sketch_pos(a), self.sketch_pos(b));
+                    let len = dist_mm(pa, pb).max(1e-9);
+                    (pa, [(pb[0] - pa[0]) / len, (pb[1] - pa[1]) / len])
+                }
+            };
+            let reach = (rect.width() + rect.height()) as f64 / px as f64;
+            let p0 = view.to_screen([a[0] - d[0] * reach, a[1] - d[1] * reach]);
+            let p1 = view.to_screen([a[0] + d[0] * reach, a[1] + d[1] * reach]);
+            painter.extend(egui::Shape::dashed_line(
+                &[p0, p1],
+                egui::Stroke::new(1.5_f32, Color32::from_rgb(200, 120, 255)),
+                10.0,
+                6.0,
+            ));
+        }
 
         // Preview of the shape the active tool will create.
         if let Some((cur, _)) = snap_preview {
@@ -968,7 +990,9 @@ impl FerroCadApp {
                         }
                     });
 
-                    if let Some(report) = &self.sketch_report {
+                    if self.sketch.points.is_empty() {
+                        ui.weak("まだ図形がありません。上のツールで描き始めてください");
+                    } else if let Some(report) = &self.sketch_report {
                         let (text, color) = match report.status {
                             SketchStatus::FullyConstrained => {
                                 ("✓ 完全拘束（形と位置がすべて決まっています）".to_string(), COLOR_FULL)
@@ -1016,7 +1040,20 @@ impl FerroCadApp {
 
                     ui.separator();
                     ui.horizontal(|ui| {
-                        ui.label("押し出し:");
+                        ui.label("立体化:");
+                        let locked = self.sketch_editing.is_some();
+                        for (revolve, label) in [(false, "押し出し"), (true, "回転")] {
+                            if ui
+                                .add_enabled(!locked, egui::SelectableLabel::new(self.sketch_revolve == revolve, label))
+                                .on_disabled_hover_text("編集中のフィーチャーの種類は変更できません")
+                                .clicked()
+                            {
+                                self.sketch_revolve = revolve;
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("結果:");
                         let has_target = self.sketch_target.is_some();
                         let target_hint = match self.sketch_target {
                             Some(t) => format!("「{}」と組み合わせます", self.feature_name(t)),
@@ -1045,27 +1082,83 @@ impl FerroCadApp {
                             }
                         }
                     });
-                    ui.horizontal(|ui| {
-                        ui.label("量:");
-                        if let Some(expr) = &self.sketch_depth_expr {
-                            ui.label(format!("式 {expr}")).on_hover_text("式で指定された量はそのまま保持されます");
-                        } else {
+                    if self.sketch_revolve {
+                        let selected_line = self.sketch_selection.iter().find_map(|s| match s {
+                            SketchSel::Segment(a, b) => Some((*a, *b)),
+                            _ => None,
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("軸:");
+                            if ui
+                                .selectable_label(self.sketch_axis == cad_core::SketchAxis::Y, "縦軸 (Y)")
+                                .clicked()
+                            {
+                                self.sketch_axis = cad_core::SketchAxis::Y;
+                            }
+                            if ui
+                                .selectable_label(self.sketch_axis == cad_core::SketchAxis::X, "横軸 (X)")
+                                .clicked()
+                            {
+                                self.sketch_axis = cad_core::SketchAxis::X;
+                            }
+                            let is_line = matches!(self.sketch_axis, cad_core::SketchAxis::Line { .. });
+                            if ui
+                                .add_enabled(
+                                    selected_line.is_some() || is_line,
+                                    egui::SelectableLabel::new(is_line, "選択した線"),
+                                )
+                                .on_hover_text("選択ツールで線を1本選んでから押すと、その線を軸にします")
+                                .on_disabled_hover_text("選択ツールで軸にしたい線を1本選んでください")
+                                .clicked()
+                                && let Some((a, b)) = selected_line
+                            {
+                                self.sketch_axis = cad_core::SketchAxis::Line { a, b };
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("角度:");
                             ui.add(
-                                egui::DragValue::new(&mut self.sketch_depth)
-                                    .speed(0.5)
-                                    .suffix(" mm")
-                                    .range(0.1..=100000.0),
+                                egui::DragValue::new(&mut self.sketch_angle)
+                                    .speed(1.0)
+                                    .suffix("°")
+                                    .range(1.0..=360.0),
                             );
-                        }
-                        ui.checkbox(&mut self.sketch_reversed, "方向を反転")
-                            .on_hover_text("切り取りでは、既定で面の内側（材料側）へ向かいます");
-                        ui.checkbox(&mut self.sketch_symmetric, "両側");
-                    });
+                            ui.small("輪郭は軸の片側に描いてください（紫の破線が軸）");
+                        });
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label("量:");
+                            let through = self.sketch_through_all && self.sketch_op != SketchOp::NewBody;
+                            if through {
+                                ui.weak("（貫通）");
+                            } else if let Some(expr) = &self.sketch_depth_expr {
+                                ui.label(format!("式 {expr}")).on_hover_text("式で指定された量はそのまま保持されます");
+                            } else {
+                                ui.add(
+                                    egui::DragValue::new(&mut self.sketch_depth)
+                                        .speed(0.5)
+                                        .suffix(" mm")
+                                        .range(0.1..=100000.0),
+                                );
+                            }
+                            ui.add_enabled(
+                                self.sketch_op != SketchOp::NewBody,
+                                egui::Checkbox::new(&mut self.sketch_through_all, "貫通"),
+                            )
+                            .on_hover_text("対象のボディを突き抜けるまで押し出します")
+                            .on_disabled_hover_text("結合・切り取りのときに使えます");
+                            ui.checkbox(&mut self.sketch_reversed, "方向を反転")
+                                .on_hover_text("切り取りでは、既定で面の内側（材料側）へ向かいます");
+                            ui.checkbox(&mut self.sketch_symmetric, "両側");
+                        });
+                    }
 
                     let loops = self.sketch.extract_closed_profiles().len();
                     ui.horizontal(|ui| {
                         let label = if self.sketch_editing.is_some() {
                             "✓ 更新して閉じる"
+                        } else if self.sketch_revolve {
+                            "✓ 回転して閉じる"
                         } else {
                             "✓ 押し出して閉じる"
                         };
@@ -1108,13 +1201,33 @@ impl FerroCadApp {
             (SketchOp::Cut, Some(target)) => (ExtrudeMode::Cut { target }, "Cut"),
             _ => (ExtrudeMode::NewBody, "Extrude"),
         };
-        let kind = FeatureKind::SketchExtrude {
-            sketch: self.sketch.clone(),
-            depth,
-            plane: self.sketch_plane.clone(),
-            mode,
-            reversed: self.sketch_reversed,
-            symmetric: self.sketch_symmetric,
+        let kind = if self.sketch_revolve {
+            FeatureKind::SketchRevolve {
+                sketch: self.sketch.clone(),
+                plane: self.sketch_plane.clone(),
+                axis: self.sketch_axis,
+                angle_deg: ScalarParam::Literal(self.sketch_angle.clamp(1.0, 360.0)),
+                mode,
+            }
+        } else {
+            FeatureKind::SketchExtrude {
+                sketch: self.sketch.clone(),
+                depth,
+                plane: self.sketch_plane.clone(),
+                mode,
+                reversed: self.sketch_reversed,
+                symmetric: self.sketch_symmetric,
+                through_all: self.sketch_through_all && mode != ExtrudeMode::NewBody,
+            }
+        };
+        let base_name = if self.sketch_revolve {
+            match mode {
+                ExtrudeMode::NewBody => "Revolve",
+                ExtrudeMode::Join { .. } => "RevolveJoin",
+                ExtrudeMode::Cut { .. } => "RevolveCut",
+            }
+        } else {
+            base_name
         };
 
         if let Some(id) = self.sketch_editing.take() {

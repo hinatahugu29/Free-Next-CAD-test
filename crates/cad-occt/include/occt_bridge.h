@@ -82,6 +82,20 @@ std::unique_ptr<OcctShapeHandle> fillet_all_edges(
     const OcctShapeHandle& handle,
     double radius
 );
+std::unique_ptr<OcctShapeHandle> mirror_shape(
+    const OcctShapeHandle& handle,
+    double ox,
+    double oy,
+    double oz,
+    double nx,
+    double ny,
+    double nz
+);
+std::unique_ptr<OcctShapeHandle> make_thick_solid(
+    const OcctShapeHandle& handle,
+    rust::Slice<const uint32_t> removed_face_indices,
+    double thickness
+);
 std::unique_ptr<OcctShapeHandle> fillet_selected_edges(
     const OcctShapeHandle& handle,
     rust::Slice<const uint32_t> edge_indices,
