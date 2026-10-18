@@ -91,6 +91,23 @@ impl FerroCadApp {
                     thickness: 2.0,
                 }
             }
+            ToolKind::OffsetPlane => {
+                let Some((fid, face_index)) = self.render_config.selected_face else {
+                    return;
+                };
+                let Some(shape) = self.controller.document.features.get(&fid).and_then(|f| f.cached_shape) else {
+                    return;
+                };
+                let Ok(face) = SemanticReference::from_face(fid, &self.store, shape, face_index) else {
+                    self.status_logs.push("選んだ面を基準にできませんでした".to_string());
+                    return;
+                };
+                ToolPanel::OffsetPlane {
+                    input: fid,
+                    face,
+                    offset: 10.0,
+                }
+            }
         });
     }
 
@@ -118,6 +135,7 @@ impl FerroCadApp {
             ToolPanel::Mirror { .. } => "∥ ミラー",
             ToolPanel::Boolean { .. } => "◆ ブーリアン",
             ToolPanel::Shell { .. } => "□ シェル",
+            ToolPanel::OffsetPlane { .. } => "▱ オフセット面からスケッチ",
         };
         let mut confirm = false;
         let mut cancel = false;
@@ -284,6 +302,14 @@ impl FerroCadApp {
                             ui.add(egui::DragValue::new(thickness).speed(0.1).range(0.05..=1000.0).suffix(" mm"));
                         });
                         ui.small("外形はそのままで、内側をくり抜きます");
+                    }
+                    ToolPanel::OffsetPlane { input, offset, .. } => {
+                        ui.label(format!("基準面: 「{}」", self.feature_name(*input)));
+                        ui.horizontal(|ui| {
+                            ui.label("面からの距離:");
+                            ui.add(egui::DragValue::new(offset).speed(0.5).suffix(" mm"));
+                        });
+                        ui.small("プラスは面の法線方向、マイナスは反対方向です。確定すると、この平面でスケッチを開始します。");
                     }
                 }
 
@@ -484,6 +510,18 @@ impl FerroCadApp {
                     input,
                     &[input],
                 );
+            }
+            ToolPanel::OffsetPlane { input, face, offset } => {
+                self.start_sketch_with(SketchStart::Extrude);
+                self.begin_sketch(
+                    SketchPlane::OffsetFace {
+                        feature: input,
+                        face,
+                        offset: ScalarParam::Literal(offset),
+                    },
+                    Some(input),
+                );
+                self.status_logs.push("オフセット面でスケッチを開始しました".to_string());
             }
         }
     }

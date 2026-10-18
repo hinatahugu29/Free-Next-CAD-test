@@ -245,6 +245,8 @@ pub enum ToolKind {
     Mirror,
     Boolean,
     Shell,
+    /// Start a sketch on a plane parallel to the currently selected face.
+    OffsetPlane,
 }
 
 /// What the sketch being started will become.
@@ -293,6 +295,11 @@ pub enum ToolPanel {
     Shell {
         input: FeatureId,
         thickness: f64,
+    },
+    OffsetPlane {
+        input: FeatureId,
+        face: SemanticReference,
+        offset: f64,
     },
 }
 
@@ -502,7 +509,9 @@ impl FerroCadApp {
         self.sketch_target = target;
         // Sketching on a face usually means adding to that body; a base-plane sketch
         // usually starts a new one.
-        self.set_sketch_op(if target.is_some() && matches!(self.sketch_plane, SketchPlane::Face { .. }) {
+        self.set_sketch_op(if target.is_some()
+            && matches!(self.sketch_plane, SketchPlane::Face { .. } | SketchPlane::OffsetFace { .. })
+        {
             SketchOp::Join
         } else {
             SketchOp::NewBody
@@ -882,6 +891,19 @@ impl FerroCadApp {
                         },
                     ) {
                         self.open_tool_panel(ToolKind::Shell);
+                    }
+                    if ribbon_button(
+                        ui,
+                        "▱",
+                        "オフセット面",
+                        face_selected,
+                        if face_selected {
+                            "選択面から平行な距離指定面を作り、そこからスケッチを始めます"
+                        } else {
+                            "先に3Dビューで基準となる平らな面をクリックしてください"
+                        },
+                    ) {
+                        self.open_tool_panel(ToolKind::OffsetPlane);
                     }
                 });
                 ribbon_group(ui, "パターン・組み合わせ", |ui| {
@@ -2793,6 +2815,32 @@ mod tests {
         app.delete_feature(plate);
         assert_eq!(app.controller.document.features.len(), features_before);
         assert!(app.status_logs.last().unwrap().contains("使われているため削除できません"));
+    }
+
+    #[test]
+    fn m7_offset_plane_starts_a_following_face_sketch() {
+        let mut app = FerroCadApp::new_with_mvp_demo();
+        let plate = FeatureId(5);
+        let shape = app.controller.document.features[&plate].cached_shape.unwrap();
+        let top = app
+            .store
+            .resolve_face_by_signature(shape, glam::DVec3::Z, None, 0.99)
+            .unwrap();
+        app.select_pick(plate, top.index, None, false);
+        app.open_tool_panel(ToolKind::OffsetPlane);
+        let mut panel = app.tool_panel.take().expect("offset panel opens for a selected face");
+        if let ToolPanel::OffsetPlane { offset, .. } = &mut panel {
+            *offset = 12.5;
+        } else {
+            panic!("expected offset-plane panel");
+        }
+        app.confirm_tool(panel);
+
+        assert!(app.sketch_mode);
+        assert_eq!(app.sketch_target, Some(plate));
+        assert!(matches!(app.sketch_plane, SketchPlane::OffsetFace { .. }));
+        assert!(app.sketch_frame.normal.z > 0.99);
+        assert!((app.sketch_frame.origin.z - (top.centroid.z + 12.5)).abs() < 1e-6);
     }
 
     /// Renders the real UI offscreen (egui_kittest + wgpu) to PNGs under

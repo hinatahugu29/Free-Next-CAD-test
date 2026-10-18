@@ -972,6 +972,13 @@ impl FerroCadApp {
                         SketchPlane::XZ => "XZ平面".to_string(),
                         SketchPlane::YZ => "YZ平面".to_string(),
                         SketchPlane::Face { feature, .. } => format!("「{}」の面", self.feature_name(*feature)),
+                        SketchPlane::OffsetFace { feature, offset, .. } => {
+                            let distance = match offset {
+                                ScalarParam::Literal(value) => format!("{value:.2} mm"),
+                                ScalarParam::Expr(expression) => expression.clone(),
+                            };
+                            format!("「{}」の面から {}", self.feature_name(*feature), distance)
+                        }
                     };
                     let editing = self
                         .sketch_editing

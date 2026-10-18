@@ -178,12 +178,19 @@ pub enum SketchPlane {
         feature: FeatureId,
         face: SemanticReference,
     },
+    /// A plane parallel to a referenced face, translated along its normal by `offset`.
+    /// This is stored on sketch features so the construction plane follows upstream edits.
+    OffsetFace {
+        feature: FeatureId,
+        face: SemanticReference,
+        offset: ScalarParam,
+    },
 }
 
 impl SketchPlane {
     fn feature(&self) -> Option<FeatureId> {
         match self {
-            Self::Face { feature, .. } => Some(*feature),
+            Self::Face { feature, .. } | Self::OffsetFace { feature, .. } => Some(*feature),
             _ => None,
         }
     }
@@ -745,7 +752,7 @@ impl FeatureKind {
             }
             Self::Mirror {
                 input,
-                plane: SketchPlane::Face { feature, .. },
+                plane: SketchPlane::Face { feature, .. } | SketchPlane::OffsetFace { feature, .. },
                 ..
             } => {
                 if input == feature {
@@ -797,7 +804,7 @@ impl FeatureKind {
             | Self::Shell { input, .. } => swap(input),
             Self::Mirror { input, plane, .. } => {
                 swap(input);
-                if let SketchPlane::Face { feature, .. } = plane {
+                if let SketchPlane::Face { feature, .. } | SketchPlane::OffsetFace { feature, .. } = plane {
                     swap(feature);
                 }
             }
@@ -808,7 +815,7 @@ impl FeatureKind {
                 swap(secondary);
             }
             Self::SketchExtrude { plane, mode, .. } | Self::SketchRevolve { plane, mode, .. } => {
-                if let SketchPlane::Face { feature, .. } = plane {
+                if let SketchPlane::Face { feature, .. } | SketchPlane::OffsetFace { feature, .. } = plane {
                     swap(feature);
                 }
                 if let ExtrudeMode::Join { target } | ExtrudeMode::Cut { target } = mode {
@@ -857,7 +864,7 @@ impl FeatureKind {
             Self::SketchExtrude { plane, .. }
             | Self::SketchRevolve { plane, .. }
             | Self::Mirror { plane, .. } => {
-                if let SketchPlane::Face { feature, face } = plane {
+                if let SketchPlane::Face { feature, face } | SketchPlane::OffsetFace { feature, face, .. } = plane {
                     out.push(RefSlot {
                         role: RefRole::Plane,
                         upstream: *feature,
@@ -896,7 +903,7 @@ impl FeatureKind {
                 | Self::Mirror { plane, .. },
                 RefRole::Plane,
             ) => match plane {
-                SketchPlane::Face { face, .. } => {
+                SketchPlane::Face { face, .. } | SketchPlane::OffsetFace { face, .. } => {
                     *face = reference;
                     true
                 }
@@ -1650,7 +1657,7 @@ impl Document {
             SketchPlane::XY => Ok(PlaneFrame::from_point_normal(DVec3::ZERO, DVec3::Z)),
             SketchPlane::XZ => Ok(PlaneFrame::from_point_normal(DVec3::ZERO, DVec3::NEG_Y)),
             SketchPlane::YZ => Ok(PlaneFrame::from_point_normal(DVec3::ZERO, DVec3::X)),
-            SketchPlane::Face { feature, face } => {
+            SketchPlane::Face { feature, face } | SketchPlane::OffsetFace { feature, face, .. } => {
                 let shape_id = self
                     .features
                     .get(feature)
@@ -1662,7 +1669,14 @@ impl Document {
                         reason,
                     }
                 })?;
-                Ok(PlaneFrame::from_point_normal(resolved.centroid, resolved.normal))
+                let offset = match plane {
+                    SketchPlane::OffsetFace { offset, .. } => offset.evaluate(&self.resolve_all_parameters()?)?,
+                    _ => 0.0,
+                };
+                Ok(PlaneFrame::from_point_normal(
+                    resolved.centroid + resolved.normal * offset,
+                    resolved.normal,
+                ))
             }
         }
     }
