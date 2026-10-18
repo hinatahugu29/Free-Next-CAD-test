@@ -667,6 +667,8 @@ pub enum FeatureKind {
         upper: Sketch,
         distance: ScalarParam,
     },
+    /// Circular profile swept along one straight parametric path.
+    SweepCircle { radius: ScalarParam, dx: ScalarParam, dy: ScalarParam, dz: ScalarParam },
     /// Repeats a feature. With `tool_only` and a sketch Join/Cut input, the input's tool
     /// is repeated on its target (e.g. a ring of holes); otherwise the input's body is
     /// repeated and fused. The choice is stored, not inferred, so re-wiring the input
@@ -773,6 +775,7 @@ impl FeatureKind {
             | Self::ExtrudeCircle { .. }
             | Self::RevolvePolygon { .. }
             | Self::Loft { .. }
+            | Self::SweepCircle { .. }
             | Self::ImportedBody { .. } => Vec::new(),
             Self::Pattern { input, .. } | Self::Mirror { input, plane: SketchPlane::XY | SketchPlane::XZ | SketchPlane::YZ, .. } | Self::Shell { input, .. } => {
                 vec![*input]
@@ -1071,6 +1074,7 @@ impl FeatureKind {
             }
             Self::SketchRevolve { angle_deg, .. } => add(angle_deg),
             Self::Loft { distance, .. } => add(distance),
+            Self::SweepCircle { radius, dx, dy, dz } => { add(radius); add(dx); add(dy); add(dz); }
             Self::Pattern { layout, .. } => match layout {
                 PatternLayout::Circular { total_angle_deg, .. } => add(total_angle_deg),
                 PatternLayout::Linear { spacing, .. } => add(spacing),
@@ -2350,6 +2354,10 @@ impl Document {
                     distance.evaluate(params)?,
                 )?)
             }
+            FeatureKind::SweepCircle { radius, dx, dy, dz } => Ok(store.sweep_circle(
+                Length::mm(radius.evaluate(params)?),
+                DVec3::new(dx.evaluate(params)?, dy.evaluate(params)?, dz.evaluate(params)?),
+            )?),
             FeatureKind::Pattern {
                 input,
                 layout,

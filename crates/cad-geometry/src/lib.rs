@@ -783,6 +783,12 @@ impl ShapeStore {
         self.insert(res)
     }
 
+    /// Sweeps a circular profile from the origin along a straight path.
+    pub fn sweep_circle(&mut self, radius: Length, direction: DVec3) -> Result<ShapeId, GeometryError> {
+        let radius = radius.ensure_positive("sweep radius")?;
+        self.insert(OcctShape::sweep_circle(radius, direction.to_array())?)
+    }
+
     /// Returns the volume in $\text{mm}^3$.
     pub fn volume(&self, id: ShapeId) -> Result<f64, GeometryError> {
         Ok(self.get(id)?.volume()?)
