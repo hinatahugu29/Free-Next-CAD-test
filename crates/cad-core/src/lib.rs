@@ -658,6 +658,13 @@ pub enum FeatureKind {
         angle_deg: ScalarParam,
         mode: ExtrudeMode,
     },
+    /// Solid loft between two closed sketches in the common XY sketch frame.
+    /// The upper profile is placed `distance` millimeters along +Z.
+    Loft {
+        lower: Sketch,
+        upper: Sketch,
+        distance: ScalarParam,
+    },
     /// Repeats a feature. With `tool_only` and a sketch Join/Cut input, the input's tool
     /// is repeated on its target (e.g. a ring of holes); otherwise the input's body is
     /// repeated and fused. The choice is stored, not inferred, so re-wiring the input
@@ -761,6 +768,7 @@ impl FeatureKind {
             | Self::ExtrudePolygon { .. }
             | Self::ExtrudeCircle { .. }
             | Self::RevolvePolygon { .. }
+            | Self::Loft { .. }
             | Self::ImportedBody { .. } => Vec::new(),
             Self::Pattern { input, .. } | Self::Mirror { input, plane: SketchPlane::XY | SketchPlane::XZ | SketchPlane::YZ, .. } | Self::Shell { input, .. } => {
                 vec![*input]
@@ -1052,6 +1060,7 @@ impl FeatureKind {
                 add(spacing_z);
             }
             Self::SketchRevolve { angle_deg, .. } => add(angle_deg),
+            Self::Loft { distance, .. } => add(distance),
             Self::Pattern { layout, .. } => match layout {
                 PatternLayout::Circular { total_angle_deg, .. } => add(total_angle_deg),
                 PatternLayout::Linear { spacing, .. } => add(spacing),
@@ -2315,6 +2324,21 @@ impl Document {
             FeatureKind::SketchExtrude { mode, .. } | FeatureKind::SketchRevolve { mode, .. } => {
                 let tool = self.sketch_tool(kind, params, store)?;
                 self.combine_with_target(tool, *mode, store)
+            }
+            FeatureKind::Loft { lower, upper, distance } => {
+                let (_, lower_loops) = solved_loops(lower)?;
+                let (_, upper_loops) = solved_loops(upper)?;
+                if lower_loops.len() != 1 || upper_loops.len() != 1 {
+                    return Err(CoreError::Geometry(GeometryError::InvalidParameter {
+                        name: "Loft".to_string(),
+                        reason: "初期版のロフトは、各断面が1つの閉じた輪郭である必要があります".to_string(),
+                    }));
+                }
+                Ok(store.loft_profiles(
+                    &lower_loops[0].segments,
+                    &upper_loops[0].segments,
+                    distance.evaluate(params)?,
+                )?)
             }
             FeatureKind::Pattern {
                 input,

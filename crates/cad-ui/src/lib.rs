@@ -122,6 +122,7 @@ fn feature_parameter_slots(kind: &FeatureKind) -> Vec<(&'static str, &ScalarPara
         FeatureKind::SketchRevolve { angle_deg, .. } | FeatureKind::RevolvePolygon { angle_deg, .. } => {
             vec![("回転角", angle_deg)]
         }
+        FeatureKind::Loft { distance, .. } => vec![("断面間距離", distance)],
         FeatureKind::ExtrudeCircle { radius, depth } => vec![("半径", radius), ("押し出し量", depth)],
         FeatureKind::Transform { dx, dy, dz, rot_angle_deg, .. } => vec![
             ("移動 X", dx),
