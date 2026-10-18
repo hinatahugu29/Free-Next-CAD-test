@@ -36,6 +36,7 @@
 #include <BRepAlgoAPI_Fuse.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
 #include <BRepAlgoAPI_Common.hxx>
+#include <BOPAlgo_Splitter.hxx>
 
 #include <BRepOffsetAPI_MakeThickSolid.hxx>
 #include <BRepOffsetAPI_DraftAngle.hxx>
@@ -402,6 +403,22 @@ std::unique_ptr<OcctShapeHandle> boolean_common(
     } catch (const Standard_Failure& e) {
         rethrow_occt_exception(e);
     }
+}
+
+std::unique_ptr<OcctShapeHandle> split_shape(const OcctShapeHandle& input, const OcctShapeHandle& tool) {
+    try {
+        TopTools_ListOfShape arguments, tools;
+        arguments.Append(input.shape());
+        tools.Append(tool.shape());
+        BOPAlgo_Splitter splitter;
+        splitter.SetArguments(arguments);
+        splitter.SetTools(tools);
+        splitter.Perform();
+        if (splitter.HasErrors()) throw std::runtime_error("Split failed: the bodies may not intersect cleanly");
+        TopoDS_Shape result = splitter.Shape();
+        if (result.IsNull()) throw std::runtime_error("Split returned an empty result");
+        return std::make_unique<OcctShapeHandle>(result);
+    } catch (const Standard_Failure& e) { rethrow_occt_exception(e); }
 }
 
 std::unique_ptr<OcctShapeHandle> translate_shape(

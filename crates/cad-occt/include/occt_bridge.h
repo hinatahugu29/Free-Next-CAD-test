@@ -63,6 +63,10 @@ std::unique_ptr<OcctShapeHandle> boolean_common(
     const OcctShapeHandle& a,
     const OcctShapeHandle& b
 );
+std::unique_ptr<OcctShapeHandle> split_shape(
+    const OcctShapeHandle& input,
+    const OcctShapeHandle& tool
+);
 
 std::unique_ptr<OcctShapeHandle> translate_shape(
     const OcctShapeHandle& handle,

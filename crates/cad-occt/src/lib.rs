@@ -103,6 +103,7 @@ mod ffi {
             a: &OcctShapeHandle,
             b: &OcctShapeHandle,
         ) -> Result<UniquePtr<OcctShapeHandle>>;
+        fn split_shape(input: &OcctShapeHandle, tool: &OcctShapeHandle) -> Result<UniquePtr<OcctShapeHandle>>;
 
         fn translate_shape(
             handle: &OcctShapeHandle,
@@ -312,6 +313,11 @@ impl OcctShape {
     /// Boolean intersection (`Common`) of two shapes.
     pub fn common(&self, other: &Self) -> Result<Self, OcctError> {
         Self::from_ptr(ffi::boolean_common(self.as_ref()?, other.as_ref()?)?)
+    }
+
+    /// Partitions this shape using `tool`, retaining OCCT's split topology.
+    pub fn split(&self, tool: &Self) -> Result<Self, OcctError> {
+        Self::from_ptr(ffi::split_shape(self.as_ref()?, tool.as_ref()?)?)
     }
 
     /// Returns a new shape translated by `(dx, dy, dz)`.
@@ -601,5 +607,13 @@ mod tests {
         let solid = sewn.solid_from_shell().expect("solid from closed shell");
         assert!(solid.is_valid().expect("solid validity"));
         assert_eq!(solid.topology_counts().expect("counts").solids, 1);
+    }
+
+    #[test]
+    fn splitter_partitions_intersecting_solids() {
+        let base = OcctShape::make_box(20.0, 20.0, 20.0).expect("base");
+        let tool = OcctShape::make_box(10.0, 30.0, 30.0).expect("tool");
+        let split = base.split(&tool).expect("split");
+        assert!(split.is_valid().expect("split validity"));
     }
 }
