@@ -263,6 +263,7 @@ pub enum ToolKind {
     Counterbore,
     Countersink,
     Refine,
+    MidPlane,
 }
 
 /// What the sketch being started will become.
@@ -331,6 +332,7 @@ pub enum ToolPanel {
     Counterbore { input: FeatureId, hole_radius: f64, bore_radius: f64, bore_depth: f64, depth: f64 },
     Countersink { input: FeatureId, hole_radius: f64, sink_radius: f64, sink_depth: f64, depth: f64 },
     Refine { input: FeatureId },
+    MidPlane { first_feature: FeatureId, first: SemanticReference, second_feature: FeatureId, second: SemanticReference },
 }
 
 /// Action chosen from a timeline chip's right-click menu.
@@ -964,6 +966,9 @@ impl FerroCadApp {
                     }
                     if ribbon_button(ui, "▽", "皿穴", feature_selected, "原点位置に皿穴を作ります") {
                         self.open_tool_panel(ToolKind::Countersink);
+                    }
+                    if ribbon_button(ui, "≡", "中間面", self.render_config.selected_faces.len() >= 2, "平行な2面の中間でスケッチを始めます") {
+                        self.open_tool_panel(ToolKind::MidPlane);
                     }
                 });
                 ribbon_group(ui, "パターン・組み合わせ", |ui| {

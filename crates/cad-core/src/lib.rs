@@ -195,11 +195,12 @@ pub enum SketchPlane {
 }
 
 impl SketchPlane {
-    fn feature(&self) -> Option<FeatureId> {
+    fn features(&self) -> Vec<FeatureId> {
         match self {
-            Self::Face { feature, .. } | Self::OffsetFace { feature, .. } => Some(*feature),
-            Self::MidFace { first_feature, .. } => Some(*first_feature),
-            _ => None,
+            Self::Face { feature, .. } | Self::OffsetFace { feature, .. } => vec![*feature],
+            Self::MidFace { first_feature, second_feature, .. } if first_feature == second_feature => vec![*first_feature],
+            Self::MidFace { first_feature, second_feature, .. } => vec![*first_feature, *second_feature],
+            _ => Vec::new(),
         }
     }
 }
@@ -347,6 +348,10 @@ pub enum RefRole {
     OpenFace(usize),
     /// The face a sketch is drawn on, or a mirror plane face.
     Plane,
+    /// The first face defining a midpoint sketch plane.
+    MidPlaneFirst,
+    /// The second face defining a midpoint sketch plane.
+    MidPlaneSecond,
     /// A face tilted by a draft feature.
     DraftFace(usize),
     /// The fixed neutral plane of a draft feature.
@@ -824,7 +829,7 @@ impl FeatureKind {
             }
             Self::SketchExtrude { plane, mode, .. } | Self::SketchRevolve { plane, mode, .. } => {
                 let mut deps = Vec::new();
-                for id in [plane.feature(), mode.target()].into_iter().flatten() {
+                for id in plane.features().into_iter().chain(mode.target()) {
                     if !deps.contains(&id) {
                         deps.push(id);
                     }
@@ -877,8 +882,13 @@ impl FeatureKind {
             | Self::Shell { input, .. } => swap(input),
             Self::Mirror { input, plane, .. } => {
                 swap(input);
-                if let SketchPlane::Face { feature, .. } | SketchPlane::OffsetFace { feature, .. } = plane {
-                    swap(feature);
+                match plane {
+                    SketchPlane::Face { feature, .. } | SketchPlane::OffsetFace { feature, .. } => swap(feature),
+                    SketchPlane::MidFace { first_feature, second_feature, .. } => {
+                        swap(first_feature);
+                        swap(second_feature);
+                    }
+                    _ => {}
                 }
             }
             Self::Boolean {
@@ -888,8 +898,13 @@ impl FeatureKind {
                 swap(secondary);
             }
             Self::SketchExtrude { plane, mode, .. } | Self::SketchRevolve { plane, mode, .. } => {
-                if let SketchPlane::Face { feature, .. } | SketchPlane::OffsetFace { feature, .. } = plane {
-                    swap(feature);
+                match plane {
+                    SketchPlane::Face { feature, .. } | SketchPlane::OffsetFace { feature, .. } => swap(feature),
+                    SketchPlane::MidFace { first_feature, second_feature, .. } => {
+                        swap(first_feature);
+                        swap(second_feature);
+                    }
+                    _ => {}
                 }
                 if let ExtrudeMode::Join { target } | ExtrudeMode::Cut { target } = mode {
                     swap(target);
@@ -944,12 +959,15 @@ impl FeatureKind {
             Self::SketchExtrude { plane, .. }
             | Self::SketchRevolve { plane, .. }
             | Self::Mirror { plane, .. } => {
-                if let SketchPlane::Face { feature, face } | SketchPlane::OffsetFace { feature, face, .. } = plane {
-                    out.push(RefSlot {
-                        role: RefRole::Plane,
-                        upstream: *feature,
-                        reference: face.clone(),
-                    });
+                match plane {
+                    SketchPlane::Face { feature, face } | SketchPlane::OffsetFace { feature, face, .. } => {
+                        out.push(RefSlot { role: RefRole::Plane, upstream: *feature, reference: face.clone() });
+                    }
+                    SketchPlane::MidFace { first_feature, first, second_feature, second } => {
+                        out.push(RefSlot { role: RefRole::MidPlaneFirst, upstream: *first_feature, reference: first.clone() });
+                        out.push(RefSlot { role: RefRole::MidPlaneSecond, upstream: *second_feature, reference: second.clone() });
+                    }
+                    _ => {}
                 }
             }
             _ => {}
@@ -993,6 +1011,24 @@ impl FeatureKind {
                     *face = reference;
                     true
                 }
+                _ => false,
+            },
+            (
+                Self::SketchExtrude { plane, .. }
+                | Self::SketchRevolve { plane, .. }
+                | Self::Mirror { plane, .. },
+                RefRole::MidPlaneFirst,
+            ) => match plane {
+                SketchPlane::MidFace { first, .. } => { *first = reference; true }
+                _ => false,
+            },
+            (
+                Self::SketchExtrude { plane, .. }
+                | Self::SketchRevolve { plane, .. }
+                | Self::Mirror { plane, .. },
+                RefRole::MidPlaneSecond,
+            ) => match plane {
+                SketchPlane::MidFace { second, .. } => { *second = reference; true }
                 _ => false,
             },
             _ => false,
@@ -4180,5 +4216,45 @@ mod tests {
         assert!(report.is_all_clean());
         let vol = doc.features[&fid].cached_summary.unwrap().volume_mm3;
         assert!((vol - 50.0 * 30.0 * 12.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn midplane_sketch_tracks_both_semantic_faces() {
+        let mut store = ShapeStore::new();
+        let mut doc = Document::new("Midplane");
+        let plate = doc.add_feature(
+            "Plate",
+            FeatureKind::Box { width: ScalarParam::mm(40.0), height: ScalarParam::mm(30.0), depth: ScalarParam::mm(10.0) },
+            true,
+            [1.0; 4],
+        ).unwrap();
+        doc.recompute(&mut store, TessellationOptions::default()).unwrap();
+        let shape = doc.features[&plate].cached_shape.unwrap();
+        let top = store.resolve_face_by_signature(shape, DVec3::Z, None, 0.99).unwrap();
+        let bottom = store.resolve_face_by_signature(shape, DVec3::NEG_Z, None, 0.99).unwrap();
+        let plane = SketchPlane::MidFace {
+            first_feature: plate,
+            first: SemanticReference::from_face(plate, &store, shape, top.index).unwrap(),
+            second_feature: plate,
+            second: SemanticReference::from_face(plate, &store, shape, bottom.index).unwrap(),
+        };
+
+        let expected_z = (top.centroid.z + bottom.centroid.z) * 0.5;
+        assert!((doc.sketch_plane_frame(&plane, &store).unwrap().origin.z - expected_z).abs() < 1e-9);
+        let mut sketch = Sketch::new("Midplane Sketch");
+        sketch.add_rectangle(-5.0, -5.0, 5.0, 5.0);
+        let feature = FeatureKind::SketchExtrude {
+            sketch,
+            depth: ScalarParam::mm(2.0),
+            plane,
+            mode: ExtrudeMode::NewBody,
+            reversed: false,
+            symmetric: false,
+            through_all: false,
+        };
+        assert_eq!(feature.upstream_features(), vec![plate]);
+        assert_eq!(feature.reference_slots().len(), 2);
+        assert!(doc.add_feature("Midplane extrusion", feature, true, [1.0; 4]).is_ok());
+        assert!(doc.recompute(&mut store, TessellationOptions::default()).unwrap().is_all_clean());
     }
 }
