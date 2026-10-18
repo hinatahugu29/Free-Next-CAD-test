@@ -18,6 +18,8 @@ pub(crate) fn role_label(role: RefRole) -> String {
         RefRole::Edge(i) => format!("辺 {}", i + 1),
         RefRole::OpenFace(i) => format!("開口面 {}", i + 1),
         RefRole::Plane => "基準の面".to_string(),
+        RefRole::DraftFace(i) => format!("ドラフト面 {}", i + 1),
+        RefRole::DraftNeutral => "ドラフトの固定面".to_string(),
     }
 }
 

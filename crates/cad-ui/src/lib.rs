@@ -131,6 +131,7 @@ fn feature_parameter_slots(kind: &FeatureKind) -> Vec<(&'static str, &ScalarPara
         ],
         FeatureKind::Fillet { radius, .. } => vec![("フィレット半径", radius)],
         FeatureKind::Chamfer { distance, .. } => vec![("面取り距離", distance)],
+        FeatureKind::Draft { angle_deg, .. } => vec![("ドラフト角", angle_deg)],
         FeatureKind::LinearPattern { spacing_x, spacing_y, spacing_z, .. } => {
             vec![("ピッチ X", spacing_x), ("ピッチ Y", spacing_y), ("ピッチ Z", spacing_z)]
         }
