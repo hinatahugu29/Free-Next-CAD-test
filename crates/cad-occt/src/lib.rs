@@ -168,6 +168,7 @@ mod ffi {
             reversed: bool,
         ) -> Result<UniquePtr<OcctShapeHandle>>;
         fn push_pull_face(handle: &OcctShapeHandle, face_index: u32, distance: f64) -> Result<UniquePtr<OcctShapeHandle>>;
+        fn make_sweep_circle(radius: f64, dx: f64, dy: f64, dz: f64) -> Result<UniquePtr<OcctShapeHandle>>;
 
         fn compute_volume(handle: &OcctShapeHandle) -> Result<f64>;
         fn compute_surface_area(handle: &OcctShapeHandle) -> Result<f64>;
@@ -412,6 +413,11 @@ impl OcctShape {
     /// Offsets a planar face by fusing/cutting a prism along its outward normal.
     pub fn push_pull_face(&self, face_index: u32, distance: f64) -> Result<Self, OcctError> {
         Self::from_ptr(ffi::push_pull_face(self.as_ref()?, face_index, distance)?)
+    }
+
+    /// Sweeps a circular profile from the origin along one straight path segment.
+    pub fn sweep_circle(radius: f64, direction: [f64; 3]) -> Result<Self, OcctError> {
+        Self::from_ptr(ffi::make_sweep_circle(radius, direction[0], direction[1], direction[2])?)
     }
 
     /// Computes volume of the shape in cubic millimeters ($\text{mm}^3$).

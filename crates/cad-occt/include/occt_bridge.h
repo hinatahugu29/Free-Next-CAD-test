@@ -132,6 +132,7 @@ std::unique_ptr<OcctShapeHandle> push_pull_face(
     uint32_t face_index,
     double distance
 );
+std::unique_ptr<OcctShapeHandle> make_sweep_circle(double radius, double dx, double dy, double dz);
 
 double compute_volume(const OcctShapeHandle& handle);
 double compute_surface_area(const OcctShapeHandle& handle);

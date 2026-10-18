@@ -38,6 +38,7 @@
 #include <BRepOffsetAPI_MakeThickSolid.hxx>
 #include <BRepOffsetAPI_DraftAngle.hxx>
 #include <BRepOffsetAPI_ThruSections.hxx>
+#include <BRepOffsetAPI_MakePipe.hxx>
 #include <TopTools_ListOfShape.hxx>
 #include <BRepFilletAPI_MakeFillet.hxx>
 #include <BRepFilletAPI_MakeChamfer.hxx>
@@ -699,6 +700,24 @@ std::unique_ptr<OcctShapeHandle> push_pull_face(
         if (!prism.IsDone()) throw std::runtime_error("Push/Pull prism failed");
         if (distance > 0.0) { BRepAlgoAPI_Fuse fuse(handle.shape(), prism.Shape()); fuse.Build(); if (!fuse.IsDone()) throw std::runtime_error("Push/Pull fuse failed"); return std::make_unique<OcctShapeHandle>(fuse.Shape()); }
         BRepAlgoAPI_Cut cut(handle.shape(), prism.Shape()); cut.Build(); if (!cut.IsDone()) throw std::runtime_error("Push/Pull cut failed"); return std::make_unique<OcctShapeHandle>(cut.Shape());
+    } catch (const Standard_Failure& e) { rethrow_occt_exception(e); }
+}
+
+std::unique_ptr<OcctShapeHandle> make_sweep_circle(double radius, double dx, double dy, double dz) {
+    ensure_valid_positive(radius, "sweep radius");
+    gp_Vec path(dx, dy, dz);
+    if (path.SquareMagnitude() < 1e-12) throw std::invalid_argument("Sweep path must have length");
+    try {
+        gp_Dir tangent(path);
+        gp_Ax2 axis(gp_Pnt(0, 0, 0), tangent);
+        TopoDS_Edge profile_edge = BRepBuilderAPI_MakeEdge(gp_Circ(axis, radius)).Edge();
+        TopoDS_Wire profile = BRepBuilderAPI_MakeWire(profile_edge).Wire();
+        TopoDS_Edge path_edge = BRepBuilderAPI_MakeEdge(gp_Pnt(0, 0, 0), gp_Pnt(dx, dy, dz)).Edge();
+        TopoDS_Wire spine = BRepBuilderAPI_MakeWire(path_edge).Wire();
+        BRepOffsetAPI_MakePipe pipe(spine, profile);
+        pipe.Build();
+        if (!pipe.IsDone()) throw std::runtime_error("BRepOffsetAPI_MakePipe failed");
+        return std::make_unique<OcctShapeHandle>(pipe.Shape());
     } catch (const Standard_Failure& e) { rethrow_occt_exception(e); }
 }
 
