@@ -592,4 +592,14 @@ mod tests {
         assert!(sweep.is_valid().expect("sweep valid"));
         assert!(sweep.volume().expect("sweep volume") > 0.0);
     }
+
+    #[test]
+    fn sew_and_solid_from_shell_preserve_closed_box() {
+        let box_shape = OcctShape::make_box(24.0, 18.0, 12.0).expect("box");
+        let sewn = box_shape.sew(0.001).expect("sew");
+        assert!(sewn.is_valid().expect("sewn validity"));
+        let solid = sewn.solid_from_shell().expect("solid from closed shell");
+        assert!(solid.is_valid().expect("solid validity"));
+        assert_eq!(solid.topology_counts().expect("counts").solids, 1);
+    }
 }
