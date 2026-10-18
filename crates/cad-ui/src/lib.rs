@@ -1,5 +1,7 @@
 //! Desktop CAD GUI for FerroCAD powered by `egui` / `eframe` and `cad-render` (Phase 3 & Phase 4).
 
+mod sketch_editor;
+
 use std::path::PathBuf;
 
 use cad_core::{
@@ -81,10 +83,14 @@ fn ribbon_button(ui: &mut egui::Ui, icon: &str, label: &str, enabled: bool, hint
 /// A titled ribbon group (e.g. "作成", "修正"): buttons in a row, group name below.
 fn ribbon_group(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
     ui.vertical(|ui| {
-        ui.horizontal(add_contents);
-        ui.vertical_centered(|ui| {
-            ui.label(RichText::new(title).size(11.0).weak());
-        });
+        let row = ui.horizontal(add_contents).response.rect;
+        // Centre the title under this group's buttons only (a centred layout would
+        // otherwise stretch to the full ribbon width and push later groups off-screen).
+        ui.allocate_ui_with_layout(
+            Vec2::new(row.width(), 14.0),
+            egui::Layout::top_down(egui::Align::Center),
+            |ui| ui.label(RichText::new(title).size(11.0).weak()),
+        );
     });
     ui.separator();
 }
@@ -109,16 +115,25 @@ pub struct FerroCadApp {
     /// Screen position where the floating on-canvas property editor should appear
     /// (set by double-clicking a face/edge directly in the 3D viewport).
     pub floating_editor_pos: Option<Pos2>,
-    /// When true, the central viewport switches from the 3D render to a flat 2D sketch
-    /// canvas: clicking places profile points (in millimeters on the sketch plane),
-    /// which are later closed into a loop and extruded via `cad_core`'s `Sketch` solver.
+    /// When true, the central viewport switches from the 3D render to the 2D sketch editor,
+    /// which edits `sketch` (a constraint-solved `cad_core::Sketch`) directly.
     pub sketch_mode: bool,
-    pub sketch_points: Vec<[f64; 2]>,
+    pub sketch: Sketch,
+    pub sketch_tool: SketchTool,
+    /// Clicks collected by the active drawing tool (position + existing point snapped to).
+    pub sketch_pending: Vec<([f64; 2], Option<cad_core::PointId>)>,
+    pub sketch_selection: Vec<SketchSel>,
+    pub sketch_report: Option<cad_core::SketchSolveReport>,
+    pub sketch_drag: Option<cad_core::PointId>,
+    /// Dimension being edited in place: constraint index and its value.
+    pub sketch_dim_edit: Option<(usize, f64)>,
+    /// Feature whose sketch is being re-edited (`None` = creating a new feature).
+    pub sketch_editing: Option<FeatureId>,
     pub sketch_depth: f64,
-    /// Snap new sketch points to the sketch's own vertices (to close loops exactly),
-    /// to the 10mm grid, and to the midpoints of edges belonging to other already-built
-    /// features (projected onto the sketch's XY plane) — a lightweight version of the
-    /// object-snap found in most CAD sketchers.
+    /// Depth expression kept verbatim when re-editing a feature whose depth is a formula.
+    pub sketch_depth_expr: Option<String>,
+    /// Snap new sketch points to the sketch's own points, the grid, and the corners and
+    /// edge midpoints of existing geometry projected onto the sketch plane.
     pub sketch_snap_enabled: bool,
     pub ribbon_tab: RibbonTab,
     /// Waiting for the user to choose a sketch plane (base plane button or a face click).
@@ -137,29 +152,30 @@ pub struct FerroCadApp {
     pub sketch_view: Option<([f64; 2], f32)>,
 }
 
-/// Initial sketch view framing the existing geometry (and any placed points).
-fn fit_sketch_view(segments: &[[[f64; 2]; 2]], points: &[[f64; 2]], rect: Rect) -> ([f64; 2], f32) {
-    let mut min = [f64::INFINITY; 2];
-    let mut max = [f64::NEG_INFINITY; 2];
-    for p in segments.iter().flatten().chain(points) {
-        for i in 0..2 {
-            min[i] = min[i].min(p[i]);
-            max[i] = max[i].max(p[i]);
-        }
-    }
-    if !min[0].is_finite() {
-        return ([0.0, 0.0], 3.0);
-    }
-    let extent = (max[0] - min[0]).max(max[1] - min[1]).max(10.0) as f32;
-    let px_per_mm = (rect.width().min(rect.height()) * 0.7 / extent).clamp(0.3, 30.0);
-    ([(min[0] + max[0]) * 0.5, (min[1] + max[1]) * 0.5], px_per_mm)
-}
-
 /// Action chosen from a timeline chip's right-click menu.
 enum ChipAction {
+    EditSketch(FeatureId),
     Rename(FeatureId),
     ToggleSuppress(FeatureId),
     Delete(FeatureId),
+}
+
+/// Active tool in the sketch editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SketchTool {
+    Select,
+    Line,
+    Rect,
+    Circle,
+    Arc,
+}
+
+/// Something selected in the sketch editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SketchSel {
+    Point(cad_core::PointId),
+    Segment(cad_core::PointId, cad_core::PointId),
+    Curve(cad_core::EntityId),
 }
 
 /// How the finished sketch is turned into geometry (UI-side choice for `ExtrudeMode`).
@@ -235,8 +251,16 @@ impl FerroCadApp {
             current_file_path: None,
             floating_editor_pos: None,
             sketch_mode: false,
-            sketch_points: Vec::new(),
+            sketch: Sketch::new("Sketch"),
+            sketch_tool: SketchTool::Line,
+            sketch_pending: Vec::new(),
+            sketch_selection: Vec::new(),
+            sketch_report: None,
+            sketch_drag: None,
+            sketch_dim_edit: None,
+            sketch_editing: None,
             sketch_depth: 10.0,
+            sketch_depth_expr: None,
             sketch_snap_enabled: true,
             ribbon_tab: RibbonTab::default(),
             sketch_plane_picking: false,
@@ -271,7 +295,9 @@ impl FerroCadApp {
     fn cancel_sketch(&mut self) {
         self.sketch_plane_picking = false;
         self.sketch_mode = false;
-        self.sketch_points.clear();
+        self.sketch_editing = None;
+        self.sketch_pending.clear();
+        self.sketch_selection.clear();
         if self.hover_face.take().is_some() {
             self.render_config.selected_face = None;
             self.viewport_dirty = true;
@@ -303,11 +329,80 @@ impl FerroCadApp {
             SketchOp::NewBody
         });
         self.sketch_symmetric = false;
-        self.sketch_mode = true;
-        self.sketch_points.clear();
         self.sketch_depth = 10.0;
+        self.sketch_depth_expr = None;
+        self.sketch_editing = None;
+        let name = format!("Sketch_{}", self.controller.document.features.len() + 1);
+        self.open_sketch_editor(Sketch::new(name));
+    }
+
+    /// Shows the 2D editor for `sketch` on the already-set plane/frame.
+    fn open_sketch_editor(&mut self, sketch: Sketch) {
+        self.sketch = sketch;
+        self.sketch_report = Some(self.sketch.clone().solve(60, 1e-9));
+        self.sketch_tool = if self.sketch.entities.is_empty() {
+            SketchTool::Line
+        } else {
+            SketchTool::Select
+        };
+        self.sketch_pending.clear();
+        self.sketch_selection.clear();
+        self.sketch_drag = None;
+        self.sketch_dim_edit = None;
+        self.sketch_mode = true;
         self.sketch_view = None;
         self.viewport_dirty = true;
+    }
+
+    /// Re-opens an existing sketch-based feature in the editor; finishing updates that
+    /// feature in place so everything downstream recomputes.
+    fn edit_sketch_feature(&mut self, id: FeatureId) {
+        let Some(feat) = self.controller.document.features.get(&id).cloned() else {
+            return;
+        };
+        let FeatureKind::SketchExtrude {
+            sketch,
+            depth,
+            plane,
+            mode,
+            reversed,
+            symmetric,
+        } = feat.kind
+        else {
+            self.status_logs
+                .push(format!("「{}」はスケッチから作られていないため、スケッチ編集はできません", feat.name));
+            return;
+        };
+        let frame = match self.controller.document.sketch_plane_frame(&plane, &self.store) {
+            Ok(frame) => frame,
+            Err(err) => {
+                self.status_logs
+                    .push(format!("スケッチ平面を特定できないため編集を開けませんでした: {err}"));
+                return;
+            }
+        };
+        self.sketch_plane_picking = false;
+        self.floating_editor_pos = None;
+        self.sketch_plane = plane;
+        self.sketch_frame = frame;
+        let (op, target) = match mode {
+            ExtrudeMode::NewBody => (SketchOp::NewBody, None),
+            ExtrudeMode::Join { target } => (SketchOp::Join, Some(target)),
+            ExtrudeMode::Cut { target } => (SketchOp::Cut, Some(target)),
+        };
+        self.sketch_target = target;
+        self.sketch_op = op;
+        self.sketch_reversed = reversed;
+        self.sketch_symmetric = symmetric;
+        match depth {
+            ScalarParam::Literal(v) => {
+                self.sketch_depth = v;
+                self.sketch_depth_expr = None;
+            }
+            ScalarParam::Expr(e) => self.sketch_depth_expr = Some(e),
+        }
+        self.open_sketch_editor(sketch);
+        self.sketch_editing = Some(id);
     }
 
     /// Cut defaults to extruding into the material (against the face's outward normal).
@@ -498,10 +593,10 @@ impl FerroCadApp {
                     } else {
                         "先に3Dビューで辺をクリックして選択してください"
                     };
-                    if ribbon_button(ui, "◜", "フィレット", edge_selected, hint) {
+                    if ribbon_button(ui, "⌒", "フィレット", edge_selected, hint) {
                         self.add_edge_modifier_on_selection(false);
                     }
-                    if ribbon_button(ui, "◸", "面取り", edge_selected, hint) {
+                    if ribbon_button(ui, "◣", "面取り", edge_selected, hint) {
                         self.add_edge_modifier_on_selection(true);
                     }
                 });
@@ -511,7 +606,7 @@ impl FerroCadApp {
                     for (icon, label, view) in [
                         ("◆", "等角", StandardView::Isometric),
                         ("▔", "上面", StandardView::Top),
-                        ("▯", "正面", StandardView::Front),
+                        ("□", "正面", StandardView::Front),
                         ("▷", "右側面", StandardView::Right),
                     ] {
                         if ribbon_button(ui, icon, label, true, label) {
@@ -527,7 +622,7 @@ impl FerroCadApp {
                     for (icon, label, mode) in [
                         ("▣", "面+辺", DisplayMode::ShadedWithEdges),
                         ("■", "面のみ", DisplayMode::Shaded),
-                        ("□", "線画", DisplayMode::Wireframe),
+                        ("▱", "線画", DisplayMode::Wireframe),
                     ] {
                         if ribbon_button(ui, icon, label, self.render_config.display_mode != mode, label) {
                             self.render_config.display_mode = mode;
@@ -538,7 +633,7 @@ impl FerroCadApp {
                         ProjectionMode::Perspective { .. } => "透視",
                         ProjectionMode::Orthographic { .. } => "平行",
                     };
-                    if ribbon_button(ui, "◫", proj, true, "透視投影 / 平行投影を切り替え") {
+                    if ribbon_button(ui, "◇", proj, true, "透視投影 / 平行投影を切り替え") {
                         self.camera.toggle_projection();
                         self.viewport_dirty = true;
                     }
@@ -549,49 +644,6 @@ impl FerroCadApp {
                 });
             }
         });
-    }
-
-    /// Existing visible geometry projected onto the current sketch plane, taken from each
-    /// feature's tessellated B-Rep edge polylines: returns the outline segments to draw
-    /// as a reference underlay, plus snap targets at every edge's true endpoints (B-Rep
-    /// vertices) and midpoints.
-    fn sketch_reference_geometry(&self) -> (Vec<[[f64; 2]; 2]>, Vec<[f64; 2]>) {
-        let frame = self.sketch_frame;
-        let local = |p: [f32; 3]| {
-            frame.to_local(glam::DVec3::new(p[0] as f64, p[1] as f64, p[2] as f64))
-        };
-        let mut segments = Vec::new();
-        let mut snaps = Vec::new();
-        for feat in self.controller.document.features.values() {
-            if !feat.visible {
-                continue;
-            }
-            let Some(mesh) = feat.cached_mesh.as_ref() else {
-                continue;
-            };
-            let mut edges: std::collections::BTreeMap<u32, Vec<[[f64; 2]; 2]>> =
-                std::collections::BTreeMap::new();
-            for (seg, &eid) in mesh.edge_segments.iter().zip(&mesh.edge_segment_ids) {
-                let s = [local(seg[0]), local(seg[1])];
-                segments.push(s);
-                edges.entry(eid).or_default().push(s);
-            }
-            for segs in edges.values() {
-                let (Some(first), Some(last)) = (segs.first(), segs.last()) else {
-                    continue;
-                };
-                snaps.push(first[0]);
-                snaps.push(last[1]);
-                if let Some(mid) = segs.get(segs.len() / 2) {
-                    snaps.push(if segs.len() % 2 == 0 {
-                        mid[0]
-                    } else {
-                        [(mid[0][0] + mid[1][0]) * 0.5, (mid[0][1] + mid[1][1]) * 0.5]
-                    });
-                }
-            }
-        }
-        (segments, snaps)
     }
 
     pub fn recompute_and_refresh(&mut self) {
@@ -935,7 +987,7 @@ impl FerroCadApp {
                         FeatureState::Clean => ("✓", Color32::from_rgb(80, 210, 120)),
                         FeatureState::Dirty => ("⟳", Color32::from_rgb(230, 190, 70)),
                         FeatureState::Computing => ("…", Color32::from_rgb(100, 180, 240)),
-                        FeatureState::Failed(_) => ("✗", Color32::from_rgb(240, 85, 85)),
+                        FeatureState::Failed(_) => ("×", Color32::from_rgb(240, 85, 85)),
                         FeatureState::Blocked { .. } => ("⊘", Color32::from_rgb(235, 140, 60)),
                     };
                     let is_selected = selected == Some(feat.id);
@@ -967,11 +1019,14 @@ impl FerroCadApp {
                                 } else {
                                     RichText::new(&feat.name)
                                 };
+                                let is_sketch = matches!(feat.kind, FeatureKind::SketchExtrude { .. });
                                 let resp = ui.selectable_label(is_selected, name);
                                 let resp = if let FeatureState::Failed(msg) = &feat.state {
                                     resp.on_hover_text(msg)
                                 } else if feat.suppressed {
                                     resp.on_hover_text("抑制中（形状から一時的に外れています）")
+                                } else if is_sketch {
+                                    resp.on_hover_text("ダブルクリック: スケッチを編集 / 右クリック: メニュー")
                                 } else {
                                     resp.on_hover_text("右クリック: 名前変更・抑制・削除")
                                 };
@@ -981,8 +1036,15 @@ impl FerroCadApp {
                                     self.render_config.selected_edge = None;
                                     self.viewport_dirty = true;
                                 }
+                                if resp.double_clicked() && is_sketch {
+                                    chip_action = Some(ChipAction::EditSketch(feat.id));
+                                }
                                 resp.context_menu(|ui| {
-                                    if ui.button("✎ 名前を変更…").clicked() {
+                                    if is_sketch && ui.button("✏ スケッチを編集").clicked() {
+                                        chip_action = Some(ChipAction::EditSketch(feat.id));
+                                        ui.close_menu();
+                                    }
+                                    if ui.button("✏ 名前を変更…").clicked() {
                                         chip_action = Some(ChipAction::Rename(feat.id));
                                         ui.close_menu();
                                     }
@@ -1004,6 +1066,7 @@ impl FerroCadApp {
         });
 
         match chip_action {
+            Some(ChipAction::EditSketch(id)) => self.edit_sketch_feature(id),
             Some(ChipAction::Rename(id)) => {
                 self.rename_target = Some((id, self.feature_name(id)));
             }
@@ -1248,319 +1311,6 @@ impl FerroCadApp {
         }
     }
 
-    /// Flat 2D sketch canvas: click to place profile points on the sketch plane
-    /// (millimeters), then close the loop and extrude it into a real feature using
-    /// `cad_core`'s `Sketch` (the same constraint-solver-backed profile type the
-    /// parametric engine already understands — not a UI-only polygon).
-    fn render_sketch_canvas(&mut self, ctx: &Context, ui: &mut egui::Ui) {
-        let avail = ui.available_size();
-        let (rect, response) =
-            ui.allocate_exact_size(avail, Sense::click_and_drag());
-        let (reference_segments, reference_snaps) = self.sketch_reference_geometry();
-
-        // View: fitted to the existing geometry on first show, then wheel to zoom and
-        // right-drag to pan.
-        let (mut center, mut px_per_mm) = *self.sketch_view.get_or_insert_with(|| {
-            fit_sketch_view(&reference_segments, &self.sketch_points, rect)
-        });
-        if response.hovered() {
-            let scroll_y = ctx.input(|i| i.smooth_scroll_delta.y);
-            if scroll_y.abs() > 0.1 {
-                px_per_mm = (px_per_mm * (1.0 + scroll_y * 0.0018).clamp(0.75, 1.35)).clamp(0.1, 60.0);
-            }
-        }
-        if response.dragged_by(egui::PointerButton::Secondary) {
-            let d = response.drag_delta();
-            center[0] -= (d.x / px_per_mm) as f64;
-            center[1] += (d.y / px_per_mm) as f64;
-        }
-        self.sketch_view = Some((center, px_per_mm));
-        let origin = rect.center()
-            - Vec2::new(center[0] as f32 * px_per_mm, -(center[1] as f32) * px_per_mm);
-
-        let to_screen = |p: [f64; 2]| -> Pos2 {
-            Pos2::new(
-                origin.x + p[0] as f32 * px_per_mm,
-                origin.y - p[1] as f32 * px_per_mm,
-            )
-        };
-        let to_mm = |p: Pos2| -> [f64; 2] {
-            [
-                ((p.x - origin.x) / px_per_mm) as f64,
-                (-(p.y - origin.y) / px_per_mm) as f64,
-            ]
-        };
-
-        let painter = ui.painter();
-        painter.rect_filled(rect, 0.0, Color32::from_rgb(24, 27, 33));
-        // Grid spacing adapts to zoom so lines stay readable (and grid snap follows it).
-        let grid_mm: f32 = [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0]
-            .into_iter()
-            .find(|g| g * px_per_mm >= 15.0)
-            .unwrap_or(1000.0);
-        let grid_px = grid_mm * px_per_mm;
-        let mut gx = (origin.x - rect.min.x).rem_euclid(grid_px);
-        while gx < rect.width() {
-            let x = rect.min.x + gx;
-            painter.line_segment(
-                [Pos2::new(x, rect.min.y), Pos2::new(x, rect.max.y)],
-                egui::Stroke::new(1.0_f32, Color32::from_rgb(38, 42, 50)),
-            );
-            gx += grid_px;
-        }
-        let mut gy = (origin.y - rect.min.y).rem_euclid(grid_px);
-        while gy < rect.height() {
-            let y = rect.min.y + gy;
-            painter.line_segment(
-                [Pos2::new(rect.min.x, y), Pos2::new(rect.max.x, y)],
-                egui::Stroke::new(1.0_f32, Color32::from_rgb(38, 42, 50)),
-            );
-            gy += grid_px;
-        }
-        painter.line_segment(
-            [Pos2::new(rect.min.x, origin.y), Pos2::new(rect.max.x, origin.y)],
-            egui::Stroke::new(1.5_f32, Color32::from_rgb(90, 60, 60)),
-        );
-        painter.line_segment(
-            [Pos2::new(origin.x, rect.min.y), Pos2::new(origin.x, rect.max.y)],
-            egui::Stroke::new(1.5_f32, Color32::from_rgb(60, 90, 60)),
-        );
-
-        // Existing geometry is always drawn as a faint top-view outline so the user can
-        // see what they are sketching against; snap targets (edge endpoints and
-        // midpoints) are marked only while snapping is on.
-        const SNAP_RADIUS_PX: f32 = 9.0;
-        let outline = egui::Stroke::new(1.2_f32, Color32::from_rgb(110, 125, 145));
-        for seg in &reference_segments {
-            painter.line_segment([to_screen(seg[0]), to_screen(seg[1])], outline);
-        }
-        let existing_geometry_snaps = if self.sketch_snap_enabled {
-            reference_snaps
-        } else {
-            Vec::new()
-        };
-        for p in &existing_geometry_snaps {
-            let s = to_screen(*p);
-            if rect.contains(s) {
-                painter.circle_stroke(s, 3.0, egui::Stroke::new(1.2_f32, Color32::from_rgb(90, 230, 210)));
-            }
-        }
-
-        if response.clicked()
-            && let Some(pos) = response.interact_pointer_pos()
-        {
-            let mut snapped = to_mm(pos);
-            if self.sketch_snap_enabled {
-                let mut best: Option<(f32, [f64; 2])> = None;
-                let mut consider = |cand: [f64; 2]| {
-                    let d = to_screen(cand).distance(pos);
-                    if d <= SNAP_RADIUS_PX && best.is_none_or(|(bd, _)| d < bd) {
-                        best = Some((d, cand));
-                    }
-                };
-                for p in &self.sketch_points {
-                    consider(*p);
-                }
-                for p in &existing_geometry_snaps {
-                    consider(*p);
-                }
-                let grid_x = (snapped[0] / grid_mm as f64).round() * grid_mm as f64;
-                let grid_y = (snapped[1] / grid_mm as f64).round() * grid_mm as f64;
-                consider([grid_x, grid_y]);
-                if let Some((_, p)) = best {
-                    snapped = p;
-                }
-            }
-            self.sketch_points.push(snapped);
-        }
-
-        for pair in self.sketch_points.windows(2) {
-            painter.line_segment(
-                [to_screen(pair[0]), to_screen(pair[1])],
-                egui::Stroke::new(2.0_f32, Color32::from_rgb(120, 180, 255)),
-            );
-        }
-        if self.sketch_points.len() >= 3
-            && let (Some(first), Some(last)) =
-                (self.sketch_points.first(), self.sketch_points.last())
-        {
-            painter.line_segment(
-                [to_screen(*last), to_screen(*first)],
-                egui::Stroke::new(1.5_f32, Color32::from_rgb(120, 180, 255, ).gamma_multiply(0.5)),
-            );
-        }
-        for p in &self.sketch_points {
-            painter.circle_filled(to_screen(*p), 3.5, Color32::from_rgb(250, 200, 60));
-        }
-
-        let hud_rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 12.0), Vec2::new(440.0, 240.0));
-        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(hud_rect), |ui| {
-            egui::Frame::window(ui.style())
-                .fill(Color32::from_rgba_unmultiplied(22, 26, 34, 225))
-                .show(ui, |ui| {
-                    let plane_label = match &self.sketch_plane {
-                        SketchPlane::XY => "XY平面".to_string(),
-                        SketchPlane::XZ => "XZ平面".to_string(),
-                        SketchPlane::YZ => "YZ平面".to_string(),
-                        SketchPlane::Face { feature, .. } => {
-                            format!("「{}」の面", self.feature_name(*feature))
-                        }
-                    };
-                    ui.label(format!("✏ スケッチ中: {plane_label}"));
-                    ui.small("クリックで頂点を配置 / ホイールで拡大縮小 / 右ドラッグで移動");
-                    ui.label(format!("頂点数: {}  (3点以上で押し出し可能)", self.sketch_points.len()));
-                    ui.checkbox(
-                        &mut self.sketch_snap_enabled,
-                        "スナップ (自分の頂点 / 10mmグリッド / 既存形状の角・辺の中点 ○)",
-                    );
-
-                    // Inline dimensioning for the most recently drawn segment: typing an
-                    // exact length moves the last point along the segment's direction to
-                    // match it (the segment's endpoints are what gets written into the
-                    // final Sketch, so this is a real, baked-in length constraint).
-                    if self.sketch_points.len() >= 2 {
-                        let n = self.sketch_points.len();
-                        let [ax, ay] = self.sketch_points[n - 2];
-                        let [bx, by] = self.sketch_points[n - 1];
-                        let (dx, dy) = (bx - ax, by - ay);
-                        let mut len = (dx * dx + dy * dy).sqrt();
-                        ui.horizontal(|ui| {
-                            ui.label("最後の辺の長さ (拘束):");
-                            if ui
-                                .add(egui::DragValue::new(&mut len).speed(0.5).suffix(" mm").range(0.01..=100000.0))
-                                .changed()
-                                && (dx.abs() > 1e-9 || dy.abs() > 1e-9)
-                            {
-                                let seg_len = (dx * dx + dy * dy).sqrt().max(1e-9);
-                                let (ux, uy) = (dx / seg_len, dy / seg_len);
-                                self.sketch_points[n - 1] = [ax + ux * len, ay + uy * len];
-                            }
-                        });
-                    }
-
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label("押し出し:");
-                        let has_target = self.sketch_target.is_some();
-                        let target_hint = match self.sketch_target {
-                            Some(t) => format!("「{}」と組み合わせます", self.feature_name(t)),
-                            None => "結合・切り取りは、面の上でスケッチするか、先に対象を選択してから使えます".to_string(),
-                        };
-                        for (op, label) in [
-                            (SketchOp::NewBody, "新規"),
-                            (SketchOp::Join, "結合"),
-                            (SketchOp::Cut, "切り取り"),
-                        ] {
-                            let enabled = op == SketchOp::NewBody || has_target;
-                            if ui
-                                .add_enabled(enabled, egui::SelectableLabel::new(self.sketch_op == op, label))
-                                .on_hover_text(&target_hint)
-                                .on_disabled_hover_text(&target_hint)
-                                .clicked()
-                            {
-                                self.set_sketch_op(op);
-                            }
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("量:");
-                        ui.add(egui::DragValue::new(&mut self.sketch_depth).speed(0.5).suffix(" mm").range(0.1..=100000.0));
-                        ui.checkbox(&mut self.sketch_reversed, "方向を反転")
-                            .on_hover_text("切り取りでは、既定で面の内側（材料側）へ向かいます");
-                        ui.checkbox(&mut self.sketch_symmetric, "両側");
-                    });
-
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(
-                                self.sketch_points.len() >= 3,
-                                egui::Button::new("✓ 閉じて押し出し"),
-                            )
-                            .clicked()
-                        {
-                            self.finish_sketch_extrude();
-                        }
-                        if ui.button("↶ 最後の点を取消").clicked() {
-                            self.sketch_points.pop();
-                        }
-                        if ui.button("✗ キャンセル (Esc)").clicked() {
-                            self.cancel_sketch();
-                        }
-                    });
-                });
-        });
-
-        if ctx.input(|i| i.key_pressed(Key::Escape)) {
-            self.cancel_sketch();
-        }
-    }
-
-    /// Converts the in-progress 2D sketch polygon into a real `cad_core::Sketch` and
-    /// submits it as a `SketchExtrude` feature through the normal command pipeline, so it
-    /// participates in the dependency graph, undo/redo, and recompute like any other
-    /// feature.
-    fn finish_sketch_extrude(&mut self) {
-        if self.sketch_points.len() < 3 {
-            return;
-        }
-        let mut sketch = Sketch::new(format!(
-            "Sketch_{}",
-            self.controller.document.features.len() + 1
-        ));
-        let point_ids: Vec<_> = self
-            .sketch_points
-            .iter()
-            .map(|[x, y]| sketch.add_point(*x, *y))
-            .collect();
-        sketch.add_polyline(point_ids, true);
-
-        let (mode, base_name) = match (self.sketch_op, self.sketch_target) {
-            (SketchOp::Join, Some(target)) => (ExtrudeMode::Join { target }, "Join"),
-            (SketchOp::Cut, Some(target)) => (ExtrudeMode::Cut { target }, "Cut"),
-            _ => (ExtrudeMode::NewBody, "Extrude"),
-        };
-        let color_rgba = self
-            .sketch_target
-            .filter(|_| mode != ExtrudeMode::NewBody)
-            .and_then(|t| self.controller.document.features.get(&t))
-            .map(|f| f.color_rgba)
-            .unwrap_or([0.55, 0.75, 0.95, 1.0]);
-
-        let before = self.controller.document.features.len();
-        self.execute_cmd(CadCommand::AddFeature {
-            name: format!("{base_name}_{}", before + 1),
-            kind: FeatureKind::SketchExtrude {
-                sketch,
-                depth: ScalarParam::mm(self.sketch_depth.max(0.1)),
-                plane: self.sketch_plane.clone(),
-                mode,
-                reversed: self.sketch_reversed,
-                symmetric: self.sketch_symmetric,
-            },
-            visible: true,
-            color_rgba,
-        });
-
-        // The combined result replaces the target body on screen.
-        if let (Some(target), true) = (
-            self.sketch_target.filter(|_| mode != ExtrudeMode::NewBody),
-            self.controller.document.features.len() > before,
-        ) {
-            let new_feature = self.render_config.selected_feature;
-            self.execute_cmd(CadCommand::UpdateFeature {
-                id: target,
-                name: None,
-                kind: None,
-                visible: Some(false),
-                color_rgba: None,
-            });
-            self.render_config.selected_feature = new_feature;
-        }
-
-        self.sketch_mode = false;
-        self.sketch_points.clear();
-    }
-
     fn render_central_viewport(&mut self, ctx: &Context, ui: &mut egui::Ui) {
         let avail = ui.available_size();
         let width = (avail.x.max(64.0) as u32).min(2048);
@@ -1767,8 +1517,8 @@ impl FerroCadApp {
     /// Prompt shown while choosing a sketch plane: base-plane buttons, or click a face.
     fn render_plane_picker(&mut self, ui: &mut egui::Ui, rect: Rect) {
         let panel = Rect::from_center_size(
-            Pos2::new(rect.center().x, rect.min.y + 100.0),
-            Vec2::new(460.0, 120.0),
+            Pos2::new(rect.center().x, rect.min.y + 110.0),
+            Vec2::new(rect.width().min(600.0) - 24.0, 120.0),
         );
         let mut choice: Option<SketchPlane> = None;
         let mut cancel = false;
@@ -1956,10 +1706,11 @@ impl eframe::App for FerroCadApp {
                 self.render_bottom_timeline(ui);
             });
 
+        // While sketching, the side panels give their space to the canvas.
         egui::SidePanel::left("left_tree_panel")
             .resizable(true)
             .default_width(310.0)
-            .show(ctx, |ui| {
+            .show_animated(ctx, !self.sketch_mode, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     self.render_left_panel(ui);
                 });
@@ -1968,7 +1719,7 @@ impl eframe::App for FerroCadApp {
         egui::SidePanel::right("right_property_panel")
             .resizable(true)
             .default_width(300.0)
-            .show(ctx, |ui| {
+            .show_animated(ctx, !self.sketch_mode, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     self.render_right_property_panel(ui);
                 });
@@ -2121,7 +1872,7 @@ mod tests {
         // On a top face, sketch coordinates coincide with world XY.
         assert!(app.sketch_frame.origin.z > 9.99 && app.sketch_frame.normal.z > 0.99);
 
-        app.sketch_points = vec![[40.0, 25.0], [50.0, 25.0], [50.0, 35.0], [40.0, 35.0]];
+        app.sketch.add_rectangle(40.0, 25.0, 50.0, 35.0);
         app.set_sketch_op(SketchOp::Cut);
         assert!(app.sketch_reversed, "cut should default to going into the material");
         app.finish_sketch_extrude();
@@ -2136,5 +1887,128 @@ mod tests {
         app.delete_feature(plate);
         assert_eq!(app.controller.document.features.len(), features_before);
         assert!(app.status_logs.last().unwrap().contains("使われているため削除できません"));
+    }
+
+    /// Renders the real UI offscreen (egui_kittest + wgpu) to PNGs under
+    /// `build/ui-snapshots/` so layout can be inspected without a window. Needs a GPU
+    /// adapter, so it is opt-in: `cargo test -p cad-ui -- --ignored ui_snapshots`.
+    #[test]
+    #[ignore]
+    fn ui_snapshots() {
+        use cad_core::SketchConstraint;
+        use egui_kittest::Harness;
+
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../build/ui-snapshots");
+        std::fs::create_dir_all(&out).unwrap();
+        let shoot = |name: &str, setup: &dyn Fn(&mut FerroCadApp)| {
+            let mut app = FerroCadApp::new_with_mvp_demo();
+            setup(&mut app);
+            let mut harness = Harness::builder()
+                .with_size(egui::vec2(1360.0, 840.0))
+                .build_eframe(|cc| {
+                    install_japanese_font(&cc.egui_ctx);
+                    app
+                });
+            harness.run_steps(6);
+            harness.render().unwrap().save(out.join(name)).unwrap();
+        };
+
+        shoot("main.png", &|_| {});
+        shoot("plane_picker.png", &|app| app.start_sketch());
+        shoot("sketch_editor.png", &|app| {
+            let plate = FeatureId(5);
+            let shape = app.controller.document.features[&plate].cached_shape.unwrap();
+            let top = app
+                .store
+                .resolve_face_by_signature(shape, glam::DVec3::Z, None, 0.99)
+                .unwrap();
+            app.start_sketch();
+            app.begin_sketch_on_face(plate, top.index);
+            let (_, [p0, p1, _, p3]) = app.sketch.add_rectangle(32.0, 18.0, 68.0, 42.0);
+            let c = app.sketch.add_point(50.0, 30.0);
+            let circle = app.sketch.add_circle(c, 6.0);
+            app.try_add_constraint(SketchConstraint::Distance { p1: p0, p2: p1, distance: 36.0 }, false);
+            app.try_add_constraint(SketchConstraint::Distance { p1: p0, p2: p3, distance: 24.0 }, false);
+            app.try_add_constraint(SketchConstraint::Radius { entity: circle, radius: 6.0 }, false);
+            app.sketch_tool = SketchTool::Select;
+            app.sketch_selection = vec![SketchSel::Segment(p0, p1)];
+            app.set_sketch_op(SketchOp::Cut);
+        });
+    }
+
+    /// M3 flow: draw a rectangle with a circle inside, constrain it fully with
+    /// dimensions, extrude it, add a downstream cut on its top, then re-edit the base
+    /// sketch's width — the cut recomputes on the wider plate. A conflicting constraint
+    /// is refused with a plain-language message.
+    #[test]
+    fn m3_constrain_extrude_and_reedit_sketch() {
+        use cad_core::{SketchConstraint, SketchStatus};
+
+        let mut app = FerroCadApp::new_with_mvp_demo();
+        app.start_sketch();
+        app.begin_sketch(SketchPlane::XY, None);
+        let (_, [p0, p1, p2, p3]) = app.sketch.add_rectangle(200.0, 0.0, 280.0, 50.0);
+        let c = app.sketch.add_point(240.0, 25.0);
+        let circle = app.sketch.add_circle(c, 8.0);
+        for constraint in [
+            SketchConstraint::Fixed { point: p0, x: 200.0, y: 0.0 },
+            SketchConstraint::Distance { p1: p0, p2: p1, distance: 80.0 },
+            SketchConstraint::Distance { p1: p0, p2: p3, distance: 50.0 },
+            SketchConstraint::Fixed { point: c, x: 240.0, y: 25.0 },
+            SketchConstraint::Radius { entity: circle, radius: 10.0 },
+        ] {
+            assert!(app.try_add_constraint(constraint, false));
+        }
+        assert_eq!(
+            app.sketch_report.as_ref().unwrap().status,
+            SketchStatus::FullyConstrained
+        );
+
+        // Redundant (already horizontal) and conflicting (a 60mm side that is fixed at
+        // 80mm) constraints are both refused, with an explanation.
+        assert!(!app.try_add_constraint(SketchConstraint::Horizontal { p1: p0, p2: p1 }, false));
+        assert!(app.status_logs.last().unwrap().contains("すでに他の拘束で決まっています"));
+        assert!(!app.try_add_constraint(SketchConstraint::Distance { p1: p2, p2: p3, distance: 60.0 }, false));
+        assert!(app.status_logs.last().unwrap().contains("矛盾"));
+
+        app.sketch_depth = 10.0;
+        app.finish_sketch_extrude();
+        let (&base, _) = app.controller.document.features.iter().next_back().unwrap();
+        let hole = 0.5 * 48.0 * 100.0 * (std::f64::consts::TAU / 48.0).sin();
+        let vol = |app: &FerroCadApp, id: FeatureId| {
+            app.controller.document.features[&id].cached_summary.unwrap().volume_mm3
+        };
+        assert!((vol(&app, base) - (4000.0 - hole) * 10.0).abs() < 1.0);
+
+        // Downstream: cut a 10x10 pocket 4mm deep from the top face.
+        let shape = app.controller.document.features[&base].cached_shape.unwrap();
+        let top = app
+            .store
+            .resolve_face_by_signature(shape, glam::DVec3::Z, None, 0.99)
+            .unwrap();
+        app.start_sketch();
+        app.begin_sketch_on_face(base, top.index);
+        app.sketch.add_rectangle(205.0, 5.0, 215.0, 15.0);
+        app.set_sketch_op(SketchOp::Cut);
+        app.sketch_depth = 4.0;
+        app.finish_sketch_extrude();
+        let (&pocket, _) = app.controller.document.features.iter().next_back().unwrap();
+        assert!((vol(&app, pocket) - ((4000.0 - hole) * 10.0 - 400.0)).abs() < 1.0);
+
+        // Re-edit the base sketch: widen the plate from 80 to 100.
+        app.edit_sketch_feature(base);
+        assert!(app.sketch_mode && app.sketch_editing == Some(base));
+        let width_dim = app
+            .sketch
+            .constraints
+            .iter()
+            .position(|c| matches!(c, SketchConstraint::Distance { distance, .. } if (*distance - 80.0).abs() < 1e-9))
+            .unwrap();
+        assert!(app.try_set_dimension(width_dim, 100.0));
+        let features_before = app.controller.document.features.len();
+        app.finish_sketch_extrude();
+        assert_eq!(app.controller.document.features.len(), features_before, "re-edit must not add a feature");
+        assert!(app.controller.document.features[&pocket].state == FeatureState::Clean);
+        assert!((vol(&app, pocket) - ((5000.0 - hole) * 10.0 - 400.0)).abs() < 1.0);
     }
 }

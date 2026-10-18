@@ -463,7 +463,174 @@ impl Sketch {
                 }
             }
         }
+        // Implicit: an arc's endpoints lie on its circle.
+        for ent in self.entities.values() {
+            if let SketchEntity::Arc {
+                id,
+                center,
+                start,
+                end,
+                ..
+            } = ent
+                && let Some(&ri) = rad_map.get(id)
+            {
+                let (cx, cy) = get_pt(*center);
+                for p in [*start, *end] {
+                    let (x, y) = get_pt(p);
+                    res.push((x - cx).hypot(y - cy) - vars[ri]);
+                }
+            }
+        }
         res
+    }
+
+    /// Removes the constraint at `index` (no-op if out of range).
+    pub fn remove_constraint(&mut self, index: usize) {
+        if index < self.constraints.len() {
+            self.constraints.remove(index);
+        }
+    }
+
+    /// Removes an entity, then any points no longer used by an entity together with the
+    /// constraints that reference them.
+    pub fn remove_entity(&mut self, id: EntityId) {
+        if self.entities.remove(&id).is_none() {
+            return;
+        }
+        let used: std::collections::BTreeSet<PointId> =
+            self.entities.values().flat_map(entity_points).collect();
+        let orphans: Vec<PointId> = self
+            .points
+            .keys()
+            .copied()
+            .filter(|p| !used.contains(p))
+            .collect();
+        for p in &orphans {
+            self.points.remove(p);
+        }
+        self.constraints.retain(|c| {
+            constraint_points(c).iter().all(|p| !orphans.contains(p))
+                && constraint_entity(c).is_none_or(|e| e != id)
+        });
+    }
+
+    /// Straight segments of the sketch as point pairs (lines, rectangle sides, polyline edges).
+    pub fn segments(&self) -> Vec<(PointId, PointId)> {
+        let mut out = Vec::new();
+        for ent in self.entities.values() {
+            match ent {
+                SketchEntity::Line { start, end, .. } => out.push((*start, *end)),
+                SketchEntity::Rectangle { corners, .. } => {
+                    for i in 0..4 {
+                        out.push((corners[i], corners[(i + 1) % 4]));
+                    }
+                }
+                SketchEntity::Polyline { points, closed, .. } => {
+                    for w in points.windows(2) {
+                        out.push((w[0], w[1]));
+                    }
+                    if *closed && points.len() > 2 {
+                        out.push((points[points.len() - 1], points[0]));
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// All closed loops of the sketch as polygons (circles and arcs discretised): each
+    /// rectangle, closed polyline and circle, plus loops chained from lines, arcs and
+    /// open polylines whose endpoints meet (shared point or same position).
+    pub fn extract_closed_profiles(&self) -> Vec<Vec<[f64; 2]>> {
+        const SEGMENTS: usize = 48;
+        const TOL: f64 = 1e-4;
+        let pos = |p: &PointId| self.points.get(p).map(|q| [q.x, q.y]);
+        let mut loops = Vec::new();
+        let mut open: Vec<Vec<[f64; 2]>> = Vec::new();
+
+        for ent in self.entities.values() {
+            match ent {
+                SketchEntity::Rectangle { corners, .. } => {
+                    if let Some(pts) = corners.iter().map(pos).collect::<Option<Vec<_>>>() {
+                        loops.push(pts);
+                    }
+                }
+                SketchEntity::Polyline { points, closed, .. } => {
+                    if let Some(pts) = points.iter().map(pos).collect::<Option<Vec<_>>>() {
+                        if *closed && pts.len() >= 3 {
+                            loops.push(pts);
+                        } else if pts.len() >= 2 {
+                            open.push(pts);
+                        }
+                    }
+                }
+                SketchEntity::Circle { center, radius, .. } => {
+                    if let Some([cx, cy]) = pos(center) {
+                        loops.push(
+                            (0..SEGMENTS)
+                                .map(|i| {
+                                    let t = i as f64 * std::f64::consts::TAU / SEGMENTS as f64;
+                                    [cx + radius * t.cos(), cy + radius * t.sin()]
+                                })
+                                .collect(),
+                        );
+                    }
+                }
+                SketchEntity::Line { start, end, .. } => {
+                    if let (Some(a), Some(b)) = (pos(start), pos(end)) {
+                        open.push(vec![a, b]);
+                    }
+                }
+                SketchEntity::Arc {
+                    center,
+                    start,
+                    end,
+                    radius,
+                    ..
+                } => {
+                    if let (Some([cx, cy]), Some(a), Some(b)) = (pos(center), pos(start), pos(end)) {
+                        let a0 = (a[1] - cy).atan2(a[0] - cx);
+                        let mut sweep = (b[1] - cy).atan2(b[0] - cx) - a0;
+                        if sweep <= 0.0 {
+                            sweep += std::f64::consts::TAU;
+                        }
+                        let n = ((sweep / std::f64::consts::TAU) * SEGMENTS as f64).ceil().max(2.0) as usize;
+                        let mut pts = vec![a];
+                        for i in 1..n {
+                            let t = a0 + sweep * i as f64 / n as f64;
+                            pts.push([cx + radius * t.cos(), cy + radius * t.sin()]);
+                        }
+                        pts.push(b);
+                        open.push(pts);
+                    }
+                }
+            }
+        }
+
+        let close = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) < TOL;
+        while let Some(mut chain) = open.pop() {
+            loop {
+                let (first, last) = (chain[0], chain[chain.len() - 1]);
+                if chain.len() >= 4 && close(first, last) {
+                    chain.pop();
+                    loops.push(chain);
+                    break;
+                }
+                let Some(i) = open
+                    .iter()
+                    .position(|e| close(e[0], last) || close(e[e.len() - 1], last))
+                else {
+                    break;
+                };
+                let mut next = open.swap_remove(i);
+                if !close(next[0], last) {
+                    next.reverse();
+                }
+                chain.extend_from_slice(&next[1..]);
+            }
+        }
+        loops
     }
 
     /// Extracts a closed 2D polygon boundary `Vec<[f64; 2]>` from the sketch for `Extrude`.
@@ -562,6 +729,44 @@ impl Sketch {
         } else {
             None
         }
+    }
+}
+
+/// Points an entity is defined by.
+pub fn entity_points(ent: &SketchEntity) -> Vec<PointId> {
+    match ent {
+        SketchEntity::Line { start, end, .. } => vec![*start, *end],
+        SketchEntity::Circle { center, .. } => vec![*center],
+        SketchEntity::Arc {
+            center, start, end, ..
+        } => vec![*center, *start, *end],
+        SketchEntity::Rectangle { corners, .. } => corners.to_vec(),
+        SketchEntity::Polyline { points, .. } => points.clone(),
+    }
+}
+
+/// Points a constraint refers to.
+pub fn constraint_points(c: &SketchConstraint) -> Vec<PointId> {
+    match *c {
+        SketchConstraint::Fixed { point, .. } => vec![point],
+        SketchConstraint::Coincident { p1, p2 }
+        | SketchConstraint::Horizontal { p1, p2 }
+        | SketchConstraint::Vertical { p1, p2 }
+        | SketchConstraint::Distance { p1, p2, .. } => vec![p1, p2],
+        SketchConstraint::Parallel { a1, a2, b1, b2 }
+        | SketchConstraint::Perpendicular { a1, a2, b1, b2 }
+        | SketchConstraint::Equal { a1, a2, b1, b2 } => vec![a1, a2, b1, b2],
+        SketchConstraint::Tangent { l1, l2, center, .. } => vec![l1, l2, center],
+        SketchConstraint::Radius { .. } => Vec::new(),
+    }
+}
+
+/// Entity a constraint refers to directly (radius / tangent circle), if any.
+pub fn constraint_entity(c: &SketchConstraint) -> Option<EntityId> {
+    match *c {
+        SketchConstraint::Radius { entity, .. } => Some(entity),
+        SketchConstraint::Tangent { circle, .. } => Some(circle),
+        _ => None,
     }
 }
 

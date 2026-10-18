@@ -19,6 +19,7 @@ use uuid::Uuid;
 pub use semantic_ref::{ResolutionFailureReason, SemanticReference};
 pub use sketch::{
     EntityId, PointId, Sketch, SketchConstraint, SketchEntity, SketchSolveReport, SketchStatus,
+    constraint_entity, constraint_points, entity_points,
 };
 
 pub const DOCUMENT_SCHEMA_VERSION: u32 = 1;
@@ -255,6 +256,70 @@ fn place_on_frame(
         current = moved;
     }
     Ok(current)
+}
+
+/// Extrudes a set of closed loops along +Z by `depth`. A loop nested inside an odd
+/// number of other loops is a hole and is subtracted; the rest are outer boundaries and
+/// are fused. Holes are cut with a prism slightly taller than the body so the boolean
+/// never has to resolve coplanar caps.
+fn extrude_loops(
+    store: &mut ShapeStore,
+    loops: &[Vec<[f64; 2]>],
+    depth: f64,
+) -> Result<ShapeId, CoreError> {
+    const MARGIN: f64 = 0.01;
+    let depth_of = |i: usize| {
+        loops
+            .iter()
+            .enumerate()
+            .filter(|&(j, other)| j != i && point_in_polygon(loops[i][0], other))
+            .count()
+    };
+    let (holes, outers): (Vec<usize>, Vec<usize>) =
+        (0..loops.len()).partition(|&i| depth_of(i) % 2 == 1);
+
+    let mut body: Option<ShapeId> = None;
+    for i in outers {
+        let prism = store.extrude_polygon(&loops[i], Length::mm(depth))?;
+        body = Some(match body {
+            None => prism,
+            Some(b) => {
+                let fused = store.fuse(b, prism)?;
+                let _ = store.remove(b);
+                let _ = store.remove(prism);
+                fused
+            }
+        });
+    }
+    let mut body = body.ok_or_else(|| {
+        CoreError::Geometry(GeometryError::InvalidParameter {
+            name: "sketch".to_string(),
+            reason: "Sketch contains only hole loops and no outer boundary".to_string(),
+        })
+    })?;
+    for i in holes {
+        let tall = store.extrude_polygon(&loops[i], Length::mm(depth + 2.0 * MARGIN))?;
+        let tool = store.translate(tall, 0.0, 0.0, -MARGIN)?;
+        let _ = store.remove(tall);
+        let cut = store.cut(body, tool)?;
+        let _ = store.remove(body);
+        let _ = store.remove(tool);
+        body = cut;
+    }
+    Ok(body)
+}
+
+fn point_in_polygon(p: [f64; 2], poly: &[[f64; 2]]) -> bool {
+    let mut inside = false;
+    let mut j = poly.len() - 1;
+    for i in 0..poly.len() {
+        let (a, b) = (poly[i], poly[j]);
+        if (a[1] > p[1]) != (b[1] > p[1]) && p[0] < (b[0] - a[0]) * (p[1] - a[1]) / (b[1] - a[1]) + a[0] {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
 }
 
 /// How an extruded sketch profile is combined with existing geometry.
@@ -1338,15 +1403,16 @@ impl Document {
                         reason: format!("Sketch solver failed with status: {:?}", report.status),
                     }));
                 }
-                let pts = solved.extract_closed_profile().ok_or_else(|| {
-                    CoreError::Geometry(GeometryError::InvalidParameter {
+                let loops = solved.extract_closed_profiles();
+                if loops.is_empty() {
+                    return Err(CoreError::Geometry(GeometryError::InvalidParameter {
                         name: solved.name.clone(),
                         reason: "Sketch does not contain a valid closed 2D profile".to_string(),
-                    })
-                })?;
+                    }));
+                }
                 let d = depth.evaluate(params)?;
                 let frame = self.sketch_plane_frame(plane, store)?;
-                let prism = store.extrude_polygon(&pts, Length::mm(d))?;
+                let prism = extrude_loops(store, &loops, d)?;
                 let z_shift = if *symmetric {
                     -d * 0.5
                 } else if *reversed {
@@ -2306,8 +2372,8 @@ mod tests {
         let report = doc.recompute(&mut store, tess).unwrap();
         assert!(report.is_all_clean(), "{:?}", report.failed_features);
 
-        // The profile is a 32-gon approximation of the circle.
-        let hole_area = 0.5 * 32.0 * 25.0 * (2.0 * std::f64::consts::PI / 32.0).sin();
+        // The profile is a 48-gon approximation of the circle.
+        let hole_area = 0.5 * 48.0 * 25.0 * (std::f64::consts::TAU / 48.0).sin();
         let vol = doc.features[&cut].cached_summary.unwrap().volume_mm3;
         assert!((vol - (60_000.0 - hole_area * 10.0)).abs() < 1.0, "vol={vol}");
 
@@ -2365,6 +2431,68 @@ mod tests {
         let b = doc.features[&side].cached_summary.unwrap().bounds;
         assert!((b.min.y + 5.0).abs() < 1e-6 && b.max.y.abs() < 1e-6, "{b:?}");
         assert!((b.max.x - 20.0).abs() < 1e-6 && (b.max.z - 30.0).abs() < 1e-6, "{b:?}");
+    }
+
+    /// M3: a rectangle with a circular hole, fully constrained by dimensions, extrudes
+    /// into a plate with a hole; an arc+line "D" profile closes into a loop, and the
+    /// solver keeps the arc's endpoints on its circle.
+    #[test]
+    fn m3_constrained_profile_with_hole_and_arc_loop() {
+        let mut sketch = Sketch::new("PlateWithHole");
+        let (_, [p0, p1, _, p3]) = sketch.add_rectangle(1.0, -2.0, 70.0, 45.0);
+        sketch.add_constraint(SketchConstraint::Fixed { point: p0, x: 0.0, y: 0.0 });
+        sketch.add_constraint(SketchConstraint::Distance { p1: p0, p2: p1, distance: 80.0 });
+        sketch.add_constraint(SketchConstraint::Distance { p1: p0, p2: p3, distance: 50.0 });
+        let c = sketch.add_point(38.0, 22.0);
+        let circle = sketch.add_circle(c, 7.0);
+        sketch.add_constraint(SketchConstraint::Fixed { point: c, x: 40.0, y: 25.0 });
+        sketch.add_constraint(SketchConstraint::Radius { entity: circle, radius: 10.0 });
+        let report = sketch.solve(60, 1e-10);
+        assert_eq!(report.status, SketchStatus::FullyConstrained, "{report:?}");
+        assert_eq!(sketch.extract_closed_profiles().len(), 2);
+
+        let mut doc = Document::new("M3");
+        let mut store = ShapeStore::new();
+        let fid = doc
+            .add_feature(
+                "Plate",
+                FeatureKind::SketchExtrude {
+                    sketch,
+                    depth: ScalarParam::mm(10.0),
+                    plane: SketchPlane::XY,
+                    mode: ExtrudeMode::NewBody,
+                    reversed: false,
+                    symmetric: false,
+                },
+                true,
+                [1.0; 4],
+            )
+            .unwrap();
+        let report = doc.recompute(&mut store, TessellationOptions::default()).unwrap();
+        assert!(report.is_all_clean(), "{:?}", report.failed_features);
+        let hole = 0.5 * 48.0 * 100.0 * (std::f64::consts::TAU / 48.0).sin();
+        let vol = doc.features[&fid].cached_summary.unwrap().volume_mm3;
+        assert!((vol - (4000.0 - hole) * 10.0).abs() < 1.0, "vol={vol}");
+
+        // "D" shape: a diameter line closed by the upper half-arc.
+        let mut d = Sketch::new("D");
+        let a = d.add_point(-10.0, 0.0);
+        let b = d.add_point(10.0, 0.0);
+        let center = d.add_point(0.0, 0.0);
+        d.add_line(a, b);
+        d.add_arc(center, b, a, 10.0);
+        // Knock the arc start off its circle; solving must pull it back.
+        d.points.get_mut(&b).unwrap().x = 10.7;
+        d.add_constraint(SketchConstraint::Fixed { point: center, x: 0.0, y: 0.0 });
+        d.solve(60, 1e-10);
+        let pb = d.points[&b];
+        assert!((pb.x.hypot(pb.y) - d.entities.values().find_map(|e| match e {
+            SketchEntity::Arc { radius, .. } => Some(*radius),
+            _ => None,
+        }).unwrap()).abs() < 1e-6);
+        let loops = d.extract_closed_profiles();
+        assert_eq!(loops.len(), 1);
+        assert!(loops[0].len() > 10, "arc should be discretised");
     }
 
     #[test]
