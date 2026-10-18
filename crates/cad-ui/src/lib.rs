@@ -250,6 +250,7 @@ pub enum ToolKind {
     /// Start a sketch on a plane parallel to the currently selected face.
     OffsetPlane,
     Draft,
+    Heal,
 }
 
 /// What the sketch being started will become.
@@ -311,6 +312,7 @@ pub enum ToolPanel {
         angle_deg: f64,
         reversed: bool,
     },
+    Heal { input: FeatureId },
 }
 
 /// Action chosen from a timeline chip's right-click menu.
@@ -923,6 +925,9 @@ impl FerroCadApp {
                         "同じボディの面を2つ以上選び、固定面と傾ける面を指定します",
                     ) {
                         self.open_tool_panel(ToolKind::Draft);
+                    }
+                    if ribbon_button(ui, "✚", "形状を修復", feature_selected, "選択中の形状を検証し、OCCT Shape Healingを適用します") {
+                        self.open_tool_panel(ToolKind::Heal);
                     }
                 });
                 ribbon_group(ui, "パターン・組み合わせ", |ui| {

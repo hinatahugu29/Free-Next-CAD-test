@@ -118,6 +118,7 @@ impl FerroCadApp {
                 };
                 ToolPanel::Draft { input: fid, faces, neutral_index: 0, angle_deg: 3.0, reversed: false }
             }
+            ToolKind::Heal => ToolPanel::Heal { input },
         });
     }
 
@@ -147,6 +148,7 @@ impl FerroCadApp {
             ToolPanel::Shell { .. } => "□ シェル",
             ToolPanel::OffsetPlane { .. } => "▱ オフセット面からスケッチ",
             ToolPanel::Draft { .. } => "◢ ドラフト",
+            ToolPanel::Heal { .. } => "✚ 形状を修復",
         };
         let mut confirm = false;
         let mut cancel = false;
@@ -334,6 +336,10 @@ impl FerroCadApp {
                         ui.horizontal(|ui| { ui.label("角度:"); ui.add(egui::DragValue::new(angle_deg).range(0.1..=88.0).suffix("°")); });
                         ui.checkbox(reversed, "反対方向へ傾ける");
                         ui.small("固定面以外の選択面を傾けます。初期版は平面の固定面に対応します。");
+                    }
+                    ToolPanel::Heal { input } => {
+                        ui.label(format!("対象: 「{}」", self.feature_name(*input)));
+                        ui.small("OCCTのShape Healingで修復済みコピーを作ります。");
                     }
                 }
 
@@ -556,6 +562,9 @@ impl FerroCadApp {
                     input, &[input],
                 );
             }
+            ToolPanel::Heal { input } => self.add_replacing(
+                format!("Heal_{n}"), FeatureKind::Heal { input }, input, &[input],
+            ),
         }
     }
 }
