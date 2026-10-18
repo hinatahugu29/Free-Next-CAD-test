@@ -592,6 +592,21 @@ impl ShapeStore {
         self.insert(shape)
     }
 
+    /// Creates a solid loft between two closed planar sketch profiles. The second profile
+    /// is placed at `second_z` in the common sketch coordinate frame.
+    pub fn loft_profiles(
+        &mut self,
+        first: &[ProfileSegment],
+        second: &[ProfileSegment],
+        second_z: f64,
+    ) -> Result<ShapeId, GeometryError> {
+        let mut first_flat = Vec::new();
+        first.iter().for_each(|segment| segment.encode(&mut first_flat));
+        let mut second_flat = Vec::new();
+        second.iter().for_each(|segment| segment.encode(&mut second_flat));
+        self.insert(OcctShape::loft_profiles(&first_flat, &second_flat, second_z)?)
+    }
+
     pub fn revolve_polygon(
         &mut self,
         points_xz: &[[f64; 2]],
