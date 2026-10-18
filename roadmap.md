@@ -825,6 +825,8 @@ OCCTの演算をUIボタンとして直接露出しない。すべてを、再�
 
 **OCCT活用候補:** Shape Healing、Sewing、Splitter、STEPCAF。ここは失敗例の収集と診断表示を先に作り、編集コマンドは後から追加する。
 
+**実装状況（2026-10）:** Shape Healing、Refine、STEP単位・妥当性診断、Sew、SolidFromShell、ソリッド同士のSplit/Partitionは実装済み。次の優先事項は `SurfaceOffset`、`TrimSurface`、およびSTEPCAFによるアセンブリ構成・色・単位の完全な読込みである。M9については直線パスの円形Sweepと2断面Loftまで実装済みで、次はスケッチパスSweep、Rib、Thickenを追加する。
+
 ### 導入しない/後回しにするもの
 
 - 自由曲面の直接編集、NURBS制御点編集、複雑な面置換
