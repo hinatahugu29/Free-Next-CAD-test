@@ -163,6 +163,14 @@ fn scalar_expression(param: &ScalarParam) -> Option<&str> {
     }
 }
 
+fn step_unit_label(step_text: &str) -> &'static str {
+    let upper = step_text.to_ascii_uppercase();
+    if upper.contains(".MILLI.") && upper.contains(".METRE.") { "mm（ミリメートル）" }
+    else if upper.contains(".INCH.") { "inch（インチ）" }
+    else if upper.contains(".METRE.") { "m（メートル）" }
+    else { "STEP内で単位を判定できません" }
+}
+
 /// Main GUI application state for FerroCAD.
 pub struct FerroCadApp {
     pub controller: DocumentController,
@@ -1775,6 +1783,13 @@ impl FerroCadApp {
         }
 
         ui.separator();
+        if let FeatureKind::ImportedBody { source_name, step_text } = &feat.kind {
+            ui.strong("STEP取込診断:");
+            ui.label(format!("元ファイル: {source_name}"));
+            ui.label(format!("単位: {}", step_unit_label(step_text)));
+            ui.small("取込後の形状は固定ボディです。編集には穴・分割・修復などの履歴フィーチャーを追加します。");
+            ui.separator();
+        }
         ui.strong("形状寸法・パラメータ編集:");
         let bindings: Vec<_> = feature_parameter_slots(&feat.kind)
             .into_iter()
@@ -2767,6 +2782,13 @@ impl eframe::App for FerroCadApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn step_unit_diagnosis_recognizes_common_units() {
+        assert_eq!(step_unit_label("SI_UNIT(.MILLI.,.METRE.)"), "mm（ミリメートル）");
+        assert_eq!(step_unit_label("CONVERSION_BASED_UNIT('INCH',.INCH.)"), "inch（インチ）");
+        assert_eq!(step_unit_label("SI_UNIT($,.METRE.)"), "m（メートル）");
+    }
 
     #[test]
     fn phase3_and_4_ui_state_and_command_execution() {
