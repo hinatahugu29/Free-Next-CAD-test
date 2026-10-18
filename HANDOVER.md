@@ -43,6 +43,7 @@ M7〜M9の主要フィーチャーを実装・テストし、Document履歴・Un
 
 ## 直近コミット
 
+- `a57935f` feat: implement generalized sweep, rib, face move, and plane pattern (M7-M9)
 - `cc056cd` docs: record implemented occt roadmap milestones
 - `7f5a400` test(core): cover positioned circular sweep
 - `b68b1d1` feat(core): make sweep start position parametric
