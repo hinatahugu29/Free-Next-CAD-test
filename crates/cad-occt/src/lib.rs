@@ -514,4 +514,15 @@ mod tests {
         let b = OcctShape::make_box(10.0, 10.0, 10.0).expect("make_box");
         assert!(b.fillet_all_edges(50.0).is_err());
     }
+
+    #[test]
+    fn draft_selected_planar_face_keeps_a_valid_solid() {
+        let b = OcctShape::make_box(40.0, 30.0, 20.0).expect("make_box");
+        let faces = b.inspect_faces().expect("inspect faces");
+        let neutral = faces.iter().find(|f| f.nz < -0.99).expect("bottom face").index;
+        let side = faces.iter().find(|f| f.nx > 0.99).expect("side face").index;
+        let drafted = b.draft_faces(&[side], neutral, 4.0, false).expect("draft planar side");
+        assert!(drafted.is_valid().expect("draft validity"));
+        assert!(drafted.volume().expect("draft volume") > 0.0);
+    }
 }
