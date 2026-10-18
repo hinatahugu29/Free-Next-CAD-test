@@ -2908,6 +2908,25 @@ mod tests {
         assert!((app.sketch_frame.origin.z - (top.centroid.z + 12.5)).abs() < 1e-6);
     }
 
+    #[test]
+    fn m7_midplane_starts_a_sketch_between_two_faces() {
+        let mut app = FerroCadApp::new_with_mvp_demo();
+        let plate = FeatureId(5);
+        let shape = app.controller.document.features[&plate].cached_shape.unwrap();
+        let top = app.store.resolve_face_by_signature(shape, glam::DVec3::Z, None, 0.99).unwrap();
+        let bottom = app.store.resolve_face_by_signature(shape, glam::DVec3::NEG_Z, None, 0.99).unwrap();
+        app.select_pick(plate, top.index, None, false);
+        app.select_pick(plate, bottom.index, None, true);
+        app.open_tool_panel(ToolKind::MidPlane);
+        let panel = app.tool_panel.take().expect("midplane panel opens for two selected faces");
+        app.confirm_tool(panel);
+
+        assert!(app.sketch_mode);
+        assert!(matches!(app.sketch_plane, SketchPlane::MidFace { .. }));
+        let expected_z = (top.centroid.z + bottom.centroid.z) * 0.5;
+        assert!((app.sketch_frame.origin.z - expected_z).abs() < 1e-6);
+    }
+
     /// Renders the real UI offscreen (egui_kittest + wgpu) to PNGs under
     /// `build/ui-snapshots/` so layout can be inspected without a window. Needs a GPU
     /// adapter, so it is opt-in: `cargo test -p cad-ui -- --ignored ui_snapshots`.
