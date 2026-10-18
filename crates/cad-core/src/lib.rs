@@ -339,6 +339,10 @@ pub enum RefRole {
     OpenFace(usize),
     /// The face a sketch is drawn on, or a mirror plane face.
     Plane,
+    /// A face tilted by a draft feature.
+    DraftFace(usize),
+    /// The fixed neutral plane of a draft feature.
+    DraftNeutral,
 }
 
 /// One face/edge reference held by a feature.
@@ -725,6 +729,15 @@ pub enum FeatureKind {
         #[serde(default)]
         semantic_refs: Vec<SemanticReference>,
     },
+    /// Tilts selected planar faces around a planar neutral face.
+    Draft {
+        input: FeatureId,
+        faces: Vec<SemanticReference>,
+        neutral_face: SemanticReference,
+        angle_deg: ScalarParam,
+        #[serde(default)]
+        reversed: bool,
+    },
     LinearPattern {
         input: FeatureId,
         spacing_x: ScalarParam,
@@ -782,6 +795,7 @@ impl FeatureKind {
             Self::Transform { input, .. }
             | Self::Fillet { input, .. }
             | Self::Chamfer { input, .. }
+            | Self::Draft { input, .. }
             | Self::LinearPattern { input, .. } => vec![*input],
         }
     }
@@ -799,6 +813,7 @@ impl FeatureKind {
             Self::Transform { input, .. }
             | Self::Fillet { input, .. }
             | Self::Chamfer { input, .. }
+            | Self::Draft { input, .. }
             | Self::LinearPattern { input, .. }
             | Self::Pattern { input, .. }
             | Self::Shell { input, .. } => swap(input),
@@ -850,6 +865,12 @@ impl FeatureKind {
                     });
                 }
             }
+            Self::Draft { input, faces, neutral_face, .. } => {
+                for (i, r) in faces.iter().enumerate() {
+                    out.push(RefSlot { role: RefRole::DraftFace(i), upstream: *input, reference: r.clone() });
+                }
+                out.push(RefSlot { role: RefRole::DraftNeutral, upstream: *input, reference: neutral_face.clone() });
+            }
             Self::Shell {
                 input, open_faces, ..
             } => {
@@ -897,6 +918,11 @@ impl FeatureKind {
                 }
                 None => false,
             },
+            (Self::Draft { faces, .. }, RefRole::DraftFace(i)) => match faces.get_mut(i) {
+                Some(slot) => { *slot = reference; true }
+                None => false,
+            },
+            (Self::Draft { neutral_face, .. }, RefRole::DraftNeutral) => { *neutral_face = reference; true },
             (
                 Self::SketchExtrude { plane, .. }
                 | Self::SketchRevolve { plane, .. }
@@ -920,6 +946,7 @@ impl FeatureKind {
             Self::Transform { input, .. }
             | Self::Fillet { input, .. }
             | Self::Chamfer { input, .. }
+            | Self::Draft { input, .. }
             | Self::LinearPattern { input, .. } => Some(*input),
             Self::Boolean { primary, .. } => Some(*primary),
             Self::SketchExtrude { mode, .. } | Self::SketchRevolve { mode, .. } => mode.target(),
@@ -1007,6 +1034,7 @@ impl FeatureKind {
             Self::Chamfer { distance, .. } => {
                 add(distance);
             }
+            Self::Draft { angle_deg, .. } => add(angle_deg),
             Self::LinearPattern {
                 spacing_x,
                 spacing_y,
@@ -2336,6 +2364,20 @@ impl Document {
                     indices.push(resolved.index);
                 }
                 Ok(store.thick_solid(src, &indices, Length::mm(t))?)
+            }
+            FeatureKind::Draft { input, faces, neutral_face, angle_deg, reversed } => {
+                let src = lookup_shape(*input)?;
+                let mut indices = Vec::with_capacity(faces.len());
+                for face in faces {
+                    let resolved = face.resolve_face(store, src).map_err(|reason| CoreError::SemanticReferenceLost {
+                        feature: *input, reason,
+                    })?;
+                    indices.push(resolved.index);
+                }
+                let neutral = neutral_face.resolve_face(store, src).map_err(|reason| CoreError::SemanticReferenceLost {
+                    feature: *input, reason,
+                })?;
+                Ok(store.draft_faces(src, &indices, neutral.index, angle_deg.evaluate(params)?, *reversed)?)
             }
             FeatureKind::ExtrudeCircle { radius, depth } => {
                 let r = radius.evaluate(params)?;
