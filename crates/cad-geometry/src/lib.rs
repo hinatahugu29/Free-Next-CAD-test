@@ -819,6 +819,12 @@ impl ShapeStore {
         self.insert(healed)
     }
 
+    /// Removes unnecessary same-domain face and edge splits from a copied shape.
+    pub fn refine_shape(&mut self, id: ShapeId) -> Result<ShapeId, GeometryError> {
+        let refined = self.get(id)?.refine()?;
+        self.insert(refined)
+    }
+
     /// Inspects the full topological structure and face/edge geometric signatures of `id`.
     pub fn inspect_shape(&self, id: ShapeId) -> Result<Shape, GeometryError> {
         let s = self.get(id)?;

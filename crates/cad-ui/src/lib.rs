@@ -148,6 +148,7 @@ fn feature_parameter_slots(kind: &FeatureKind) -> Vec<(&'static str, &ScalarPara
         FeatureKind::Mirror { .. }
         | FeatureKind::Boolean { .. }
         | FeatureKind::Heal { .. }
+        | FeatureKind::Refine { .. }
         | FeatureKind::ImportedBody { .. } => Vec::new(),
     }
 }
@@ -261,6 +262,7 @@ pub enum ToolKind {
     SweepCircle,
     Counterbore,
     Countersink,
+    Refine,
 }
 
 /// What the sketch being started will become.
@@ -328,6 +330,7 @@ pub enum ToolPanel {
     SweepCircle { radius: f64, path: [f64; 3] },
     Counterbore { input: FeatureId, hole_radius: f64, bore_radius: f64, bore_depth: f64, depth: f64 },
     Countersink { input: FeatureId, hole_radius: f64, sink_radius: f64, sink_depth: f64, depth: f64 },
+    Refine { input: FeatureId },
 }
 
 /// Action chosen from a timeline chip's right-click menu.
@@ -943,6 +946,9 @@ impl FerroCadApp {
                     }
                     if ribbon_button(ui, "✚", "形状を修復", feature_selected, "選択中の形状を検証し、OCCT Shape Healingを適用します") {
                         self.open_tool_panel(ToolKind::Heal);
+                    }
+                    if ribbon_button(ui, "◇", "分割を整理", feature_selected, "不要な面・辺の分割線を整理します") {
+                        self.open_tool_panel(ToolKind::Refine);
                     }
                     if ribbon_button(ui, "⌁", "ロフト", feature_selected, "2つのXYスケッチ断面の間に遷移形状を作ります") {
                         self.open_tool_panel(ToolKind::Loft);
