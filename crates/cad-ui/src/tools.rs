@@ -119,6 +119,7 @@ impl FerroCadApp {
                 ToolPanel::Draft { input: fid, faces, neutral_index: 0, angle_deg: 3.0, reversed: false }
             }
             ToolKind::Heal => ToolPanel::Heal { input },
+            ToolKind::Loft => ToolPanel::Loft { lower: input, upper: None, distance: 20.0 },
         });
     }
 
@@ -149,6 +150,7 @@ impl FerroCadApp {
             ToolPanel::OffsetPlane { .. } => "▱ オフセット面からスケッチ",
             ToolPanel::Draft { .. } => "◢ ドラフト",
             ToolPanel::Heal { .. } => "✚ 形状を修復",
+            ToolPanel::Loft { .. } => "⌁ ロフト",
         };
         let mut confirm = false;
         let mut cancel = false;
@@ -341,12 +343,25 @@ impl FerroCadApp {
                         ui.label(format!("対象: 「{}」", self.feature_name(*input)));
                         ui.small("OCCTのShape Healingで修復済みコピーを作ります。");
                     }
+                    ToolPanel::Loft { lower, upper, distance } => {
+                        ui.label("下側断面と上側断面を選びます（XY平面の押し出しスケッチのみ）");
+                        ui.label(format!("下側: {}", self.feature_name(*lower)));
+                        ui.horizontal(|ui| {
+                            ui.label("上側:");
+                            let selected = upper.map(|id| self.feature_name(id)).unwrap_or_else(|| "（選択）".to_string());
+                            egui::ComboBox::from_id_salt("loft_upper").selected_text(selected).show_ui(ui, |ui| {
+                                for (id, name) in &names { if *id != *lower { ui.selectable_value(upper, Some(*id), name); } }
+                            });
+                        });
+                        ui.horizontal(|ui| { ui.label("断面間距離:"); ui.add(egui::DragValue::new(distance).speed(0.5).suffix(" mm")); });
+                    }
                 }
 
                 ui.separator();
                 let ready = match &panel {
                     ToolPanel::Boolean { b, .. } => b.is_some(),
                     ToolPanel::Shell { input, .. } => !self.open_faces_on(*input).is_empty(),
+                    ToolPanel::Loft { upper, .. } => upper.is_some(),
                     _ => true,
                 };
                 ui.horizontal(|ui| {
@@ -565,6 +580,18 @@ impl FerroCadApp {
             ToolPanel::Heal { input } => self.add_replacing(
                 format!("Heal_{n}"), FeatureKind::Heal { input }, input, &[input],
             ),
+            ToolPanel::Loft { lower, upper: Some(upper), distance } => {
+                let sketches = |id| match &self.controller.document.features.get(&id)?.kind {
+                    FeatureKind::SketchExtrude { sketch, plane: SketchPlane::XY, .. } => Some(sketch.clone()),
+                    _ => None,
+                };
+                let (Some(lower), Some(upper)) = (sketches(lower), sketches(upper)) else {
+                    self.status_logs.push("ロフトにはXY平面上の押し出しスケッチを2つ選んでください".to_string());
+                    return;
+                };
+                self.execute_cmd(CadCommand::AddFeature { name: format!("Loft_{n}"), kind: FeatureKind::Loft { lower, upper, distance: ScalarParam::Literal(distance) }, visible: true, color_rgba: [0.65, 0.55, 0.9, 1.0] });
+            }
+            ToolPanel::Loft { upper: None, .. } => {}
         }
     }
 }

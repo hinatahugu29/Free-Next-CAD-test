@@ -252,6 +252,7 @@ pub enum ToolKind {
     OffsetPlane,
     Draft,
     Heal,
+    Loft,
 }
 
 /// What the sketch being started will become.
@@ -314,6 +315,7 @@ pub enum ToolPanel {
         reversed: bool,
     },
     Heal { input: FeatureId },
+    Loft { lower: FeatureId, upper: Option<FeatureId>, distance: f64 },
 }
 
 /// Action chosen from a timeline chip's right-click menu.
@@ -929,6 +931,9 @@ impl FerroCadApp {
                     }
                     if ribbon_button(ui, "✚", "形状を修復", feature_selected, "選択中の形状を検証し、OCCT Shape Healingを適用します") {
                         self.open_tool_panel(ToolKind::Heal);
+                    }
+                    if ribbon_button(ui, "⌁", "ロフト", feature_selected, "2つのXYスケッチ断面の間に遷移形状を作ります") {
+                        self.open_tool_panel(ToolKind::Loft);
                     }
                 });
                 ribbon_group(ui, "パターン・組み合わせ", |ui| {
