@@ -1896,6 +1896,16 @@ impl FerroCadApp {
         if let Some(summary) = feat.cached_summary.or(feat.last_valid_summary) {
             ui.separator();
             ui.strong("📊 幾何・トポロジー計測結果:");
+            if let Some(shape) = feat.cached_shape {
+                match self.store.is_valid(shape) {
+                    Ok(true) => ui.colored_label(Color32::from_rgb(110, 210, 145), "✓ 形状検査: 有効"),
+                    Ok(false) => ui.colored_label(Color32::from_rgb(240, 115, 90), "⚠ 形状検査: 無効 — 修復を試してください"),
+                    Err(err) => ui.colored_label(Color32::from_rgb(240, 160, 70), format!("⚠ 形状検査を実行できません: {err}")),
+                };
+            }
+            if summary.solids == 0 && summary.faces > 0 {
+                ui.colored_label(Color32::from_rgb(240, 180, 80), "開いたシェルの可能性: ソリッド化またはSewの対象です");
+            }
             ui.label(format!("体積: {:.2} mm³", summary.volume_mm3));
             ui.label(format!("表面積: {:.2} mm²", summary.surface_area_mm2));
             ui.label(format!(
