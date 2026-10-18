@@ -547,4 +547,12 @@ mod tests {
         assert!(loft.is_valid().expect("loft valid"));
         assert!(loft.volume().expect("loft volume") > 0.0);
     }
+
+    #[test]
+    fn healing_keeps_a_valid_solid_valid() {
+        let box_shape = OcctShape::make_box(24.0, 18.0, 12.0).expect("box");
+        let healed = box_shape.heal().expect("heal");
+        assert!(healed.is_valid().expect("healed validity"));
+        assert!((healed.volume().expect("healed volume") - 5184.0).abs() < 1e-3);
+    }
 }
