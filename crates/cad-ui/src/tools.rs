@@ -131,6 +131,7 @@ impl FerroCadApp {
             ToolKind::Countersink => ToolPanel::Countersink { input, center: [0.0, 0.0], hole_radius: 3.0, sink_radius: 6.0, sink_depth: 3.0, depth: 20.0 },
             ToolKind::Refine => ToolPanel::Refine { input },
             ToolKind::SolidFromShell => ToolPanel::SolidFromShell { input },
+            ToolKind::Sew => ToolPanel::Sew { input, tolerance: 0.001 },
             ToolKind::MidPlane => {
                 let selected: Vec<_> = self.render_config.selected_faces.iter().copied().take(2).collect();
                 if selected.len() != 2 { return; }
@@ -178,6 +179,7 @@ impl FerroCadApp {
             ToolPanel::Countersink { .. } => "▽ 皿穴",
             ToolPanel::Refine { .. } => "◇ 分割を整理",
             ToolPanel::SolidFromShell { .. } => "⬡ 閉じたシェルをソリッド化",
+            ToolPanel::Sew { .. } => "⌁ Sew（面・シェルを縫合）",
             ToolPanel::MidPlane { .. } => "≡ 中間面からスケッチ",
         };
         let mut confirm = false;
@@ -435,6 +437,11 @@ impl FerroCadApp {
                     ToolPanel::SolidFromShell { input } => {
                         ui.label(format!("対象: 「{}」", self.feature_name(*input)));
                         ui.small("閉じたシェルだけをソリッドへ変換します。開いたシェルはSewで閉じてから実行してください。");
+                    }
+                    ToolPanel::Sew { input, tolerance } => {
+                        ui.label(format!("対象: 「{}」", self.feature_name(*input)));
+                        ui.horizontal(|ui| { ui.label("許容差:"); ui.add(egui::DragValue::new(tolerance).range(0.000_001..=1.0).speed(0.0001).suffix(" mm")); });
+                        ui.small("許容差内で一致する面境界を縫合します。必要に応じてソリッド化を続けてください。");
                     }
                     ToolPanel::MidPlane { first_feature, second_feature, .. } => {
                         ui.label(format!("面1: 「{}」", self.feature_name(*first_feature)));
@@ -697,6 +704,9 @@ impl FerroCadApp {
             ),
             ToolPanel::SolidFromShell { input } => self.add_replacing(
                 format!("SolidFromShell_{n}"), FeatureKind::SolidFromShell { input }, input, &[input],
+            ),
+            ToolPanel::Sew { input, tolerance } => self.add_replacing(
+                format!("Sew_{n}"), FeatureKind::Sew { input, tolerance: ScalarParam::Literal(tolerance) }, input, &[input],
             ),
             ToolPanel::MidPlane { first_feature, first, second_feature, second } => {
                 self.start_sketch_with(SketchStart::Extrude);

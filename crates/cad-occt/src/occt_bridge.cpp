@@ -30,6 +30,7 @@
 #include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakeSolid.hxx>
+#include <BRepBuilderAPI_Sewing.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
 
 #include <BRepAlgoAPI_Fuse.hxx>
@@ -798,6 +799,18 @@ std::unique_ptr<OcctShapeHandle> solid_from_shell(const OcctShapeHandle& handle)
         BRepBuilderAPI_MakeSolid maker(TopoDS::Shell(shells(1)));
         if (!maker.IsDone()) throw std::runtime_error("SolidFromShell failed: the shell may be open or self-intersecting");
         return std::make_unique<OcctShapeHandle>(maker.Solid());
+    } catch (const Standard_Failure& e) { rethrow_occt_exception(e); }
+}
+
+std::unique_ptr<OcctShapeHandle> sew_shape(const OcctShapeHandle& handle, double tolerance) {
+    ensure_valid_positive(tolerance, "sewing tolerance");
+    try {
+        BRepBuilderAPI_Sewing sewing(tolerance);
+        sewing.Add(handle.shape());
+        sewing.Perform();
+        TopoDS_Shape sewn = sewing.SewedShape();
+        if (sewn.IsNull()) throw std::runtime_error("Sew failed: no sewable shell was produced");
+        return std::make_unique<OcctShapeHandle>(sewn);
     } catch (const Standard_Failure& e) { rethrow_occt_exception(e); }
 }
 

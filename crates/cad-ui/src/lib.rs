@@ -150,6 +150,7 @@ fn feature_parameter_slots(kind: &FeatureKind) -> Vec<(&'static str, &ScalarPara
         | FeatureKind::Heal { .. }
         | FeatureKind::Refine { .. }
         | FeatureKind::SolidFromShell { .. }
+        | FeatureKind::Sew { .. }
         | FeatureKind::ImportedBody { .. } => Vec::new(),
     }
 }
@@ -265,6 +266,7 @@ pub enum ToolKind {
     Countersink,
     Refine,
     SolidFromShell,
+    Sew,
     MidPlane,
 }
 
@@ -335,6 +337,7 @@ pub enum ToolPanel {
     Countersink { input: FeatureId, center: [f64; 2], hole_radius: f64, sink_radius: f64, sink_depth: f64, depth: f64 },
     Refine { input: FeatureId },
     SolidFromShell { input: FeatureId },
+    Sew { input: FeatureId, tolerance: f64 },
     MidPlane { first_feature: FeatureId, first: SemanticReference, second_feature: FeatureId, second: SemanticReference },
 }
 
@@ -957,6 +960,9 @@ impl FerroCadApp {
                     }
                     if ribbon_button(ui, "⬡", "ソリッド化", feature_selected, "閉じたシェルをソリッドへ変換します") {
                         self.open_tool_panel(ToolKind::SolidFromShell);
+                    }
+                    if ribbon_button(ui, "⌁", "Sew", feature_selected, "隣接する面・シェルの境界を縫合します") {
+                        self.open_tool_panel(ToolKind::Sew);
                     }
                     if ribbon_button(ui, "⌁", "ロフト", feature_selected, "2つのXYスケッチ断面の間に遷移形状を作ります") {
                         self.open_tool_panel(ToolKind::Loft);

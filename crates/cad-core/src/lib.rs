@@ -796,6 +796,8 @@ pub enum FeatureKind {
     Refine { input: FeatureId },
     /// Converts a single closed shell to a solid after import or sewing.
     SolidFromShell { input: FeatureId },
+    /// Stitches coincident shell boundaries before solidification.
+    Sew { input: FeatureId, tolerance: ScalarParam },
     /// Direct planar-face offset, retaining a semantic face reference.
     PushPull { input: FeatureId, face: SemanticReference, distance: ScalarParam },
     LinearPattern {
@@ -866,6 +868,7 @@ impl FeatureKind {
             | Self::Heal { input }
             | Self::Refine { input }
             | Self::SolidFromShell { input }
+            | Self::Sew { input, .. }
             | Self::PushPull { input, .. }
             | Self::Counterbore { input, .. }
             | Self::Countersink { input, .. }
@@ -890,6 +893,7 @@ impl FeatureKind {
             | Self::Heal { input }
             | Self::Refine { input }
             | Self::SolidFromShell { input }
+            | Self::Sew { input, .. }
             | Self::PushPull { input, .. }
             | Self::Counterbore { input, .. }
             | Self::Countersink { input, .. }
@@ -1062,6 +1066,7 @@ impl FeatureKind {
             | Self::Heal { input }
             | Self::Refine { input }
             | Self::SolidFromShell { input }
+            | Self::Sew { input, .. }
             | Self::PushPull { input, .. }
             | Self::Counterbore { input, .. }
             | Self::Countersink { input, .. }
@@ -1156,6 +1161,7 @@ impl FeatureKind {
             Self::Heal { .. } => {}
             Self::Refine { .. } => {}
             Self::SolidFromShell { .. } => {}
+            Self::Sew { tolerance, .. } => add(tolerance),
             Self::PushPull { distance, .. } => add(distance),
             Self::LinearPattern {
                 spacing_x,
@@ -2574,6 +2580,7 @@ impl Document {
             FeatureKind::Heal { input } => Ok(store.heal_shape(lookup_shape(*input)?)?),
             FeatureKind::Refine { input } => Ok(store.refine_shape(lookup_shape(*input)?)?),
             FeatureKind::SolidFromShell { input } => Ok(store.solid_from_shell(lookup_shape(*input)?)?),
+            FeatureKind::Sew { input, tolerance } => Ok(store.sew_shape(lookup_shape(*input)?, tolerance.evaluate(params)?)?),
             FeatureKind::PushPull { input, face, distance } => {
                 let src = lookup_shape(*input)?;
                 let resolved = face.resolve_face(store, src).map_err(|reason| CoreError::SemanticReferenceLost { feature: *input, reason })?;

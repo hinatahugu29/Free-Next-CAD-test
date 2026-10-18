@@ -177,6 +177,7 @@ mod ffi {
         fn heal_shape(handle: &OcctShapeHandle) -> Result<UniquePtr<OcctShapeHandle>>;
         fn refine_shape(handle: &OcctShapeHandle) -> Result<UniquePtr<OcctShapeHandle>>;
         fn solid_from_shell(handle: &OcctShapeHandle) -> Result<UniquePtr<OcctShapeHandle>>;
+        fn sew_shape(handle: &OcctShapeHandle, tolerance: f64) -> Result<UniquePtr<OcctShapeHandle>>;
         fn get_topology_counts(handle: &OcctShapeHandle) -> Result<RawTopoCounts>;
         fn inspect_faces(handle: &OcctShapeHandle) -> Result<Vec<RawFaceInfo>>;
         fn inspect_edges(handle: &OcctShapeHandle) -> Result<Vec<RawEdgeInfo>>;
@@ -455,6 +456,11 @@ impl OcctShape {
     /// Converts one closed shell into a solid.
     pub fn solid_from_shell(&self) -> Result<Self, OcctError> {
         Self::from_ptr(ffi::solid_from_shell(self.as_ref()?)?)
+    }
+
+    /// Stitches coincident surface boundaries within `tolerance` millimeters.
+    pub fn sew(&self, tolerance: f64) -> Result<Self, OcctError> {
+        Self::from_ptr(ffi::sew_shape(self.as_ref()?, tolerance)?)
     }
 
     /// Returns counts of solids, faces, edges, and vertices in the shape.

@@ -614,6 +614,11 @@ impl ShapeStore {
         self.insert(solid)
     }
 
+    /// Stitches coincident shell boundaries within `tolerance_mm`.
+    pub fn sew_shape(&mut self, id: ShapeId, tolerance_mm: f64) -> Result<ShapeId, GeometryError> {
+        self.insert(self.get(id)?.sew(tolerance_mm)?)
+    }
+
     pub fn revolve_polygon(
         &mut self,
         points_xz: &[[f64; 2]],
