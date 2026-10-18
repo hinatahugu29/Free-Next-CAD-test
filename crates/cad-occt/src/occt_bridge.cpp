@@ -191,6 +191,88 @@ std::unique_ptr<OcctShapeHandle> make_extrude_polygon(
     }
 }
 
+namespace {
+// Builds a closed wire from encoded segments, in the XY plane (or XZ for revolve).
+// Encoding per segment: 0 = line (x0, y0, x1, y1); 1 = CCW arc (cx, cy, r, a0, a1) with
+// a1 > a0 in radians; 2 = full circle (cx, cy, r).
+TopoDS_Wire build_profile_wire(rust::Slice<const double> d, bool xz) {
+    auto pnt = [xz](double u, double v) { return xz ? gp_Pnt(u, 0.0, v) : gp_Pnt(u, v, 0.0); };
+    // Axis so that the arc parameter runs from +u toward +v.
+    auto ax = [xz](double cu, double cv) {
+        return xz ? gp_Ax2(gp_Pnt(cu, 0.0, cv), gp_Dir(0.0, -1.0, 0.0), gp_Dir(1.0, 0.0, 0.0))
+                  : gp_Ax2(gp_Pnt(cu, cv, 0.0), gp_Dir(0.0, 0.0, 1.0), gp_Dir(1.0, 0.0, 0.0));
+    };
+    BRepBuilderAPI_MakeWire wire;
+    size_t i = 0;
+    while (i < d.size()) {
+        int kind = static_cast<int>(d[i++]);
+        if (kind == 0 && i + 4 <= d.size()) {
+            gp_Pnt a = pnt(d[i], d[i + 1]);
+            gp_Pnt b = pnt(d[i + 2], d[i + 3]);
+            i += 4;
+            if (a.Distance(b) < 1e-9) {
+                continue;
+            }
+            wire.Add(BRepBuilderAPI_MakeEdge(a, b).Edge());
+        } else if (kind == 1 && i + 5 <= d.size()) {
+            gp_Circ circ(ax(d[i], d[i + 1]), d[i + 2]);
+            double a0 = d[i + 3];
+            double a1 = d[i + 4];
+            i += 5;
+            wire.Add(BRepBuilderAPI_MakeEdge(circ, a0, a1).Edge());
+        } else if (kind == 2 && i + 3 <= d.size()) {
+            gp_Circ circ(ax(d[i], d[i + 1]), d[i + 2]);
+            i += 3;
+            wire.Add(BRepBuilderAPI_MakeEdge(circ).Edge());
+        } else {
+            throw std::invalid_argument("Malformed profile segment data");
+        }
+        if (!wire.IsDone()) {
+            throw std::runtime_error("Profile segments do not connect into a wire");
+        }
+    }
+    if (!wire.IsDone() || !wire.Wire().Closed()) {
+        throw std::runtime_error("Profile is not a closed loop");
+    }
+    return wire.Wire();
+}
+}  // namespace
+
+std::unique_ptr<OcctShapeHandle> make_profile_solid(
+    rust::Slice<const double> segments,
+    double amount,
+    bool revolve
+) {
+    ensure_valid_positive(amount, revolve ? "revolve angle" : "depth");
+    try {
+        TopoDS_Wire wire = build_profile_wire(segments, revolve);
+        BRepBuilderAPI_MakeFace face_maker(wire, Standard_True);
+        if (!face_maker.IsDone()) {
+            throw std::runtime_error("Failed to construct planar face from profile");
+        }
+        if (revolve) {
+            if (amount > 360.0) {
+                throw std::invalid_argument("Revolve angle must be in (0, 360] degrees");
+            }
+            gp_Ax1 axis(gp_Pnt(0.0, 0.0, 0.0), gp_Dir(0.0, 0.0, 1.0));
+            BRepPrimAPI_MakeRevol revol(face_maker.Face(), axis, amount * (kPi / 180.0));
+            revol.Build();
+            if (!revol.IsDone()) {
+                throw std::runtime_error("BRepPrimAPI_MakeRevol failed");
+            }
+            return std::make_unique<OcctShapeHandle>(revol.Shape());
+        }
+        BRepPrimAPI_MakePrism prism(face_maker.Face(), gp_Vec(0.0, 0.0, amount));
+        prism.Build();
+        if (!prism.IsDone()) {
+            throw std::runtime_error("BRepPrimAPI_MakePrism failed");
+        }
+        return std::make_unique<OcctShapeHandle>(prism.Shape());
+    } catch (const Standard_Failure& e) {
+        rethrow_occt_exception(e);
+    }
+}
+
 std::unique_ptr<OcctShapeHandle> make_extrude_circle(double radius, double depth) {
     ensure_valid_positive(radius, "radius");
     ensure_valid_positive(depth, "depth");

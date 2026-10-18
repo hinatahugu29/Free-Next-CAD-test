@@ -264,6 +264,35 @@ pub struct TriMesh {
     pub edge_segment_ids: Vec<u32>,
 }
 
+/// One exact segment of a closed 2D profile (millimetres, radians).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum ProfileSegment {
+    Line { a: [f64; 2], b: [f64; 2] },
+    /// Counter-clockwise arc from `start_rad` to `end_rad` (`end_rad > start_rad`).
+    Arc {
+        center: [f64; 2],
+        radius: f64,
+        start_rad: f64,
+        end_rad: f64,
+    },
+    Circle { center: [f64; 2], radius: f64 },
+}
+
+impl ProfileSegment {
+    fn encode(&self, out: &mut Vec<f64>) {
+        match *self {
+            Self::Line { a, b } => out.extend_from_slice(&[0.0, a[0], a[1], b[0], b[1]]),
+            Self::Arc {
+                center,
+                radius,
+                start_rad,
+                end_rad,
+            } => out.extend_from_slice(&[1.0, center[0], center[1], radius, start_rad, end_rad]),
+            Self::Circle { center, radius } => out.extend_from_slice(&[2.0, center[0], center[1], radius]),
+        }
+    }
+}
+
 /// Writes triangle meshes as one binary STL file (millimetres, facet normals computed
 /// from the triangle winding).
 pub fn write_stl_binary(meshes: &[&TriMesh], path: impl AsRef<Path>) -> std::io::Result<()> {
@@ -538,6 +567,31 @@ impl ShapeStore {
     }
 
     /// Revolves a 2D polygon on the XZ plane around the Z axis by `angle`.
+    /// Solid from a closed profile of exact lines/arcs/circles: extruded along +Z by
+    /// `depth` from the XY plane, giving true cylindrical faces for circles and arcs.
+    pub fn extrude_profile(&mut self, segments: &[ProfileSegment], depth: Length) -> Result<ShapeId, GeometryError> {
+        let d = depth.ensure_positive("depth")?;
+        let mut flat = Vec::new();
+        segments.iter().for_each(|s| s.encode(&mut flat));
+        let shape = OcctShape::make_profile_solid(&flat, d, false)?;
+        self.insert(shape)
+    }
+
+    /// Revolves a closed profile drawn in the XZ plane (u = X, v = Z) around Z.
+    pub fn revolve_profile(&mut self, segments: &[ProfileSegment], angle: Angle) -> Result<ShapeId, GeometryError> {
+        let deg = angle.in_deg();
+        if !deg.is_finite() || deg <= 1e-6 || deg > 360.0 {
+            return Err(GeometryError::InvalidParameter {
+                name: "angle".to_string(),
+                reason: "revolve angle must be in (0, 360] degrees".to_string(),
+            });
+        }
+        let mut flat = Vec::new();
+        segments.iter().for_each(|s| s.encode(&mut flat));
+        let shape = OcctShape::make_profile_solid(&flat, deg, true)?;
+        self.insert(shape)
+    }
+
     pub fn revolve_polygon(
         &mut self,
         points_xz: &[[f64; 2]],

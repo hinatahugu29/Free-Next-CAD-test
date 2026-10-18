@@ -80,6 +80,11 @@ mod ffi {
             depth: f64,
         ) -> Result<UniquePtr<OcctShapeHandle>>;
         fn make_extrude_circle(radius: f64, depth: f64) -> Result<UniquePtr<OcctShapeHandle>>;
+        fn make_profile_solid(
+            segments: &[f64],
+            amount: f64,
+            revolve: bool,
+        ) -> Result<UniquePtr<OcctShapeHandle>>;
         fn make_revolve_polygon(
             coords_xz: &[f64],
             angle_deg: f64,
@@ -260,6 +265,14 @@ impl OcctShape {
     /// Extrudes a 2D circle of `radius` on the XY plane along +Z by `depth`.
     pub fn make_extrude_circle(radius: f64, depth: f64) -> Result<Self, OcctError> {
         Self::from_ptr(ffi::make_extrude_circle(radius, depth)?)
+    }
+
+    /// Builds a solid from a closed profile of exact lines, arcs and circles (see
+    /// `make_profile_solid` in the bridge for the encoding): extruded along +Z by
+    /// `amount` mm from the XY plane, or (`revolve`) drawn in the XZ plane and revolved
+    /// `amount` degrees around Z.
+    pub fn make_profile_solid(segments: &[f64], amount: f64, revolve: bool) -> Result<Self, OcctError> {
+        Self::from_ptr(ffi::make_profile_solid(segments, amount, revolve)?)
     }
 
     /// Revolves a closed 2D polygon on the XZ plane around the Z axis by `angle_deg` degrees.

@@ -7,7 +7,15 @@
 
 use std::collections::BTreeMap;
 
+use cad_geometry::ProfileSegment;
 use serde::{Deserialize, Serialize};
+
+/// A closed loop of a sketch: exact segments plus a discretised polygon.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfileLoop {
+    pub points: Vec<[f64; 2]>,
+    pub segments: Vec<ProfileSegment>,
+}
 
 /// Identifier for a 2D point in a [`Sketch`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -539,47 +547,76 @@ impl Sketch {
         out
     }
 
-    /// All closed loops of the sketch as polygons (circles and arcs discretised): each
-    /// rectangle, closed polyline and circle, plus loops chained from lines, arcs and
-    /// open polylines whose endpoints meet (shared point or same position).
+    /// All closed loops of the sketch as polygons (circles and arcs discretised), for
+    /// display and inside/outside tests. See [`Sketch::extract_profile_loops`] for the
+    /// exact geometry.
     pub fn extract_closed_profiles(&self) -> Vec<Vec<[f64; 2]>> {
+        self.extract_profile_loops().into_iter().map(|l| l.points).collect()
+    }
+
+    /// All closed loops of the sketch: each rectangle, closed polyline and circle, plus
+    /// loops chained from lines, arcs and open polylines whose endpoints meet. Every
+    /// loop carries its exact segments (true arcs and circles, for the kernel) and a
+    /// discretised polygon (for display and containment tests).
+    pub fn extract_profile_loops(&self) -> Vec<ProfileLoop> {
         const SEGMENTS: usize = 48;
         const TOL: f64 = 1e-4;
         let pos = |p: &PointId| self.points.get(p).map(|q| [q.x, q.y]);
+        let lines_of = |pts: &[[f64; 2]], closed: bool| -> Vec<ProfileSegment> {
+            let mut segs: Vec<ProfileSegment> = pts
+                .windows(2)
+                .map(|w| ProfileSegment::Line { a: w[0], b: w[1] })
+                .collect();
+            if closed && pts.len() > 2 {
+                segs.push(ProfileSegment::Line {
+                    a: pts[pts.len() - 1],
+                    b: pts[0],
+                });
+            }
+            segs
+        };
         let mut loops = Vec::new();
-        let mut open: Vec<Vec<[f64; 2]>> = Vec::new();
+        // Open pieces to chain: polyline points (start..end) and their segments.
+        let mut open: Vec<(Vec<[f64; 2]>, Vec<ProfileSegment>)> = Vec::new();
 
         for ent in self.entities.values() {
             match ent {
                 SketchEntity::Rectangle { corners, .. } => {
                     if let Some(pts) = corners.iter().map(pos).collect::<Option<Vec<_>>>() {
-                        loops.push(pts);
+                        let segments = lines_of(&pts, true);
+                        loops.push(ProfileLoop { points: pts, segments });
                     }
                 }
                 SketchEntity::Polyline { points, closed, .. } => {
                     if let Some(pts) = points.iter().map(pos).collect::<Option<Vec<_>>>() {
                         if *closed && pts.len() >= 3 {
-                            loops.push(pts);
+                            let segments = lines_of(&pts, true);
+                            loops.push(ProfileLoop { points: pts, segments });
                         } else if pts.len() >= 2 {
-                            open.push(pts);
+                            let segments = lines_of(&pts, false);
+                            open.push((pts, segments));
                         }
                     }
                 }
                 SketchEntity::Circle { center, radius, .. } => {
                     if let Some([cx, cy]) = pos(center) {
-                        loops.push(
-                            (0..SEGMENTS)
+                        loops.push(ProfileLoop {
+                            points: (0..SEGMENTS)
                                 .map(|i| {
                                     let t = i as f64 * std::f64::consts::TAU / SEGMENTS as f64;
                                     [cx + radius * t.cos(), cy + radius * t.sin()]
                                 })
                                 .collect(),
-                        );
+                            segments: vec![ProfileSegment::Circle {
+                                center: [cx, cy],
+                                radius: *radius,
+                            }],
+                        });
                     }
                 }
                 SketchEntity::Line { start, end, .. } => {
                     if let (Some(a), Some(b)) = (pos(start), pos(end)) {
-                        open.push(vec![a, b]);
+                        open.push((vec![a, b], vec![ProfileSegment::Line { a, b }]));
                     }
                 }
                 SketchEntity::Arc {
@@ -602,32 +639,50 @@ impl Sketch {
                             pts.push([cx + radius * t.cos(), cy + radius * t.sin()]);
                         }
                         pts.push(b);
-                        open.push(pts);
+                        let seg = ProfileSegment::Arc {
+                            center: [cx, cy],
+                            radius: *radius,
+                            start_rad: a0,
+                            end_rad: a0 + sweep,
+                        };
+                        open.push((pts, vec![seg]));
                     }
                 }
             }
         }
 
         let close = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) < TOL;
-        while let Some(mut chain) = open.pop() {
+        while let Some((mut chain, mut segments)) = open.pop() {
             loop {
                 let (first, last) = (chain[0], chain[chain.len() - 1]);
-                if chain.len() >= 4 && close(first, last) {
+                if chain.len() >= 4 && close(first, last) && segments.len() >= 2 {
                     chain.pop();
-                    loops.push(chain);
+                    loops.push(ProfileLoop {
+                        points: chain,
+                        segments,
+                    });
                     break;
                 }
                 let Some(i) = open
                     .iter()
-                    .position(|e| close(e[0], last) || close(e[e.len() - 1], last))
+                    .position(|(e, _)| close(e[0], last) || close(e[e.len() - 1], last))
                 else {
                     break;
                 };
-                let mut next = open.swap_remove(i);
+                let (mut next, mut next_segs) = open.swap_remove(i);
                 if !close(next[0], last) {
+                    // Traverse this piece backwards; arcs stay as counter-clockwise
+                    // arcs (the kernel orders edges itself), lines flip.
                     next.reverse();
+                    next_segs.reverse();
+                    for s in &mut next_segs {
+                        if let ProfileSegment::Line { a, b } = s {
+                            std::mem::swap(a, b);
+                        }
+                    }
                 }
                 chain.extend_from_slice(&next[1..]);
+                segments.extend(next_segs);
             }
         }
         loops

@@ -18,9 +18,10 @@ use uuid::Uuid;
 
 pub use semantic_ref::{ResolutionFailureReason, SemanticReference};
 pub use sketch::{
-    EntityId, PointId, Sketch, SketchConstraint, SketchEntity, SketchSolveReport, SketchStatus,
-    constraint_entity, constraint_points, entity_points,
+    EntityId, PointId, ProfileLoop, Sketch, SketchConstraint, SketchEntity, SketchSolveReport,
+    SketchStatus, constraint_entity, constraint_points, entity_points,
 };
+use cad_geometry::ProfileSegment;
 
 pub const DOCUMENT_SCHEMA_VERSION: u32 = 1;
 
@@ -264,7 +265,7 @@ fn place_on_frame(
 /// never has to resolve coplanar caps.
 fn extrude_loops(
     store: &mut ShapeStore,
-    loops: &[Vec<[f64; 2]>],
+    loops: &[ProfileLoop],
     depth: f64,
 ) -> Result<ShapeId, CoreError> {
     const MARGIN: f64 = 0.01;
@@ -272,7 +273,7 @@ fn extrude_loops(
         loops
             .iter()
             .enumerate()
-            .filter(|&(j, other)| j != i && point_in_polygon(loops[i][0], other))
+            .filter(|&(j, other)| j != i && point_in_polygon(loops[i].points[0], &other.points))
             .count()
     };
     let (holes, outers): (Vec<usize>, Vec<usize>) =
@@ -280,7 +281,7 @@ fn extrude_loops(
 
     let mut body: Option<ShapeId> = None;
     for i in outers {
-        let prism = store.extrude_polygon(&loops[i], Length::mm(depth))?;
+        let prism = store.extrude_profile(&loops[i].segments, Length::mm(depth))?;
         body = Some(match body {
             None => prism,
             Some(b) => {
@@ -298,7 +299,7 @@ fn extrude_loops(
         })
     })?;
     for i in holes {
-        let tall = store.extrude_polygon(&loops[i], Length::mm(depth + 2.0 * MARGIN))?;
+        let tall = store.extrude_profile(&loops[i].segments, Length::mm(depth + 2.0 * MARGIN))?;
         let tool = store.translate(tall, 0.0, 0.0, -MARGIN)?;
         let _ = store.remove(tall);
         let cut = store.cut(body, tool)?;
@@ -469,7 +470,7 @@ impl Instance {
 }
 
 /// Solves a sketch and returns its closed loops, with plain errors when it can't.
-fn solved_loops(sketch: &Sketch) -> Result<(Sketch, Vec<Vec<[f64; 2]>>), CoreError> {
+fn solved_loops(sketch: &Sketch) -> Result<(Sketch, Vec<ProfileLoop>), CoreError> {
     let mut solved = sketch.clone();
     let report = solved.solve(60, 1e-7);
     if matches!(
@@ -481,7 +482,7 @@ fn solved_loops(sketch: &Sketch) -> Result<(Sketch, Vec<Vec<[f64; 2]>>), CoreErr
             reason: format!("Sketch solver failed with status: {:?}", report.status),
         }));
     }
-    let loops = solved.extract_closed_profiles();
+    let loops = solved.extract_profile_loops();
     if loops.is_empty() {
         return Err(CoreError::Geometry(GeometryError::InvalidParameter {
             name: solved.name.clone(),
@@ -491,20 +492,66 @@ fn solved_loops(sketch: &Sketch) -> Result<(Sketch, Vec<Vec<[f64; 2]>>), CoreErr
     Ok((solved, loops))
 }
 
+/// Re-expresses a sketch loop in (distance along `side`, distance along `dir`) from `a`
+/// — a rigid map, possibly mirrored — keeping arcs and circles exact.
+fn map_profile_loop(l: &ProfileLoop, a: DVec3, side: DVec3, dir: DVec3) -> ProfileLoop {
+    let map = |p: [f64; 2]| {
+        let v = DVec3::new(p[0], p[1], 0.0) - a;
+        [v.dot(side), v.dot(dir)]
+    };
+    let angle_of = |t: f64| {
+        let u = DVec3::new(t.cos(), t.sin(), 0.0);
+        u.dot(dir).atan2(u.dot(side))
+    };
+    let mirrored = side.x * dir.y - side.y * dir.x < 0.0;
+    let segments = l
+        .segments
+        .iter()
+        .map(|s| match *s {
+            ProfileSegment::Line { a: p, b: q } => ProfileSegment::Line { a: map(p), b: map(q) },
+            ProfileSegment::Circle { center, radius } => ProfileSegment::Circle {
+                center: map(center),
+                radius,
+            },
+            ProfileSegment::Arc {
+                center,
+                radius,
+                start_rad,
+                end_rad,
+            } => {
+                let sweep = end_rad - start_rad;
+                // A mirror flips the turning direction, so the arc now runs CCW from
+                // the image of its old end point.
+                let start = if mirrored { angle_of(end_rad) } else { angle_of(start_rad) };
+                ProfileSegment::Arc {
+                    center: map(center),
+                    radius,
+                    start_rad: start,
+                    end_rad: start + sweep,
+                }
+            }
+        })
+        .collect();
+    ProfileLoop {
+        points: l.points.iter().map(|&p| map(p)).collect(),
+        segments,
+    }
+}
+
 /// Revolves loops given as (radius, height) about +Z; nested loops become holes.
-fn revolve_loops(store: &mut ShapeStore, loops: &[Vec<[f64; 2]>], angle_deg: f64) -> Result<ShapeId, CoreError> {
+fn revolve_loops(store: &mut ShapeStore, loops: &[ProfileLoop], angle_deg: f64) -> Result<ShapeId, CoreError> {
     let depth_of = |i: usize| {
         loops
             .iter()
             .enumerate()
-            .filter(|&(j, other)| j != i && point_in_polygon(loops[i][0], other))
+            .filter(|&(j, other)| j != i && point_in_polygon(loops[i].points[0], &other.points))
             .count()
     };
     let (holes, outers): (Vec<usize>, Vec<usize>) =
         (0..loops.len()).partition(|&i| depth_of(i) % 2 == 1);
     let mut body: Option<ShapeId> = None;
     for i in outers {
-        let rev = store.revolve_polygon(&loops[i], Angle::deg(angle_deg))?;
+        let rev = store.revolve_profile(&loops[i].segments, Angle::deg(angle_deg))?;
         body = Some(match body {
             None => rev,
             Some(b) => {
@@ -522,7 +569,7 @@ fn revolve_loops(store: &mut ShapeStore, loops: &[Vec<[f64; 2]>], angle_deg: f64
         })
     })?;
     for i in holes {
-        let tool = store.revolve_polygon(&loops[i], Angle::deg(angle_deg))?;
+        let tool = store.revolve_profile(&loops[i].segments, Angle::deg(angle_deg))?;
         let cut = store.cut(body, tool)?;
         let _ = store.remove(body);
         let _ = store.remove(tool);
@@ -2009,19 +2056,9 @@ impl Document {
                 }
                 // Express each loop as (distance from axis, position along axis).
                 let mut side = DVec3::new(dir.y, -dir.x, 0.0);
-                let rz: Vec<Vec<[f64; 2]>> = loops
-                    .iter()
-                    .map(|l| {
-                        l.iter()
-                            .map(|p| {
-                                let v = DVec3::new(p[0], p[1], 0.0) - a;
-                                [v.dot(side), v.dot(dir)]
-                            })
-                            .collect()
-                    })
-                    .collect();
-                let (neg, posi) = rz.iter().flatten().fold((false, false), |(n, p), q| {
-                    (n || q[0] < -1e-7, p || q[0] > 1e-7)
+                let (neg, posi) = loops.iter().flat_map(|l| l.points.iter()).fold((false, false), |(n, p), q| {
+                    let r = (DVec3::new(q[0], q[1], 0.0) - a).dot(side);
+                    (n || r < -1e-7, p || r > 1e-7)
                 });
                 if neg && posi {
                     return Err(CoreError::Geometry(GeometryError::InvalidParameter {
@@ -2029,14 +2066,10 @@ impl Document {
                         reason: "The profile crosses the revolve axis; keep it on one side".to_string(),
                     }));
                 }
-                let rz: Vec<Vec<[f64; 2]>> = if neg {
+                if neg {
                     side = -side;
-                    rz.into_iter()
-                        .map(|l| l.into_iter().map(|[r, z]| [-r, z]).collect())
-                        .collect()
-                } else {
-                    rz
-                };
+                }
+                let rz: Vec<ProfileLoop> = loops.iter().map(|l| map_profile_loop(l, a, side, dir)).collect();
                 let solid = revolve_loops(store, &rz, angle_deg.evaluate(params)?)?;
                 let frame = self.sketch_plane_frame(plane, store)?;
                 let to3 = |v: DVec3| frame.x_axis * v.x + frame.y_axis * v.y;
@@ -3195,8 +3228,8 @@ mod tests {
         let report = doc.recompute(&mut store, tess).unwrap();
         assert!(report.is_all_clean(), "{:?}", report.failed_features);
 
-        // The profile is a 48-gon approximation of the circle.
-        let hole_area = 0.5 * 48.0 * 25.0 * (std::f64::consts::TAU / 48.0).sin();
+        // Circles are exact (true cylindrical faces).
+        let hole_area = std::f64::consts::PI * 25.0;
         let vol = doc.features[&cut].cached_summary.unwrap().volume_mm3;
         assert!((vol - (60_000.0 - hole_area * 10.0)).abs() < 1.0, "vol={vol}");
 
@@ -3295,7 +3328,7 @@ mod tests {
             .unwrap();
         let report = doc.recompute(&mut store, TessellationOptions::default()).unwrap();
         assert!(report.is_all_clean(), "{:?}", report.failed_features);
-        let hole = 0.5 * 48.0 * 100.0 * (std::f64::consts::TAU / 48.0).sin();
+        let hole = std::f64::consts::PI * 100.0;
         let vol = doc.features[&fid].cached_summary.unwrap().volume_mm3;
         assert!((vol - (4000.0 - hole) * 10.0).abs() < 1.0, "vol={vol}");
 
@@ -3397,7 +3430,7 @@ mod tests {
             .unwrap();
         let report = doc.recompute(&mut store, tess).unwrap();
         assert!(report.is_all_clean(), "{:?}", report.failed_features);
-        let hole_area = 0.5 * 48.0 * 16.0 * (std::f64::consts::TAU / 48.0).sin();
+        let hole_area = std::f64::consts::PI * 16.0;
         assert!((vol(&doc, bolt) - (flange_vol - hole_area * 8.0)).abs() < 1.0);
         assert!((vol(&doc, ring) - (flange_vol - 6.0 * hole_area * 8.0)).abs() < 1.0, "{}", vol(&doc, ring));
 
@@ -3586,7 +3619,7 @@ mod tests {
         doc.set_rollback(None).unwrap();
         let report = doc.recompute(&mut store, tess).unwrap();
         assert!(report.is_all_clean(), "{:?}", report.failed_features);
-        let hole = 0.5 * 48.0 * 25.0 * (std::f64::consts::TAU / 48.0).sin();
+        let hole = std::f64::consts::PI * 25.0;
         assert!((vol(&doc, mirror) - 2.0 * (60_000.0 - hole * 10.0)).abs() < 1.0, "{}", vol(&doc, mirror));
 
         // Break the hole's sketch-plane reference, then re-bind it to the top face.
@@ -3704,7 +3737,7 @@ mod tests {
         assert!(report.is_all_clean(), "{:?}", report.failed_features);
         let imported_vol = doc.features[&imported].cached_summary.unwrap().volume_mm3;
         assert!((imported_vol - expected).abs() < 1e-3);
-        let hole = 0.5 * 48.0 * 25.0 * (std::f64::consts::TAU / 48.0).sin();
+        let hole = std::f64::consts::PI * 25.0;
         let cut_vol = doc.features[&cut].cached_summary.unwrap().volume_mm3;
         assert!((cut_vol - (expected - hole * 10.0)).abs() < 1.0);
 

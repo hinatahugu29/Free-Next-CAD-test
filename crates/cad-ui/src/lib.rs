@@ -2509,7 +2509,7 @@ mod tests {
         app.sketch.add_circle(c, 4.0);
         app.finish_sketch_extrude();
         let hole = last(&app);
-        let hole_area = 0.5 * 48.0 * 16.0 * (std::f64::consts::TAU / 48.0).sin();
+        let hole_area = std::f64::consts::PI * 16.0;
         assert!((vol(&app, hole) - (flange_vol - hole_area * 8.0)).abs() < 1.0, "{}", vol(&app, hole));
 
         // Circular pattern panel: defaults to the target's centre, axis Z, 6 x 360°.
@@ -2594,7 +2594,7 @@ mod tests {
         let doc = &app.controller.document;
         assert_eq!(doc.features[&hole].state, FeatureState::Clean);
         // The later hole was re-wired onto the inserted one, so it carries both holes.
-        let area = 0.5 * 48.0 * 25.0 * (std::f64::consts::TAU / 48.0).sin();
+        let area = std::f64::consts::PI * 25.0;
         let plate_vol = doc.features[&plate].cached_summary.unwrap().volume_mm3;
         let vol = doc.features[&hole].cached_summary.unwrap().volume_mm3;
         assert!((vol - (plate_vol - 2.0 * area * 10.0)).abs() < 1.0, "{vol} vs {plate_vol}");
@@ -2715,7 +2715,7 @@ mod tests {
         app.sketch_depth = 10.0;
         app.finish_sketch_extrude();
         let (&base, _) = app.controller.document.features.iter().next_back().unwrap();
-        let hole = 0.5 * 48.0 * 100.0 * (std::f64::consts::TAU / 48.0).sin();
+        let hole = std::f64::consts::PI * 100.0;
         let vol = |app: &FerroCadApp, id: FeatureId| {
             app.controller.document.features[&id].cached_summary.unwrap().volume_mm3
         };

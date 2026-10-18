@@ -36,6 +36,11 @@ std::unique_ptr<OcctShapeHandle> make_extrude_polygon(
     double depth
 );
 std::unique_ptr<OcctShapeHandle> make_extrude_circle(double radius, double depth);
+std::unique_ptr<OcctShapeHandle> make_profile_solid(
+    rust::Slice<const double> segments,
+    double amount,
+    bool revolve
+);
 std::unique_ptr<OcctShapeHandle> make_revolve_polygon(
     rust::Slice<const double> coords_xz,
     double angle_deg
