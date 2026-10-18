@@ -85,6 +85,7 @@ mod ffi {
             amount: f64,
             revolve: bool,
         ) -> Result<UniquePtr<OcctShapeHandle>>;
+        fn make_loft_profiles(first_segments: &[f64], second_segments: &[f64], second_z: f64) -> Result<UniquePtr<OcctShapeHandle>>;
         fn make_revolve_polygon(
             coords_xz: &[f64],
             angle_deg: f64,
@@ -358,6 +359,11 @@ impl OcctShape {
     /// Hollows the solid inward to wall `thickness`, opening the given faces (0-based).
     pub fn thick_solid(&self, removed_face_indices: &[u32], thickness: f64) -> Result<Self, OcctError> {
         Self::from_ptr(ffi::make_thick_solid(self.as_ref()?, removed_face_indices, thickness)?)
+    }
+
+    /// Creates a solid loft between two closed XY profile encodings.
+    pub fn loft_profiles(first: &[f64], second: &[f64], second_z: f64) -> Result<Self, OcctError> {
+        Self::from_ptr(ffi::make_loft_profiles(first, second, second_z)?)
     }
 
     /// Fillets all edges of the shape with constant `radius`.

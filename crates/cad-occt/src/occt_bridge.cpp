@@ -37,6 +37,7 @@
 
 #include <BRepOffsetAPI_MakeThickSolid.hxx>
 #include <BRepOffsetAPI_DraftAngle.hxx>
+#include <BRepOffsetAPI_ThruSections.hxx>
 #include <TopTools_ListOfShape.hxx>
 #include <BRepFilletAPI_MakeFillet.hxx>
 #include <BRepFilletAPI_MakeChamfer.hxx>
@@ -272,6 +273,27 @@ std::unique_ptr<OcctShapeHandle> make_profile_solid(
     } catch (const Standard_Failure& e) {
         rethrow_occt_exception(e);
     }
+}
+
+std::unique_ptr<OcctShapeHandle> make_loft_profiles(
+    rust::Slice<const double> first_segments,
+    rust::Slice<const double> second_segments,
+    double second_z
+) {
+    if (!std::isfinite(second_z) || std::abs(second_z) < 1e-9)
+        throw std::invalid_argument("Loft section distance must be non-zero");
+    try {
+        TopoDS_Wire first = build_profile_wire(first_segments, false);
+        TopoDS_Wire second = build_profile_wire(second_segments, false);
+        gp_Trsf move; move.SetTranslation(gp_Vec(0.0, 0.0, second_z));
+        BRepBuilderAPI_Transform transformed(second, move, true);
+        BRepOffsetAPI_ThruSections loft(Standard_True, Standard_False);
+        loft.AddWire(first);
+        loft.AddWire(TopoDS::Wire(transformed.Shape()));
+        loft.Build();
+        if (!loft.IsDone()) throw std::runtime_error("BRepOffsetAPI_ThruSections failed");
+        return std::make_unique<OcctShapeHandle>(loft.Shape());
+    } catch (const Standard_Failure& e) { rethrow_occt_exception(e); }
 }
 
 std::unique_ptr<OcctShapeHandle> make_extrude_circle(double radius, double depth) {

@@ -41,6 +41,11 @@ std::unique_ptr<OcctShapeHandle> make_profile_solid(
     double amount,
     bool revolve
 );
+std::unique_ptr<OcctShapeHandle> make_loft_profiles(
+    rust::Slice<const double> first_segments,
+    rust::Slice<const double> second_segments,
+    double second_z
+);
 std::unique_ptr<OcctShapeHandle> make_revolve_polygon(
     rust::Slice<const double> coords_xz,
     double angle_deg
