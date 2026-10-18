@@ -777,6 +777,12 @@ impl ShapeStore {
         self.insert(res)
     }
 
+    /// Pushes or pulls a planar face along its normal by `distance`.
+    pub fn push_pull_face(&mut self, id: ShapeId, face_index: u32, distance: f64) -> Result<ShapeId, GeometryError> {
+        let res = self.get(id)?.push_pull_face(face_index, distance)?;
+        self.insert(res)
+    }
+
     /// Returns the volume in $\text{mm}^3$.
     pub fn volume(&self, id: ShapeId) -> Result<f64, GeometryError> {
         Ok(self.get(id)?.volume()?)

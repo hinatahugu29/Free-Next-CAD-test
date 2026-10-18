@@ -123,6 +123,7 @@ fn feature_parameter_slots(kind: &FeatureKind) -> Vec<(&'static str, &ScalarPara
             vec![("回転角", angle_deg)]
         }
         FeatureKind::Loft { distance, .. } => vec![("断面間距離", distance)],
+        FeatureKind::PushPull { distance, .. } => vec![("移動距離", distance)],
         FeatureKind::ExtrudeCircle { radius, depth } => vec![("半径", radius), ("押し出し量", depth)],
         FeatureKind::Transform { dx, dy, dz, rot_angle_deg, .. } => vec![
             ("移動 X", dx),
@@ -253,6 +254,7 @@ pub enum ToolKind {
     Draft,
     Heal,
     Loft,
+    PushPull,
 }
 
 /// What the sketch being started will become.
@@ -316,6 +318,7 @@ pub enum ToolPanel {
     },
     Heal { input: FeatureId },
     Loft { lower: FeatureId, upper: Option<FeatureId>, distance: f64 },
+    PushPull { input: FeatureId, face: SemanticReference, distance: f64 },
 }
 
 /// Action chosen from a timeline chip's right-click menu.
@@ -934,6 +937,9 @@ impl FerroCadApp {
                     }
                     if ribbon_button(ui, "⌁", "ロフト", feature_selected, "2つのXYスケッチ断面の間に遷移形状を作ります") {
                         self.open_tool_panel(ToolKind::Loft);
+                    }
+                    if ribbon_button(ui, "↕", "押出し面", face_selected, "選択面を法線方向へ押出し・引込みます") {
+                        self.open_tool_panel(ToolKind::PushPull);
                     }
                 });
                 ribbon_group(ui, "パターン・組み合わせ", |ui| {

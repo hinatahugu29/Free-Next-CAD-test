@@ -343,6 +343,8 @@ pub enum RefRole {
     DraftFace(usize),
     /// The fixed neutral plane of a draft feature.
     DraftNeutral,
+    /// The planar face offset by a Push/Pull feature.
+    PushPullFace,
 }
 
 /// One face/edge reference held by a feature.
@@ -747,6 +749,8 @@ pub enum FeatureKind {
     },
     /// OCCT Shape Healing applied as a non-destructive history feature.
     Heal { input: FeatureId },
+    /// Direct planar-face offset, retaining a semantic face reference.
+    PushPull { input: FeatureId, face: SemanticReference, distance: ScalarParam },
     LinearPattern {
         input: FeatureId,
         spacing_x: ScalarParam,
@@ -807,6 +811,7 @@ impl FeatureKind {
             | Self::Chamfer { input, .. }
             | Self::Draft { input, .. }
             | Self::Heal { input }
+            | Self::PushPull { input, .. }
             | Self::LinearPattern { input, .. } => vec![*input],
         }
     }
@@ -826,6 +831,7 @@ impl FeatureKind {
             | Self::Chamfer { input, .. }
             | Self::Draft { input, .. }
             | Self::Heal { input }
+            | Self::PushPull { input, .. }
             | Self::LinearPattern { input, .. }
             | Self::Pattern { input, .. }
             | Self::Shell { input, .. } => swap(input),
@@ -883,6 +889,7 @@ impl FeatureKind {
                 }
                 out.push(RefSlot { role: RefRole::DraftNeutral, upstream: *input, reference: neutral_face.clone() });
             }
+            Self::PushPull { input, face, .. } => out.push(RefSlot { role: RefRole::PushPullFace, upstream: *input, reference: face.clone() }),
             Self::Shell {
                 input, open_faces, ..
             } => {
@@ -935,6 +942,7 @@ impl FeatureKind {
                 None => false,
             },
             (Self::Draft { neutral_face, .. }, RefRole::DraftNeutral) => { *neutral_face = reference; true },
+            (Self::PushPull { face, .. }, RefRole::PushPullFace) => { *face = reference; true },
             (
                 Self::SketchExtrude { plane, .. }
                 | Self::SketchRevolve { plane, .. }
@@ -960,6 +968,7 @@ impl FeatureKind {
             | Self::Chamfer { input, .. }
             | Self::Draft { input, .. }
             | Self::Heal { input }
+            | Self::PushPull { input, .. }
             | Self::LinearPattern { input, .. } => Some(*input),
             Self::Boolean { primary, .. } => Some(*primary),
             Self::SketchExtrude { mode, .. } | Self::SketchRevolve { mode, .. } => mode.target(),
@@ -1049,6 +1058,7 @@ impl FeatureKind {
             }
             Self::Draft { angle_deg, .. } => add(angle_deg),
             Self::Heal { .. } => {}
+            Self::PushPull { distance, .. } => add(distance),
             Self::LinearPattern {
                 spacing_x,
                 spacing_y,
@@ -2410,6 +2420,11 @@ impl Document {
                 Ok(store.draft_faces(src, &indices, neutral.index, angle_deg.evaluate(params)?, *reversed)?)
             }
             FeatureKind::Heal { input } => Ok(store.heal_shape(lookup_shape(*input)?)?),
+            FeatureKind::PushPull { input, face, distance } => {
+                let src = lookup_shape(*input)?;
+                let resolved = face.resolve_face(store, src).map_err(|reason| CoreError::SemanticReferenceLost { feature: *input, reason })?;
+                Ok(store.push_pull_face(src, resolved.index, distance.evaluate(params)?)?)
+            }
             FeatureKind::ExtrudeCircle { radius, depth } => {
                 let r = radius.evaluate(params)?;
                 let d = depth.evaluate(params)?;

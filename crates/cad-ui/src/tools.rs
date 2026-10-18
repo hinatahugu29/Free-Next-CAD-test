@@ -120,6 +120,12 @@ impl FerroCadApp {
             }
             ToolKind::Heal => ToolPanel::Heal { input },
             ToolKind::Loft => ToolPanel::Loft { lower: input, upper: None, distance: 20.0 },
+            ToolKind::PushPull => {
+                let Some((fid, index)) = self.render_config.selected_face else { return; };
+                let Some(shape) = self.controller.document.features.get(&fid).and_then(|f| f.cached_shape) else { return; };
+                let Ok(face) = SemanticReference::from_face(fid, &self.store, shape, index) else { return; };
+                ToolPanel::PushPull { input: fid, face, distance: 5.0 }
+            }
         });
     }
 
@@ -151,6 +157,7 @@ impl FerroCadApp {
             ToolPanel::Draft { .. } => "◢ ドラフト",
             ToolPanel::Heal { .. } => "✚ 形状を修復",
             ToolPanel::Loft { .. } => "⌁ ロフト",
+            ToolPanel::PushPull { .. } => "↕ 面を押出し・引込み",
         };
         let mut confirm = false;
         let mut cancel = false;
@@ -354,6 +361,11 @@ impl FerroCadApp {
                             });
                         });
                         ui.horizontal(|ui| { ui.label("断面間距離:"); ui.add(egui::DragValue::new(distance).speed(0.5).suffix(" mm")); });
+                    }
+                    ToolPanel::PushPull { input, distance, .. } => {
+                        ui.label(format!("対象: 「{}」", self.feature_name(*input)));
+                        ui.horizontal(|ui| { ui.label("距離:"); ui.add(egui::DragValue::new(distance).speed(0.5).suffix(" mm")); });
+                        ui.small("プラスは法線方向へ追加、マイナスは引き込みます。平面面のみ対応です。");
                     }
                 }
 
@@ -592,6 +604,9 @@ impl FerroCadApp {
                 self.execute_cmd(CadCommand::AddFeature { name: format!("Loft_{n}"), kind: FeatureKind::Loft { lower, upper, distance: ScalarParam::Literal(distance) }, visible: true, color_rgba: [0.65, 0.55, 0.9, 1.0] });
             }
             ToolPanel::Loft { upper: None, .. } => {}
+            ToolPanel::PushPull { input, face, distance } => self.add_replacing(
+                format!("PushPull_{n}"), FeatureKind::PushPull { input, face, distance: ScalarParam::Literal(distance) }, input, &[input],
+            ),
         }
     }
 }
