@@ -109,6 +109,10 @@ pub enum ScalarParam {
     Expr(String),
 }
 
+fn zero_scalar() -> ScalarParam {
+    ScalarParam::Literal(0.0)
+}
+
 impl ScalarParam {
     pub const fn mm(val: f64) -> Self {
         Self::Literal(val)
@@ -682,17 +686,25 @@ pub enum FeatureKind {
     },
     /// Circular profile swept along one straight parametric path.
     SweepCircle { radius: ScalarParam, dx: ScalarParam, dy: ScalarParam, dz: ScalarParam },
-    /// Counterbore hole cut along +Z from the body's XY origin.
+    /// Counterbore hole cut along +Z from a parametric XY position.
     Counterbore {
         input: FeatureId,
+        #[serde(default = "zero_scalar")]
+        center_x: ScalarParam,
+        #[serde(default = "zero_scalar")]
+        center_y: ScalarParam,
         hole_radius: ScalarParam,
         bore_radius: ScalarParam,
         bore_depth: ScalarParam,
         depth: ScalarParam,
     },
-    /// Countersunk hole cut along +Z from the body's XY origin.
+    /// Countersunk hole cut along +Z from a parametric XY position.
     Countersink {
         input: FeatureId,
+        #[serde(default = "zero_scalar")]
+        center_x: ScalarParam,
+        #[serde(default = "zero_scalar")]
+        center_y: ScalarParam,
         hole_radius: ScalarParam,
         sink_radius: ScalarParam,
         sink_depth: ScalarParam,
@@ -1152,8 +1164,8 @@ impl FeatureKind {
             Self::SketchRevolve { angle_deg, .. } => add(angle_deg),
             Self::Loft { distance, .. } => add(distance),
             Self::SweepCircle { radius, dx, dy, dz } => { add(radius); add(dx); add(dy); add(dz); }
-            Self::Counterbore { hole_radius, bore_radius, bore_depth, depth, .. } => { add(hole_radius); add(bore_radius); add(bore_depth); add(depth); }
-            Self::Countersink { hole_radius, sink_radius, sink_depth, depth, .. } => { add(hole_radius); add(sink_radius); add(sink_depth); add(depth); }
+            Self::Counterbore { center_x, center_y, hole_radius, bore_radius, bore_depth, depth, .. } => { add(center_x); add(center_y); add(hole_radius); add(bore_radius); add(bore_depth); add(depth); }
+            Self::Countersink { center_x, center_y, hole_radius, sink_radius, sink_depth, depth, .. } => { add(center_x); add(center_y); add(hole_radius); add(sink_radius); add(sink_depth); add(depth); }
             Self::Pattern { layout, .. } => match layout {
                 PatternLayout::Circular { total_angle_deg, .. } => add(total_angle_deg),
                 PatternLayout::Linear { spacing, .. } => add(spacing),
@@ -2448,8 +2460,10 @@ impl Document {
                 Length::mm(radius.evaluate(params)?),
                 DVec3::new(dx.evaluate(params)?, dy.evaluate(params)?, dz.evaluate(params)?),
             )?),
-            FeatureKind::Counterbore { input, hole_radius, bore_radius, bore_depth, depth } => {
+            FeatureKind::Counterbore { input, center_x, center_y, hole_radius, bore_radius, bore_depth, depth } => {
                 let src = lookup_shape(*input)?;
+                let center_x = center_x.evaluate(params)?;
+                let center_y = center_y.evaluate(params)?;
                 let hole_radius = hole_radius.evaluate(params)?;
                 let bore_radius = bore_radius.evaluate(params)?;
                 let bore_depth = bore_depth.evaluate(params)?;
@@ -2458,12 +2472,16 @@ impl Document {
                     return Err(CoreError::Geometry(GeometryError::InvalidParameter { name: "Counterbore".to_string(), reason: "座ぐり径は穴径以上、座ぐり深さは全深さ以下にしてください".to_string() }));
                 }
                 let through = store.create_cylinder(Length::mm(hole_radius), Length::mm(depth))?;
+                let through = store.translate(through, center_x, center_y, 0.0)?;
                 let bore = store.create_cylinder(Length::mm(bore_radius), Length::mm(bore_depth))?;
+                let bore = store.translate(bore, center_x, center_y, 0.0)?;
                 let tool = store.fuse(through, bore)?;
                 Ok(store.cut(src, tool)?)
             }
-            FeatureKind::Countersink { input, hole_radius, sink_radius, sink_depth, depth } => {
+            FeatureKind::Countersink { input, center_x, center_y, hole_radius, sink_radius, sink_depth, depth } => {
                 let src = lookup_shape(*input)?;
+                let center_x = center_x.evaluate(params)?;
+                let center_y = center_y.evaluate(params)?;
                 let hole_radius = hole_radius.evaluate(params)?;
                 let sink_radius = sink_radius.evaluate(params)?;
                 let sink_depth = sink_depth.evaluate(params)?;
@@ -2472,8 +2490,9 @@ impl Document {
                     return Err(CoreError::Geometry(GeometryError::InvalidParameter { name: "Countersink".to_string(), reason: "皿穴径は穴径以上、皿深さは全深さ以下にしてください".to_string() }));
                 }
                 let cone = store.create_cone(Length::mm(sink_radius), Length::mm(hole_radius), Length::mm(sink_depth))?;
+                let cone = store.translate(cone, center_x, center_y, 0.0)?;
                 let shaft = store.create_cylinder(Length::mm(hole_radius), Length::mm(depth - sink_depth))?;
-                let shaft = store.translate(shaft, 0.0, 0.0, sink_depth)?;
+                let shaft = store.translate(shaft, center_x, center_y, sink_depth)?;
                 let tool = store.fuse(cone, shaft)?;
                 Ok(store.cut(src, tool)?)
             }
@@ -4256,5 +4275,34 @@ mod tests {
         assert_eq!(feature.reference_slots().len(), 2);
         assert!(doc.add_feature("Midplane extrusion", feature, true, [1.0; 4]).is_ok());
         assert!(doc.recompute(&mut store, TessellationOptions::default()).unwrap().is_all_clean());
+    }
+
+    #[test]
+    fn counterbore_position_is_parametric() {
+        let mut store = ShapeStore::new();
+        let mut doc = Document::new("Positioned counterbore");
+        let plate = doc.add_feature(
+            "Plate",
+            FeatureKind::Box { width: ScalarParam::mm(100.0), height: ScalarParam::mm(60.0), depth: ScalarParam::mm(10.0) },
+            true,
+            [1.0; 4],
+        ).unwrap();
+        let hole = doc.add_feature(
+            "Counterbore",
+            FeatureKind::Counterbore {
+                input: plate,
+                center_x: ScalarParam::mm(35.0),
+                center_y: ScalarParam::mm(20.0),
+                hole_radius: ScalarParam::mm(3.0),
+                bore_radius: ScalarParam::mm(6.0),
+                bore_depth: ScalarParam::mm(4.0),
+                depth: ScalarParam::mm(10.0),
+            },
+            true,
+            [1.0; 4],
+        ).unwrap();
+        assert!(doc.recompute(&mut store, TessellationOptions::default()).unwrap().is_all_clean());
+        let shape = store.inspect_shape(doc.features[&hole].cached_shape.unwrap()).unwrap();
+        assert!(shape.faces.iter().any(|face| (face.centroid.x - 35.0).abs() < 1e-3 && (face.centroid.y - 20.0).abs() < 1e-3));
     }
 }
