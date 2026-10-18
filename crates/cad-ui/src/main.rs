@@ -1,4 +1,4 @@
-use cad_ui::{FerroCadApp, install_japanese_font};
+use cad_ui::{FerroCadApp, default_app_dir, install_japanese_font};
 
 fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
@@ -13,7 +13,7 @@ fn main() -> eframe::Result {
         native_options,
         Box::new(|cc| {
             install_japanese_font(&cc.egui_ctx);
-            Ok(Box::new(FerroCadApp::new_with_mvp_demo()))
+            Ok(Box::new(FerroCadApp::new_with_mvp_demo().with_persistence(default_app_dir())))
         }),
     )
 }

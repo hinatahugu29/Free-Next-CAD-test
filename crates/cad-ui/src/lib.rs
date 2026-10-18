@@ -1,7 +1,11 @@
 //! Desktop CAD GUI for FerroCAD powered by `egui` / `eframe` and `cad-render` (Phase 3 & Phase 4).
 
 mod explain;
+mod files;
+mod measure;
 mod rebind;
+
+pub use files::default_app_dir;
 mod sketch_editor;
 mod tools;
 
@@ -68,6 +72,7 @@ pub enum RibbonTab {
     #[default]
     Solid,
     View,
+    Tools,
 }
 
 /// One ribbon button: a large icon glyph above a short label, fixed width so groups
@@ -163,6 +168,19 @@ pub struct FerroCadApp {
     pub sketch_start: SketchStart,
     /// Re-picking a feature's face/edge reference in the viewport.
     pub rebind: Option<rebind::RebindState>,
+    /// Folder for config, recent files and autosave (`None` = persistence off, as in tests).
+    pub app_dir: Option<PathBuf>,
+    pub recent_files: Vec<PathBuf>,
+    /// Document revision at the last save (or load); differs when there are unsaved changes.
+    pub saved_revision: u64,
+    pub autosaved_revision: u64,
+    pub last_autosave: Option<std::time::Instant>,
+    /// Autosaved work found at startup, with the file it belonged to.
+    pub recovery_offer: Option<Option<PathBuf>>,
+    pub pending_action: Option<files::PendingAction>,
+    pub allow_close: bool,
+    pub measure: Option<measure::MeasureState>,
+    last_title: String,
 }
 
 /// Which modify tool a ribbon button opens.
@@ -345,7 +363,24 @@ impl FerroCadApp {
             tool_panel: None,
             sketch_start: SketchStart::Extrude,
             rebind: None,
+            app_dir: None,
+            recent_files: Vec::new(),
+            saved_revision: 0,
+            autosaved_revision: 0,
+            last_autosave: None,
+            recovery_offer: None,
+            pending_action: None,
+            allow_close: false,
+            measure: None,
+            last_title: String::new(),
         }
+        .mark_saved()
+    }
+
+    fn mark_saved(mut self) -> Self {
+        self.saved_revision = self.controller.document.revision;
+        self.autosaved_revision = self.saved_revision;
+        self
     }
 
     fn add_primitive(&mut self, base_name: &str, kind: FeatureKind, color_rgba: [f32; 4]) {
@@ -646,7 +681,11 @@ impl FerroCadApp {
 
     fn render_ribbon(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            for (tab, label) in [(RibbonTab::Solid, "ソリッド"), (RibbonTab::View, "表示")] {
+            for (tab, label) in [
+                (RibbonTab::Solid, "ソリッド"),
+                (RibbonTab::View, "表示"),
+                (RibbonTab::Tools, "ツール"),
+            ] {
                 if ui.selectable_label(self.ribbon_tab == tab, RichText::new(label).size(13.0)).clicked() {
                     self.ribbon_tab = tab;
                 }
@@ -755,6 +794,31 @@ impl FerroCadApp {
                     }
                 });
             }
+            RibbonTab::Tools => {
+                ribbon_group(ui, "読み込み・書き出し", |ui| {
+                    if ribbon_button(ui, "▽", "STEP取込", true, "STEPファイルを固定の形状として取り込みます") {
+                        self.import_step_dialog();
+                    }
+                    let selected = self.render_config.selected_feature.is_some();
+                    if ribbon_button(
+                        ui,
+                        "△",
+                        "STEP書出",
+                        selected,
+                        if selected { "選択中のボディをSTEPで書き出します" } else { "先に書き出すボディを選択してください" },
+                    ) {
+                        self.export_step_dialog();
+                    }
+                    if ribbon_button(ui, "▲", "STL書出", true, "表示中のボディを3Dプリンタ用のSTLで書き出します") {
+                        self.export_stl_dialog();
+                    }
+                });
+                ribbon_group(ui, "検査", |ui| {
+                    if ribbon_button(ui, "⊿", "測定", true, "面積・距離・角度を測ります") {
+                        self.start_measure();
+                    }
+                });
+            }
             RibbonTab::View => {
                 ribbon_group(ui, "視点", |ui| {
                     for (icon, label, view) in [
@@ -849,6 +913,12 @@ impl FerroCadApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &Context) {
+        if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::S)) {
+            self.save_document(None);
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::O)) {
+            self.open_dialog();
+        }
         if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::K)) {
             self.show_command_palette = !self.show_command_palette;
         }
@@ -876,83 +946,60 @@ impl FerroCadApp {
     fn render_top_menubar(&mut self, ui: &mut egui::Ui) {
         egui::menu::bar(ui, |ui| {
             ui.menu_button("ファイル (File)", |ui| {
-                if ui.button("新規空ドキュメント (New)").clicked() {
-                    self.store.clear();
-                    self.controller = DocumentController::new(Document::new("新規モデル"));
-                    self.render_config.selected_feature = None;
-                    self.render_config.selected_face = None;
-                    self.render_config.selected_edge = None;
-                    self.viewport_dirty = true;
+                if ui.button("新規 (New)").clicked() {
+                    self.request(files::PendingAction::New);
                     ui.close_menu();
                 }
-                if ui
-                    .button("Milestone M1 デモ（穴あきプレート）を再読込")
-                    .clicked()
-                {
-                    *self = Self::new_with_mvp_demo();
+                if ui.button("開く… (Ctrl+O)").clicked() {
                     ui.close_menu();
+                    self.open_dialog();
                 }
-                ui.separator();
-                if ui.button("設計JSONを開く (Open JSON)...").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("FerroCAD JSON", &["json", "fcad"])
-                        .pick_file()
-                    {
-                        match Document::load_json(&path) {
-                            Ok(doc) => {
-                                self.store.clear();
-                                self.controller = DocumentController::new(doc);
-                                self.current_file_path = Some(path.clone());
-                                self.recompute_and_refresh();
-                                if let Some(bbox) = self.controller.document.visible_bounding_box()
-                                {
-                                    self.camera.fit_bounding_box(&bbox);
-                                }
-                                self.status_logs
-                                    .push(format!("JSON読込完了: {}", path.display()));
-                            }
-                            Err(e) => self.status_logs.push(format!("読込エラー: {e}")),
+                ui.menu_button("最近使ったファイル", |ui| {
+                    if self.recent_files.is_empty() {
+                        ui.weak("（まだありません）");
+                    }
+                    for path in self.recent_files.clone() {
+                        let label = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        if ui.button(label).on_hover_text(path.display().to_string()).clicked() {
+                            self.request(files::PendingAction::Open(path));
+                            ui.close_menu();
                         }
                     }
+                });
+                ui.separator();
+                if ui.button("保存 (Ctrl+S)").clicked() {
                     ui.close_menu();
+                    self.save_document(None);
                 }
-                if ui.button("設計JSONを保存 (Save JSON)...").clicked() {
+                if ui.button("名前を付けて保存…").clicked() {
+                    ui.close_menu();
                     if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("FerroCAD JSON", &["json"])
-                        .set_file_name("model.json")
+                        .add_filter("FerroCAD", &["fcad"])
+                        .set_file_name(format!("{}.fcad", self.controller.document.name))
                         .save_file()
                     {
-                        match self.controller.document.save_json(&path) {
-                            Ok(()) => {
-                                self.current_file_path = Some(path.clone());
-                                self.status_logs
-                                    .push(format!("JSON保存完了: {}", path.display()));
-                            }
-                            Err(e) => self.status_logs.push(format!("保存エラー: {e}")),
-                        }
+                        self.save_document(Some(path));
                     }
-                    ui.close_menu();
                 }
                 ui.separator();
-                if ui
-                    .button("選択フィーチャーをSTEP出力 (Export STEP)...")
-                    .clicked()
-                {
-                    if let Some(fid) = self.render_config.selected_feature
-                        && let Some(feat) = self.controller.document.features.get(&fid)
-                        && let Some(shape_id) = feat.cached_shape
-                        && let Some(path) = rfd::FileDialog::new()
-                            .add_filter("STEP CAD", &["step", "stp"])
-                            .set_file_name(format!("{}.step", feat.name))
-                            .save_file()
-                    {
-                        match self.store.export_step(shape_id, &path) {
-                            Ok(()) => self
-                                .status_logs
-                                .push(format!("STEP出力完了: {}", path.display())),
-                            Err(e) => self.status_logs.push(format!("STEP出力エラー: {e}")),
-                        }
-                    }
+                if ui.button("STEPを取り込む…").clicked() {
+                    ui.close_menu();
+                    self.import_step_dialog();
+                }
+                if ui.button("STLで書き出す…（3Dプリンタ用）").clicked() {
+                    ui.close_menu();
+                    self.export_stl_dialog();
+                }
+                if ui.button("選択中のボディをSTEPで書き出す…").clicked() {
+                    ui.close_menu();
+                    self.export_step_dialog();
+                }
+                ui.separator();
+                if ui.button("デモ（穴あきプレート）を開く").clicked() {
+                    self.request(files::PendingAction::Demo);
                     ui.close_menu();
                 }
             });
@@ -1696,6 +1743,20 @@ impl FerroCadApp {
             }
         }
 
+        // Measuring: clicks pick faces/points; results are drawn over the view.
+        if self.measure.is_some() {
+            if response.clicked()
+                && let Some(pos) = response.interact_pointer_pos()
+            {
+                let (u, v) = uv(pos);
+                if let Some(hit) = pick_document(&self.view_document(), &self.camera, u, v, aspect) {
+                    let p = hit.hit_point;
+                    self.measure_pick(hit.feature_id, hit.face_index, glam::DVec3::new(p.x as f64, p.y as f64, p.z as f64));
+                }
+            }
+            self.draw_measure_overlay(ui, rect);
+        }
+
         // Re-binding a reference: a click on the shown body picks the new face/edge.
         if self.rebind.is_some() {
             if response.clicked()
@@ -1716,6 +1777,7 @@ impl FerroCadApp {
         if !self.sketch_plane_picking
             && !self.sketch_mode
             && self.rebind.is_none()
+            && self.measure.is_none()
             && (response.clicked() || response.double_clicked())
             && let Some(pos) = response.interact_pointer_pos()
         {
@@ -2006,6 +2068,14 @@ fn edit_operation_params(ui: &mut egui::Ui, kind: &mut FeatureKind) -> bool {
 }
 
 impl eframe::App for FerroCadApp {
+    /// A normal exit leaves no autosave behind (so the next start offers no recovery);
+    /// if the process dies instead, the autosave survives and is offered next time.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if !self.has_unsaved_changes() || self.allow_close {
+            self.clear_autosave();
+        }
+    }
+
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.handle_shortcuts(ctx);
 
@@ -2074,6 +2144,23 @@ impl eframe::App for FerroCadApp {
 
         if !self.sketch_mode {
             self.render_tool_panel(ctx);
+            self.render_measure_panel(ctx);
+        }
+        self.render_file_dialogs(ctx);
+
+        // Autosave, window title, and asking before closing with unsaved work.
+        self.tick_autosave(std::time::Instant::now());
+        let title = self.window_title();
+        if title != self.last_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.last_title = title;
+        }
+        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && self.has_unsaved_changes() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.pending_action = Some(files::PendingAction::Exit);
+        }
+        if self.allow_close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
         if let Some((id, mut name)) = self.rename_target.take() {
@@ -2153,8 +2240,8 @@ impl eframe::App for FerroCadApp {
                         self.show_command_palette = false;
                     }
                     if ui.button("Milestone M1 穴あきプレートを再生成").clicked() {
-                        *self = Self::new_with_mvp_demo();
                         self.show_command_palette = false;
+                        self.request(files::PendingAction::Demo);
                     }
                 });
         }
@@ -2353,6 +2440,21 @@ mod tests {
             app.set_rollback(Some(FeatureId(3)));
             app.render_config.selected_feature = Some(FeatureId(1));
         });
+        shoot("m6_measure.png", &|app| {
+            app.ribbon_tab = RibbonTab::Tools;
+            let shape = app.controller.document.features[&FeatureId(5)].cached_shape.unwrap();
+            let top = app.store.resolve_face_by_signature(shape, glam::DVec3::Z, None, 0.99).unwrap();
+            let side = app.store.resolve_face_by_signature(shape, glam::DVec3::X, Some(glam::DVec3::new(100.0, 30.0, 5.0)), 0.99).unwrap();
+            app.start_measure();
+            app.measure_pick(FeatureId(5), top.index, glam::DVec3::new(30.0, 30.0, 10.0));
+            app.measure_pick(FeatureId(5), side.index, glam::DVec3::new(100.0, 30.0, 5.0));
+        });
+        shoot("m6_recovery.png", &|app| {
+            app.recovery_offer = Some(Some(std::path::PathBuf::from(r"C:/work/bracket.fcad")));
+        });
+        shoot("m6_unsaved.png", &|app| {
+            app.pending_action = Some(files::PendingAction::New);
+        });
         shoot("m4_revolve_sketch.png", &|app| {
             app.start_sketch_with(SketchStart::Revolve);
             app.begin_sketch(SketchPlane::XZ, None);
@@ -2496,6 +2598,83 @@ mod tests {
         let plate_vol = doc.features[&plate].cached_summary.unwrap().volume_mm3;
         let vol = doc.features[&hole].cached_summary.unwrap().volume_mm3;
         assert!((vol - (plate_vol - 2.0 * area * 10.0)).abs() < 1.0, "{vol} vs {plate_vol}");
+    }
+
+    /// M6: autosave survives a crash and is offered/restored on the next start; saving
+    /// clears it and records a recent file; STL/STEP go through the app; measuring two
+    /// parallel faces reports their gap; unsaved work is guarded.
+    #[test]
+    fn m6_autosave_recovery_files_and_measure() {
+        let dir = std::env::temp_dir().join(format!("ferrocad_ui_m6_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut app = FerroCadApp::new_with_mvp_demo().with_persistence(dir.clone());
+        assert!(app.recovery_offer.is_none());
+        assert!(!app.has_unsaved_changes());
+        app.add_primitive(
+            "Box",
+            FeatureKind::Box {
+                width: ScalarParam::mm(10.0),
+                height: ScalarParam::mm(10.0),
+                depth: ScalarParam::mm(10.0),
+            },
+            [1.0; 4],
+        );
+        assert!(app.has_unsaved_changes());
+        app.tick_autosave(std::time::Instant::now());
+        assert!(app.autosave_path().unwrap().exists());
+        let expected = app.controller.document.features.len();
+        drop(app); // the process "dies": no on_exit, autosave stays
+
+        let mut app = FerroCadApp::new_with_mvp_demo().with_persistence(dir.clone());
+        assert_eq!(app.recovery_offer, Some(None), "work from the dead session is offered");
+        app.recover();
+        assert_eq!(app.controller.document.features.len(), expected);
+        assert!(app.has_unsaved_changes(), "recovered work still needs saving");
+
+        let saved = dir.join("part.fcad");
+        assert!(app.save_document(Some(saved.clone())));
+        assert!(!app.autosave_path().unwrap().exists(), "saving clears the autosave");
+        assert!(app.window_title().starts_with("part.fcad"));
+
+        // STL of what is visible, and a STEP round trip as an imported body.
+        let stl = dir.join("part.stl");
+        assert!(app.export_visible_stl(&stl));
+        let bytes = std::fs::read(&stl).unwrap();
+        let n = u32::from_le_bytes(bytes[80..84].try_into().unwrap()) as usize;
+        assert!(n > 0 && bytes.len() == 84 + 50 * n);
+        let step = dir.join("plate.step");
+        let plate_shape = app.controller.document.features[&FeatureId(5)].cached_shape.unwrap();
+        app.store.export_step(plate_shape, &step).unwrap();
+        assert!(app.import_step_file(&step));
+        let imported = *app.controller.document.features.keys().next_back().unwrap();
+        assert!(matches!(app.controller.document.features[&imported].kind, FeatureKind::ImportedBody { .. }));
+        assert_eq!(app.controller.document.features[&imported].state, FeatureState::Clean);
+
+        // Measure the plate's top and bottom faces: parallel, 10mm apart.
+        let shape = app.controller.document.features[&FeatureId(5)].cached_shape.unwrap();
+        let top = app.store.resolve_face_by_signature(shape, glam::DVec3::Z, None, 0.99).unwrap();
+        let bottom = app.store.resolve_face_by_signature(shape, glam::DVec3::NEG_Z, None, 0.99).unwrap();
+        app.start_measure();
+        app.measure_pick(FeatureId(5), top.index, glam::DVec3::new(50.0, 30.0, 10.0));
+        app.measure_pick(FeatureId(5), bottom.index, glam::DVec3::new(50.0, 30.0, 0.0));
+        let rows = app.measure_results();
+        let find = |label: &str| rows.iter().find(|(l, _)| l == label).map(|(_, v)| v.clone()).unwrap();
+        assert_eq!(find("点と点の距離"), "10.000 mm");
+        assert_eq!(find("面と面の角度"), "0.00°");
+        assert_eq!(find("面と面の距離（平行）"), "10.000 mm");
+
+        // Unsaved changes are guarded before a destructive action.
+        assert!(app.has_unsaved_changes());
+        app.request(files::PendingAction::New);
+        assert_eq!(app.pending_action, Some(files::PendingAction::New));
+
+        // A clean start afterwards: recent file remembered, nothing to recover.
+        app.clear_autosave();
+        let app2 = FerroCadApp::new_with_mvp_demo().with_persistence(dir.clone());
+        assert_eq!(app2.recent_files.first(), Some(&saved));
+        assert!(app2.recovery_offer.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// M3 flow: draw a rectangle with a circle inside, constrain it fully with

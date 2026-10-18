@@ -264,6 +264,33 @@ pub struct TriMesh {
     pub edge_segment_ids: Vec<u32>,
 }
 
+/// Writes triangle meshes as one binary STL file (millimetres, facet normals computed
+/// from the triangle winding).
+pub fn write_stl_binary(meshes: &[&TriMesh], path: impl AsRef<Path>) -> std::io::Result<()> {
+    let count: usize = meshes.iter().map(|m| m.indices.len()).sum();
+    let count = u32::try_from(count)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "too many triangles for STL"))?;
+    let mut out = Vec::with_capacity(84 + 50 * count as usize);
+    let mut header = [0u8; 80];
+    let tag = b"FerroCAD binary STL (mm)";
+    header[..tag.len()].copy_from_slice(tag);
+    out.extend_from_slice(&header);
+    out.extend_from_slice(&count.to_le_bytes());
+    for mesh in meshes {
+        for tri in &mesh.indices {
+            let [a, b, c] = tri.map(|i| DVec3::from_array(mesh.positions[i as usize].map(f64::from)));
+            let n = (b - a).cross(c - a).normalize_or_zero();
+            for v in [n, a, b, c] {
+                for comp in [v.x, v.y, v.z] {
+                    out.extend_from_slice(&(comp as f32).to_le_bytes());
+                }
+            }
+            out.extend_from_slice(&0u16.to_le_bytes());
+        }
+    }
+    std::fs::write(path, out)
+}
+
 impl TriMesh {
     pub fn triangle_count(&self) -> usize {
         self.indices.len()

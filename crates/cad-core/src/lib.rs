@@ -625,6 +625,12 @@ pub enum FeatureKind {
         thickness: ScalarParam,
         open_faces: Vec<SemanticReference>,
     },
+    /// A fixed (non-parametric) body read from a STEP file. The file's text is stored in
+    /// the document so the model keeps working if the original file moves or changes.
+    ImportedBody {
+        source_name: String,
+        step_text: String,
+    },
     ExtrudeCircle {
         radius: ScalarParam,
         depth: ScalarParam,
@@ -685,7 +691,8 @@ impl FeatureKind {
             | Self::Cone { .. }
             | Self::ExtrudePolygon { .. }
             | Self::ExtrudeCircle { .. }
-            | Self::RevolvePolygon { .. } => Vec::new(),
+            | Self::RevolvePolygon { .. }
+            | Self::ImportedBody { .. } => Vec::new(),
             Self::Pattern { input, .. } | Self::Mirror { input, plane: SketchPlane::XY | SketchPlane::XZ | SketchPlane::YZ, .. } | Self::Shell { input, .. } => {
                 vec![*input]
             }
@@ -961,7 +968,7 @@ impl FeatureKind {
                 PatternLayout::Circular { total_angle_deg, .. } => add(total_angle_deg),
                 PatternLayout::Linear { spacing, .. } => add(spacing),
             },
-            Self::Mirror { .. } => {}
+            Self::Mirror { .. } | Self::ImportedBody { .. } => {}
             Self::Shell { thickness, .. } => add(thickness),
         }
         set
@@ -1518,6 +1525,29 @@ impl Document {
         self.operation_history
             .push(CadCommand::SetSuppressed { id, suppressed });
         Ok(())
+    }
+
+    /// Writes the given features' current shapes as one binary STL, tessellated with
+    /// `options` (use finer settings than the viewport for printing). Returns the
+    /// triangle count.
+    pub fn export_stl(
+        &self,
+        store: &ShapeStore,
+        ids: &[FeatureId],
+        path: impl AsRef<Path>,
+        options: TessellationOptions,
+    ) -> Result<usize, CoreError> {
+        let mut meshes = Vec::new();
+        for id in ids {
+            let shape = self.feature_shape(*id)?;
+            meshes.push(store.tessellate(shape, options)?);
+        }
+        if meshes.is_empty() {
+            return Err(CoreError::Serialization("nothing to export".to_string()));
+        }
+        let refs: Vec<&TriMesh> = meshes.iter().collect();
+        cad_geometry::write_stl_binary(&refs, path).map_err(|e| CoreError::Serialization(e.to_string()))?;
+        Ok(meshes.iter().map(|m| m.indices.len()).sum())
     }
 
     /// Checks whether a reference still resolves against its upstream shape right now.
@@ -2191,6 +2221,14 @@ impl Document {
                     vec![mirror]
                 };
                 self.replicate(*input, &instances, tool, params, store)
+            }
+            FeatureKind::ImportedBody { step_text, .. } => {
+                // OCCT's STEP reader works on files, so round-trip through a temp file.
+                let path = std::env::temp_dir().join(format!("ferrocad_import_{}.step", Uuid::new_v4()));
+                std::fs::write(&path, step_text).map_err(|e| CoreError::Serialization(e.to_string()))?;
+                let imported = store.import_step(&path);
+                let _ = std::fs::remove_file(&path);
+                Ok(imported?)
             }
             FeatureKind::Shell {
                 input,
@@ -3587,6 +3625,98 @@ mod tests {
         let reloaded = Document::from_snapshot(doc.to_snapshot()).unwrap();
         assert_eq!(reloaded.timeline(), vec![plate, cut, mirror]);
         assert_eq!(reloaded.rollback, Some(plate));
+    }
+
+    /// Reads a binary STL and returns (triangles, enclosed volume by the divergence
+    /// theorem). A closed, consistently oriented mesh gives the solid's volume.
+    fn read_stl(path: &std::path::Path) -> (usize, f64) {
+        let bytes = std::fs::read(path).unwrap();
+        let n = u32::from_le_bytes(bytes[80..84].try_into().unwrap()) as usize;
+        assert_eq!(bytes.len(), 84 + 50 * n, "binary STL size must match its triangle count");
+        let f = |o: usize| f32::from_le_bytes(bytes[o..o + 4].try_into().unwrap()) as f64;
+        let mut vol = 0.0;
+        for t in 0..n {
+            let o = 84 + 50 * t + 12;
+            let v = |k: usize| DVec3::new(f(o + 12 * k), f(o + 12 * k + 4), f(o + 12 * k + 8));
+            vol += v(0).dot(v(1).cross(v(2))) / 6.0;
+        }
+        (n, vol)
+    }
+
+    /// M6: STL export is a closed mesh with the solid's volume; a STEP file imported as a
+    /// body can be modelled on and survives a save/load round trip.
+    #[test]
+    fn m6_stl_export_and_step_import() {
+        let tess = TessellationOptions::default();
+        let mut store = ShapeStore::new();
+        let (mut ctrl, plate) = build_perforated_plate_mvp().unwrap();
+        ctrl.document.recompute(&mut store, tess).unwrap();
+        let expected = ctrl.document.features[&plate].cached_summary.unwrap().volume_mm3;
+
+        let dir = std::env::temp_dir().join(format!("ferrocad_m6_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stl = dir.join("plate.stl");
+        let fine = TessellationOptions {
+            linear_deflection_mm: 0.02,
+            angular_deflection_rad: 0.1,
+        };
+        let tris = ctrl.document.export_stl(&store, &[plate], &stl, fine).unwrap();
+        let (n, vol) = read_stl(&stl);
+        assert_eq!(n, tris);
+        assert!((vol - expected).abs() / expected < 2e-3, "STL volume {vol} vs solid {expected}");
+
+        // Import the plate back from STEP as a fixed body, then cut a hole into it.
+        let step = dir.join("plate.step");
+        store.export_step(ctrl.document.features[&plate].cached_shape.unwrap(), &step).unwrap();
+        let mut doc = Document::new("Imported");
+        let imported = doc
+            .add_feature(
+                "ImportedPlate",
+                FeatureKind::ImportedBody {
+                    source_name: "plate.step".to_string(),
+                    step_text: std::fs::read_to_string(&step).unwrap(),
+                },
+                true,
+                [1.0; 4],
+            )
+            .unwrap();
+        let mut circle = Sketch::new("Hole");
+        let c = circle.add_point(50.0, 30.0);
+        circle.add_circle(c, 5.0);
+        let cut = doc
+            .add_feature(
+                "Hole",
+                FeatureKind::SketchExtrude {
+                    sketch: circle,
+                    depth: ScalarParam::mm(1.0),
+                    plane: SketchPlane::XY,
+                    mode: ExtrudeMode::Cut { target: imported },
+                    reversed: false,
+                    symmetric: false,
+                    through_all: true,
+                },
+                true,
+                [1.0; 4],
+            )
+            .unwrap();
+        let mut store2 = ShapeStore::new();
+        let report = doc.recompute(&mut store2, tess).unwrap();
+        assert!(report.is_all_clean(), "{:?}", report.failed_features);
+        let imported_vol = doc.features[&imported].cached_summary.unwrap().volume_mm3;
+        assert!((imported_vol - expected).abs() < 1e-3);
+        let hole = 0.5 * 48.0 * 25.0 * (std::f64::consts::TAU / 48.0).sin();
+        let cut_vol = doc.features[&cut].cached_summary.unwrap().volume_mm3;
+        assert!((cut_vol - (expected - hole * 10.0)).abs() < 1.0);
+
+        // The STEP text lives in the document: delete the file, reload, recompute.
+        let saved = dir.join("model.fcad");
+        doc.save_json(&saved).unwrap();
+        std::fs::remove_file(&step).unwrap();
+        let mut reloaded = Document::load_json(&saved).unwrap();
+        let mut store3 = ShapeStore::new();
+        assert!(reloaded.recompute(&mut store3, tess).unwrap().is_all_clean());
+        assert!((reloaded.features[&cut].cached_summary.unwrap().volume_mm3 - cut_vol).abs() < 1e-3);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -657,6 +657,7 @@ dependencies = [
  "glam",
  "image",
  "rfd",
+ "serde",
  "serde_json",
 ]
 
