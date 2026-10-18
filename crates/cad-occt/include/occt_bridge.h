@@ -136,7 +136,18 @@ std::unique_ptr<OcctShapeHandle> push_pull_face(
     uint32_t face_index,
     double distance
 );
+std::unique_ptr<OcctShapeHandle> face_move(
+    const OcctShapeHandle& handle,
+    uint32_t face_index,
+    double dx,
+    double dy,
+    double dz
+);
 std::unique_ptr<OcctShapeHandle> make_sweep_circle(double radius, double dx, double dy, double dz);
+std::unique_ptr<OcctShapeHandle> make_sweep(
+    rust::Slice<const double> profile_segments,
+    rust::Slice<const double> path_points
+);
 
 double compute_volume(const OcctShapeHandle& handle);
 double compute_surface_area(const OcctShapeHandle& handle);

@@ -143,6 +143,18 @@ impl FerroCadApp {
                 let (Some((first_feature, first)), Some((second_feature, second))) = (reference(selected[0]), reference(selected[1])) else { return; };
                 ToolPanel::MidPlane { first_feature, first, second_feature, second }
             }
+            ToolKind::FaceMove => {
+                let Some((fid, index)) = self.render_config.selected_face else { return; };
+                let Some(shape) = self.controller.document.features.get(&fid).and_then(|f| f.cached_shape) else { return; };
+                let Ok(face) = SemanticReference::from_face(fid, &self.store, shape, index) else { return; };
+                ToolPanel::FaceMove { input: fid, face, displacement: [0.0, 0.0, 10.0] }
+            }
+            ToolKind::PlanePattern => {
+                let Some((fid, index)) = self.render_config.selected_face else { return; };
+                let Some(shape) = self.controller.document.features.get(&fid).and_then(|f| f.cached_shape) else { return; };
+                let Ok(face) = SemanticReference::from_face(fid, &self.store, shape, index) else { return; };
+                ToolPanel::PlanePattern { input: fid, base_face: face, spacing: 10.0, count: 3 }
+            }
         });
     }
 
@@ -183,6 +195,8 @@ impl FerroCadApp {
             ToolPanel::Sew { .. } => "⌁ Sew（面・シェルを縫合）",
             ToolPanel::Split { .. } => "✂ 分割（Partition）",
             ToolPanel::MidPlane { .. } => "≡ 中間面からスケッチ",
+            ToolPanel::FaceMove { .. } => "↗ 面移動（Face Move）",
+            ToolPanel::PlanePattern { .. } => "▤ 基準平面配列（Plane Pattern）",
         };
         let mut confirm = false;
         let mut cancel = false;
@@ -407,6 +421,28 @@ impl FerroCadApp {
                         ui.label(format!("対象: 「{}」", self.feature_name(*input)));
                         ui.horizontal(|ui| { ui.label("距離:"); ui.add(egui::DragValue::new(distance).speed(0.5).suffix(" mm")); });
                         ui.small("プラスは法線方向へ追加、マイナスは引き込みます。平面面のみ対応です。");
+                    }
+                    ToolPanel::FaceMove { input, displacement, .. } => {
+                        ui.label(format!("対象: 「{}」", self.feature_name(*input)));
+                        ui.horizontal(|ui| {
+                            ui.label("移動ベクトル XYZ:");
+                            ui.add(egui::DragValue::new(&mut displacement[0]).speed(0.5).prefix("X: ").suffix(" mm"));
+                            ui.add(egui::DragValue::new(&mut displacement[1]).speed(0.5).prefix("Y: ").suffix(" mm"));
+                            ui.add(egui::DragValue::new(&mut displacement[2]).speed(0.5).prefix("Z: ").suffix(" mm"));
+                        });
+                        ui.small("法線方向の制約なしに、選択した平面を任意ベクトルへ平行移動します。");
+                    }
+                    ToolPanel::PlanePattern { input, spacing, count, .. } => {
+                        ui.label(format!("対象: 「{}」", self.feature_name(*input)));
+                        ui.horizontal(|ui| {
+                            ui.label("間隔:");
+                            ui.add(egui::DragValue::new(spacing).speed(0.5).suffix(" mm"));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("個数:");
+                            ui.add(egui::DragValue::new(count).range(1..=100));
+                        });
+                        ui.small("基準面から指定間隔で平行な基準平面配列を生成します。");
                     }
                     ToolPanel::SweepCircle { radius, start, path } => {
                         ui.horizontal(|ui| { ui.label("半径:"); ui.add(egui::DragValue::new(radius).range(0.01..=10000.0).suffix(" mm")); });
@@ -727,6 +763,12 @@ impl FerroCadApp {
                 self.start_sketch_with(SketchStart::Extrude);
                 self.begin_sketch(SketchPlane::MidFace { first_feature, first, second_feature, second }, None);
             }
+            ToolPanel::FaceMove { input, face, displacement } => self.add_replacing(
+                format!("FaceMove_{n}"), FeatureKind::FaceMove { input, face, dx: ScalarParam::Literal(displacement[0]), dy: ScalarParam::Literal(displacement[1]), dz: ScalarParam::Literal(displacement[2]) }, input, &[input],
+            ),
+            ToolPanel::PlanePattern { input, base_face, spacing, count } => self.add_replacing(
+                format!("PlanePattern_{n}"), FeatureKind::PlanePattern { input, base_face, spacing: ScalarParam::Literal(spacing), count, reverse: false }, input, &[input],
+            ),
         }
     }
 }

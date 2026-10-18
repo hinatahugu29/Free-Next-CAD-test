@@ -801,10 +801,23 @@ impl ShapeStore {
         self.insert(res)
     }
 
+    /// Moves a planar face by fusing or cutting a prism along an arbitrary displacement vector.
+    pub fn face_move(&mut self, id: ShapeId, face_index: u32, displacement: DVec3) -> Result<ShapeId, GeometryError> {
+        let res = self.get(id)?.face_move(face_index, displacement.to_array())?;
+        self.insert(res)
+    }
+
     /// Sweeps a circular profile from the origin along a straight path.
     pub fn sweep_circle(&mut self, radius: Length, direction: DVec3) -> Result<ShapeId, GeometryError> {
         let radius = radius.ensure_positive("sweep radius")?;
         self.insert(OcctShape::sweep_circle(radius, direction.to_array())?)
+    }
+
+    /// Sweeps a closed planar sketch profile along an arbitrary polyline path.
+    pub fn sweep(&mut self, profile: &[ProfileSegment], path_points: &[f64]) -> Result<ShapeId, GeometryError> {
+        let mut profile_flat = Vec::new();
+        profile.iter().for_each(|segment| segment.encode(&mut profile_flat));
+        self.insert(OcctShape::sweep(&profile_flat, path_points)?)
     }
 
     /// Returns the volume in $\text{mm}^3$.

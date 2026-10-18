@@ -362,6 +362,10 @@ pub enum RefRole {
     DraftNeutral,
     /// The planar face offset by a Push/Pull feature.
     PushPullFace,
+    /// The planar face displaced by a FaceMove feature.
+    FaceMoveFace,
+    /// The base face for a PlanePattern feature.
+    PlanePatternFace,
 }
 
 /// One face/edge reference held by a feature.
@@ -802,6 +806,36 @@ pub enum FeatureKind {
     Split { input: FeatureId, tool: FeatureId },
     /// Direct planar-face offset, retaining a semantic face reference.
     PushPull { input: FeatureId, face: SemanticReference, distance: ScalarParam },
+    /// Moves a planar face along an arbitrary displacement vector.
+    FaceMove {
+        input: FeatureId,
+        face: SemanticReference,
+        dx: ScalarParam,
+        dy: ScalarParam,
+        dz: ScalarParam,
+    },
+    /// Sweeps a 2D closed sketch profile along a 3D polyline path.
+    Sweep {
+        profile: Sketch,
+        path_points: Vec<[ScalarParam; 3]>,
+    },
+    /// Structural rib added from a sketch profile onto an existing body.
+    Rib {
+        input: FeatureId,
+        sketch: Sketch,
+        plane: SketchPlane,
+        thickness: ScalarParam,
+        depth: ScalarParam,
+    },
+    /// Array of construction planes generated from a base face by spacing and count.
+    PlanePattern {
+        input: FeatureId,
+        base_face: SemanticReference,
+        spacing: ScalarParam,
+        count: u32,
+        #[serde(default)]
+        reverse: bool,
+    },
     LinearPattern {
         input: FeatureId,
         spacing_x: ScalarParam,
@@ -825,6 +859,7 @@ impl FeatureKind {
             | Self::RevolvePolygon { .. }
             | Self::Loft { .. }
             | Self::SweepCircle { .. }
+            | Self::Sweep { .. }
             | Self::ImportedBody { .. } => Vec::new(),
             Self::Pattern { input, .. } | Self::Mirror { input, plane: SketchPlane::XY | SketchPlane::XZ | SketchPlane::YZ, .. } | Self::Shell { input, .. } => {
                 vec![*input]
@@ -872,9 +907,20 @@ impl FeatureKind {
             | Self::SolidFromShell { input }
             | Self::Sew { input, .. }
             | Self::PushPull { input, .. }
+            | Self::FaceMove { input, .. }
+            | Self::PlanePattern { input, .. }
             | Self::Counterbore { input, .. }
             | Self::Countersink { input, .. }
             | Self::LinearPattern { input, .. } => vec![*input],
+            Self::Rib { input, plane, .. } => {
+                let mut deps = vec![*input];
+                for id in plane.features() {
+                    if !deps.contains(&id) {
+                        deps.push(id);
+                    }
+                }
+                deps
+            }
             Self::Split { input, tool } => if input == tool { vec![*input] } else { vec![*input, *tool] },
         }
     }
@@ -898,6 +944,8 @@ impl FeatureKind {
             | Self::SolidFromShell { input }
             | Self::Sew { input, .. }
             | Self::PushPull { input, .. }
+            | Self::FaceMove { input, .. }
+            | Self::PlanePattern { input, .. }
             | Self::Counterbore { input, .. }
             | Self::Countersink { input, .. }
             | Self::LinearPattern { input, .. }
@@ -969,6 +1017,20 @@ impl FeatureKind {
                 out.push(RefSlot { role: RefRole::DraftNeutral, upstream: *input, reference: neutral_face.clone() });
             }
             Self::PushPull { input, face, .. } => out.push(RefSlot { role: RefRole::PushPullFace, upstream: *input, reference: face.clone() }),
+            Self::FaceMove { input, face, .. } => out.push(RefSlot { role: RefRole::FaceMoveFace, upstream: *input, reference: face.clone() }),
+            Self::PlanePattern { input, base_face, .. } => out.push(RefSlot { role: RefRole::PlanePatternFace, upstream: *input, reference: base_face.clone() }),
+            Self::Rib { plane, .. } => {
+                match plane {
+                    SketchPlane::Face { feature, face } | SketchPlane::OffsetFace { feature, face, .. } => {
+                        out.push(RefSlot { role: RefRole::Plane, upstream: *feature, reference: face.clone() });
+                    }
+                    SketchPlane::MidFace { first_feature, first, second_feature, second } => {
+                        out.push(RefSlot { role: RefRole::MidPlaneFirst, upstream: *first_feature, reference: first.clone() });
+                        out.push(RefSlot { role: RefRole::MidPlaneSecond, upstream: *second_feature, reference: second.clone() });
+                    }
+                    _ => {}
+                }
+            }
             Self::Shell {
                 input, open_faces, ..
             } => {
@@ -1025,9 +1087,12 @@ impl FeatureKind {
             },
             (Self::Draft { neutral_face, .. }, RefRole::DraftNeutral) => { *neutral_face = reference; true },
             (Self::PushPull { face, .. }, RefRole::PushPullFace) => { *face = reference; true },
+            (Self::FaceMove { face, .. }, RefRole::FaceMoveFace) => { *face = reference; true },
+            (Self::PlanePattern { base_face, .. }, RefRole::PlanePatternFace) => { *base_face = reference; true },
             (
                 Self::SketchExtrude { plane, .. }
                 | Self::SketchRevolve { plane, .. }
+                | Self::Rib { plane, .. }
                 | Self::Mirror { plane, .. },
                 RefRole::Plane,
             ) => match plane {
@@ -1169,6 +1234,9 @@ impl FeatureKind {
             Self::Sew { tolerance, .. } => add(tolerance),
             Self::Split { .. } => {}
             Self::PushPull { distance, .. } => add(distance),
+            Self::FaceMove { dx, dy, dz, .. } => { add(dx); add(dy); add(dz); }
+            Self::PlanePattern { spacing, .. } => add(spacing),
+            Self::Rib { thickness, depth, .. } => { add(thickness); add(depth); }
             Self::LinearPattern {
                 spacing_x,
                 spacing_y,
@@ -1182,6 +1250,13 @@ impl FeatureKind {
             Self::SketchRevolve { angle_deg, .. } => add(angle_deg),
             Self::Loft { distance, .. } => add(distance),
             Self::SweepCircle { radius, start_x, start_y, start_z, dx, dy, dz } => { add(radius); add(start_x); add(start_y); add(start_z); add(dx); add(dy); add(dz); }
+            Self::Sweep { path_points, .. } => {
+                for pt in path_points {
+                    add(&pt[0]);
+                    add(&pt[1]);
+                    add(&pt[2]);
+                }
+            }
             Self::Counterbore { center_x, center_y, hole_radius, bore_radius, bore_depth, depth, .. } => { add(center_x); add(center_y); add(hole_radius); add(bore_radius); add(bore_depth); add(depth); }
             Self::Countersink { center_x, center_y, hole_radius, sink_radius, sink_depth, depth, .. } => { add(center_x); add(center_y); add(hole_radius); add(sink_radius); add(sink_depth); add(depth); }
             Self::Pattern { layout, .. } => match layout {
@@ -2592,6 +2667,56 @@ impl Document {
                 let src = lookup_shape(*input)?;
                 let resolved = face.resolve_face(store, src).map_err(|reason| CoreError::SemanticReferenceLost { feature: *input, reason })?;
                 Ok(store.push_pull_face(src, resolved.index, distance.evaluate(params)?)?)
+            }
+            FeatureKind::FaceMove { input, face, dx, dy, dz } => {
+                let src = lookup_shape(*input)?;
+                let resolved = face.resolve_face(store, src).map_err(|reason| CoreError::SemanticReferenceLost { feature: *input, reason })?;
+                let disp = DVec3::new(dx.evaluate(params)?, dy.evaluate(params)?, dz.evaluate(params)?);
+                Ok(store.face_move(src, resolved.index, disp)?)
+            }
+            FeatureKind::Sweep { profile, path_points } => {
+                let (_, loops) = solved_loops(profile)?;
+                if loops.is_empty() {
+                    return Err(CoreError::Geometry(GeometryError::InvalidParameter {
+                        name: "Sweep".to_string(),
+                        reason: "スイープには1つ以上の閉じたスケッチ輪郭が必要です".to_string(),
+                    }));
+                }
+                let mut path_coords = Vec::with_capacity(path_points.len() * 3);
+                for pt in path_points {
+                    path_coords.push(pt[0].evaluate(params)?);
+                    path_coords.push(pt[1].evaluate(params)?);
+                    path_coords.push(pt[2].evaluate(params)?);
+                }
+                Ok(store.sweep(&loops[0].segments, &path_coords)?)
+            }
+            FeatureKind::Rib { input, sketch, plane, thickness, depth } => {
+                let src = lookup_shape(*input)?;
+                let frame = self.sketch_plane_frame(plane, store)?;
+                let (solved_sketch, loops) = solved_loops(sketch)?;
+                let t = thickness.evaluate(params)?;
+                let d = depth.evaluate(params)?;
+                let rib_shape = if !loops.is_empty() {
+                    let slab = store.extrude_profile(&loops[0].segments, Length::mm(d))?;
+                    place_on_frame(store, slab, &frame, 0.0)?
+                } else if solved_sketch.points.len() >= 2 {
+                    let pts: Vec<_> = solved_sketch.points.values().collect();
+                    let len = ((pts[1].x - pts[0].x).powi(2) + (pts[1].y - pts[0].y).powi(2)).sqrt();
+                    let box_shape = store.create_box(Length::mm(len), Length::mm(t), Length::mm(d))?;
+                    place_on_frame(store, box_shape, &frame, 0.0)?
+                } else {
+                    return Err(CoreError::Geometry(GeometryError::InvalidParameter {
+                        name: "Rib".to_string(),
+                        reason: "リブには閉じた輪郭または2点以上のスケッチ要素が必要です".to_string(),
+                    }));
+                };
+                let fused = store.fuse(src, rib_shape)?;
+                let _ = store.remove(rib_shape);
+                Ok(fused)
+            }
+            FeatureKind::PlanePattern { input, .. } => {
+                let src = lookup_shape(*input)?;
+                Ok(src)
             }
             FeatureKind::ExtrudeCircle { radius, depth } => {
                 let r = radius.evaluate(params)?;
@@ -4350,5 +4475,74 @@ mod tests {
         let bounds = doc.features[&sweep].cached_summary.unwrap().bounds;
         assert!((bounds.center().x - 30.0).abs() < 1e-3 && (bounds.center().y - 40.0).abs() < 1e-3);
         assert!((bounds.min.z - 5.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn face_move_in_document_recomputes_and_tracks_semantic_face() {
+        let mut store = ShapeStore::new();
+        let mut doc = Document::new("FaceMove doc");
+        let b = doc.add_feature("Base", FeatureKind::Box {
+            width: ScalarParam::mm(20.0),
+            height: ScalarParam::mm(20.0),
+            depth: ScalarParam::mm(20.0),
+        }, true, [1.0; 4]).unwrap();
+        assert!(doc.recompute(&mut store, TessellationOptions::default()).unwrap().is_all_clean());
+
+        let base_shape = doc.features[&b].cached_shape.unwrap();
+        let faces = store.inspect_shape(base_shape).unwrap().faces;
+        let top_face = faces.iter().find(|f| (f.normal.z - 1.0).abs() < 1e-3).expect("top face");
+        let sem_ref = SemanticReference::from_face(b, &store, base_shape, top_face.index).expect("sem_ref");
+
+        let fm = doc.add_feature("MoveTop", FeatureKind::FaceMove {
+            input: b,
+            face: sem_ref,
+            dx: ScalarParam::mm(0.0),
+            dy: ScalarParam::mm(0.0),
+            dz: ScalarParam::mm(15.0),
+        }, true, [1.0; 4]).unwrap();
+
+        assert!(doc.recompute(&mut store, TessellationOptions::default()).unwrap().is_all_clean());
+        let moved_shape = doc.features[&fm].cached_shape.unwrap();
+        let vol = store.volume(moved_shape).unwrap();
+        // 20 * 20 * 35 = 14000
+        assert!((vol - 14000.0).abs() < 1e-1, "vol was {vol}");
+    }
+
+    #[test]
+    fn generalized_sweep_and_rib_in_document() {
+        let mut store = ShapeStore::new();
+        let mut doc = Document::new("Sweep and Rib");
+
+        // Profile sketch for sweep: 10 x 6 rectangle
+        let mut sk = Sketch::new("Profile");
+        let p0 = sk.add_point(-5.0, -3.0);
+        let p1 = sk.add_point(5.0, -3.0);
+        let p2 = sk.add_point(5.0, 3.0);
+        let p3 = sk.add_point(-5.0, 3.0);
+        sk.add_line(p0, p1);
+        sk.add_line(p1, p2);
+        sk.add_line(p2, p3);
+        sk.add_line(p3, p0);
+
+        let path = vec![
+            [ScalarParam::mm(0.0), ScalarParam::mm(0.0), ScalarParam::mm(0.0)],
+            [ScalarParam::mm(0.0), ScalarParam::mm(0.0), ScalarParam::mm(40.0)],
+        ];
+        let sweep = doc.add_feature("Sweep", FeatureKind::Sweep {
+            profile: sk.clone(),
+            path_points: path,
+        }, true, [1.0; 4]).unwrap();
+
+        let rib = doc.add_feature("Rib", FeatureKind::Rib {
+            input: sweep,
+            sketch: sk,
+            plane: SketchPlane::XY,
+            thickness: ScalarParam::mm(4.0),
+            depth: ScalarParam::mm(10.0),
+        }, true, [1.0; 4]).unwrap();
+
+        assert!(doc.recompute(&mut store, TessellationOptions::default()).unwrap().is_all_clean());
+        let rib_shape = doc.features[&rib].cached_shape.unwrap();
+        assert!(store.volume(rib_shape).unwrap() > 2000.0);
     }
 }

@@ -713,13 +713,55 @@ std::unique_ptr<OcctShapeHandle> push_pull_face(
         if (face_index >= static_cast<uint32_t>(faces.Extent())) throw std::out_of_range("Face index out of range");
         TopoDS_Face face = TopoDS::Face(faces(face_index + 1));
         BRepAdaptor_Surface surface(face);
-        if (surface.GetType() != GeomAbs_Plane) throw std::invalid_argument("Push/Pull supports planar faces only");
         gp_Dir normal = surface.Plane().Axis().Direction();
+        if (face.Orientation() == TopAbs_REVERSED) {
+            normal.Reverse();
+        }
         BRepPrimAPI_MakePrism prism(face, gp_Vec(normal) * distance);
         prism.Build();
         if (!prism.IsDone()) throw std::runtime_error("Push/Pull prism failed");
         if (distance > 0.0) { BRepAlgoAPI_Fuse fuse(handle.shape(), prism.Shape()); fuse.Build(); if (!fuse.IsDone()) throw std::runtime_error("Push/Pull fuse failed"); return std::make_unique<OcctShapeHandle>(fuse.Shape()); }
         BRepAlgoAPI_Cut cut(handle.shape(), prism.Shape()); cut.Build(); if (!cut.IsDone()) throw std::runtime_error("Push/Pull cut failed"); return std::make_unique<OcctShapeHandle>(cut.Shape());
+    } catch (const Standard_Failure& e) { rethrow_occt_exception(e); }
+}
+
+std::unique_ptr<OcctShapeHandle> face_move(
+    const OcctShapeHandle& handle, uint32_t face_index, double dx, double dy, double dz
+) {
+    gp_Vec move_vec(dx, dy, dz);
+    if (move_vec.SquareMagnitude() < 1e-12)
+        throw std::invalid_argument("Face move displacement vector must be non-zero");
+    try {
+        TopTools_IndexedMapOfShape faces;
+        TopExp::MapShapes(handle.shape(), TopAbs_FACE, faces);
+        if (face_index >= static_cast<uint32_t>(faces.Extent()))
+            throw std::out_of_range("Face index out of range for face move");
+        TopoDS_Face face = TopoDS::Face(faces(face_index + 1));
+        BRepAdaptor_Surface surface(face);
+        if (surface.GetType() != GeomAbs_Plane)
+            throw std::invalid_argument("Face move currently supports planar faces only");
+        
+        BRepPrimAPI_MakePrism prism(face, move_vec);
+        prism.Build();
+        if (!prism.IsDone())
+            throw std::runtime_error("Face move prism failed");
+        
+        gp_Dir normal = surface.Plane().Axis().Direction();
+        if (face.Orientation() == TopAbs_REVERSED) {
+            normal.Reverse();
+        }
+        double dot = gp_Vec(normal).Dot(move_vec);
+        if (dot >= 0.0) {
+            BRepAlgoAPI_Fuse fuse(handle.shape(), prism.Shape());
+            fuse.Build();
+            if (!fuse.IsDone()) throw std::runtime_error("Face move fuse failed");
+            return std::make_unique<OcctShapeHandle>(fuse.Shape());
+        } else {
+            BRepAlgoAPI_Cut cut(handle.shape(), prism.Shape());
+            cut.Build();
+            if (!cut.IsDone()) throw std::runtime_error("Face move cut failed");
+            return std::make_unique<OcctShapeHandle>(cut.Shape());
+        }
     } catch (const Standard_Failure& e) { rethrow_occt_exception(e); }
 }
 
@@ -739,6 +781,72 @@ std::unique_ptr<OcctShapeHandle> make_sweep_circle(double radius, double dx, dou
         if (!pipe.IsDone()) throw std::runtime_error("BRepOffsetAPI_MakePipe failed");
         return std::make_unique<OcctShapeHandle>(pipe.Shape());
     } catch (const Standard_Failure& e) { rethrow_occt_exception(e); }
+}
+
+std::unique_ptr<OcctShapeHandle> make_sweep(
+    rust::Slice<const double> profile_segments,
+    rust::Slice<const double> path_points
+) {
+    if (path_points.size() < 6 || path_points.size() % 3 != 0) {
+        throw std::invalid_argument("Sweep path must have at least 2 points (6 coordinates)");
+    }
+    try {
+        TopoDS_Wire profile_wire = build_profile_wire(profile_segments, false);
+        BRepBuilderAPI_MakeFace face_maker(profile_wire, Standard_True);
+        if (!face_maker.IsDone()) {
+            throw std::runtime_error("Failed to build face from sweep profile");
+        }
+        TopoDS_Face profile_face = face_maker.Face();
+
+        BRepBuilderAPI_MakeWire path_maker;
+        gp_Pnt p_start(path_points[0], path_points[1], path_points[2]);
+        gp_Pnt p_next(path_points[3], path_points[4], path_points[5]);
+        gp_Vec v_start(p_start, p_next);
+        if (v_start.SquareMagnitude() < 1e-12) {
+            throw std::invalid_argument("First segment of sweep path has zero length");
+        }
+
+        for (size_t i = 0; i + 5 < path_points.size(); i += 3) {
+            gp_Pnt p1(path_points[i], path_points[i + 1], path_points[i + 2]);
+            gp_Pnt p2(path_points[i + 3], path_points[i + 4], path_points[i + 5]);
+            if (p1.Distance(p2) > 1e-6) {
+                path_maker.Add(BRepBuilderAPI_MakeEdge(p1, p2).Edge());
+            }
+        }
+        if (!path_maker.IsDone()) {
+            throw std::runtime_error("Failed to construct sweep path wire");
+        }
+        TopoDS_Wire spine = path_maker.Wire();
+
+        // Orient profile face from XY (normal 0,0,1) to path tangent at start point
+        gp_Dir initial_normal(0.0, 0.0, 1.0);
+        gp_Dir path_dir(v_start);
+        gp_Trsf transform;
+        if (!initial_normal.IsEqual(path_dir, 1e-6)) {
+            if (initial_normal.IsOpposite(path_dir, 1e-6)) {
+                transform.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(1.0, 0.0, 0.0)), kPi);
+            } else {
+                gp_Vec rot_axis = gp_Vec(initial_normal) ^ gp_Vec(path_dir);
+                double angle = initial_normal.Angle(path_dir);
+                transform.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), rot_axis), angle);
+            }
+        }
+        gp_Trsf translate;
+        translate.SetTranslation(gp_Vec(p_start.XYZ()));
+        transform = translate * transform;
+
+        BRepBuilderAPI_Transform xform(profile_face, transform, Standard_True);
+        TopoDS_Shape oriented_profile = xform.Shape();
+
+        BRepOffsetAPI_MakePipe pipe(spine, oriented_profile);
+        pipe.Build();
+        if (!pipe.IsDone()) {
+            throw std::runtime_error("BRepOffsetAPI_MakePipe failed");
+        }
+        return std::make_unique<OcctShapeHandle>(pipe.Shape());
+    } catch (const Standard_Failure& e) {
+        rethrow_occt_exception(e);
+    }
 }
 
 double compute_volume(const OcctShapeHandle& handle) {

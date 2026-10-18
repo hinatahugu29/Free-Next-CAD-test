@@ -169,7 +169,9 @@ mod ffi {
             reversed: bool,
         ) -> Result<UniquePtr<OcctShapeHandle>>;
         fn push_pull_face(handle: &OcctShapeHandle, face_index: u32, distance: f64) -> Result<UniquePtr<OcctShapeHandle>>;
+        fn face_move(handle: &OcctShapeHandle, face_index: u32, dx: f64, dy: f64, dz: f64) -> Result<UniquePtr<OcctShapeHandle>>;
         fn make_sweep_circle(radius: f64, dx: f64, dy: f64, dz: f64) -> Result<UniquePtr<OcctShapeHandle>>;
+        fn make_sweep(profile_segments: &[f64], path_points: &[f64]) -> Result<UniquePtr<OcctShapeHandle>>;
 
         fn compute_volume(handle: &OcctShapeHandle) -> Result<f64>;
         fn compute_surface_area(handle: &OcctShapeHandle) -> Result<f64>;
@@ -424,9 +426,25 @@ impl OcctShape {
         Self::from_ptr(ffi::push_pull_face(self.as_ref()?, face_index, distance)?)
     }
 
+    /// Moves a planar face by fusing or cutting a prism along an arbitrary displacement vector.
+    pub fn face_move(&self, face_index: u32, displacement: [f64; 3]) -> Result<Self, OcctError> {
+        Self::from_ptr(ffi::face_move(
+            self.as_ref()?,
+            face_index,
+            displacement[0],
+            displacement[1],
+            displacement[2],
+        )?)
+    }
+
     /// Sweeps a circular profile from the origin along one straight path segment.
     pub fn sweep_circle(radius: f64, direction: [f64; 3]) -> Result<Self, OcctError> {
         Self::from_ptr(ffi::make_sweep_circle(radius, direction[0], direction[1], direction[2])?)
+    }
+
+    /// Sweeps an encoded closed profile along an arbitrary polyline path.
+    pub fn sweep(profile_segments: &[f64], path_points: &[f64]) -> Result<Self, OcctError> {
+        Self::from_ptr(ffi::make_sweep(profile_segments, path_points)?)
     }
 
     /// Computes volume of the shape in cubic millimeters ($\text{mm}^3$).
@@ -616,4 +634,45 @@ mod tests {
         let split = base.split(&tool).expect("split");
         assert!(split.is_valid().expect("split validity"));
     }
+
+    #[test]
+    fn generalized_sweep_along_polyline_path_makes_a_valid_solid() {
+        // Rectangle profile: 10 x 6
+        let profile = [
+            0.0, -5.0, -3.0, 5.0, -3.0,
+            0.0, 5.0, -3.0, 5.0, 3.0,
+            0.0, 5.0, 3.0, -5.0, 3.0,
+            0.0, -5.0, 3.0, -5.0, -3.0,
+        ];
+        // Straight polyline path: (0,0,0) -> (0,0,30)
+        let path = [0.0, 0.0, 0.0, 0.0, 0.0, 30.0];
+        let sweep = OcctShape::sweep(&profile, &path).expect("generalized sweep");
+        assert!(sweep.is_valid().expect("sweep valid"));
+        let vol = sweep.volume().expect("sweep volume");
+        // 10 * 6 * 30 = 1800
+        assert!((vol - 1800.0).abs() < 1e-2, "vol was {vol}");
+    }
+
+    #[test]
+    fn face_move_translates_planar_face_correctly() {
+        let base = OcctShape::make_box(20.0, 20.0, 20.0).expect("base");
+        let faces = base.inspect_faces().expect("inspect faces");
+        // Find a face and move along its outward normal
+        let n = [faces[0].nx, faces[0].ny, faces[0].nz];
+        let moved = base.face_move(0, [n[0] * 10.0, n[1] * 10.0, n[2] * 10.0]).expect("face move");
+        assert!(moved.is_valid().expect("moved valid"));
+        let vol = moved.volume().expect("moved volume");
+        // 20*20*20 = 8000 + 20*20*10 = 12000
+        assert!((vol - 12000.0).abs() < 1e-2, "volume was {vol}");
+    }
+
+    #[test]
+    fn thick_solid_hollows_box_with_open_face() {
+        let base = OcctShape::make_box(30.0, 30.0, 30.0).expect("base");
+        // Open the top face (index 0), hollow wall inward to 2mm thickness
+        let hollow = base.thick_solid(&[0], 2.0).expect("thick solid");
+        assert!(hollow.is_valid().expect("hollow valid"));
+        assert!(hollow.volume().expect("hollow volume") < 27000.0);
+    }
 }
+

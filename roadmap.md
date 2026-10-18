@@ -764,7 +764,7 @@ OCCTの演算をUIボタンとして直接露出しない。すべてを、再�
 - [x] `OffsetPlane`（選択平面Faceからの距離指定、パラメータ式、上流面へのSemanticReference）
 - [x] `MidPlane`（平行な2面の中間。両面への参照を保存）
 - [x] タイムラインへのTransform挿入
-- [ ] `PlanePattern`（間隔・個数での基準平面配列）
+- [x] `PlanePattern`（間隔・個数での基準平面配列、UIツールパネルおよびリボンボタン対応）
 
 ### M8 — 面を直接編集するフィーチャー
 
@@ -788,7 +788,7 @@ OCCTの演算をUIボタンとして直接露出しない。すべてを、再�
 
 - [x] 単一平面FaceのPush-Pull（単純なプリズム状ケース）
 - [x] `Draft`（対象面・ニュートラル面・角度を保存）
-- [ ] `FaceMove` / 任意ベクトルへの面移動
+- [x] `FaceMove` / 任意ベクトルへの面移動（TopAbs_REVERSED対応、UIツールパネル・リボン対応）
 - [ ] 曲面・複数面へのPush-Pullと参照追跡の強化
 
 ### M9 — 断面ベースの形状作成
@@ -814,9 +814,9 @@ OCCTの演算をUIボタンとして直接露出しない。すべてを、再�
 
 - [x] 2断面のソリッドLoft（初期版）
 - [x] 直線パス上の円形Sweep。開始位置 `start_x/y/z` と半径をパラメータ式で駆動可能
-- [ ] スケッチ/辺をパスにするSweep
-- [ ] `Rib`
-- [ ] `Thicken` / Offset Shape
+- [x] スケッチプロファイルを折れ線パスへスイープする汎用Sweep（`OcctShape::sweep`, `FeatureKind::Sweep`）
+- [x] `Rib`（スケッチと平面・厚み・深さからリブ作成・主ボディ結合）
+- [x] `Thicken` / Offset Shape（`thick_solid` による開口面指定と内向き中空化）
 
 ### M10 — 実務向けの穴・エッジ・パターン
 

@@ -145,7 +145,11 @@ fn feature_parameter_slots(kind: &FeatureKind) -> Vec<(&'static str, &ScalarPara
             PatternLayout::Linear { spacing, .. } => vec![("間隔", spacing)],
         },
         FeatureKind::Shell { thickness, .. } => vec![("壁の厚さ", thickness)],
-        FeatureKind::Mirror { .. }
+        FeatureKind::FaceMove { dx, dy, dz, .. } => vec![("移動 X", dx), ("移動 Y", dy), ("移動 Z", dz)],
+        FeatureKind::Rib { thickness, depth, .. } => vec![("厚み", thickness), ("深さ", depth)],
+        FeatureKind::PlanePattern { spacing, .. } => vec![("間隔", spacing)],
+        FeatureKind::Sweep { .. }
+        | FeatureKind::Mirror { .. }
         | FeatureKind::Boolean { .. }
         | FeatureKind::Heal { .. }
         | FeatureKind::Refine { .. }
@@ -278,6 +282,8 @@ pub enum ToolKind {
     Sew,
     Split,
     MidPlane,
+    FaceMove,
+    PlanePattern,
 }
 
 /// What the sketch being started will become.
@@ -342,6 +348,7 @@ pub enum ToolPanel {
     Heal { input: FeatureId },
     Loft { lower: FeatureId, upper: Option<FeatureId>, distance: f64 },
     PushPull { input: FeatureId, face: SemanticReference, distance: f64 },
+    FaceMove { input: FeatureId, face: SemanticReference, displacement: [f64; 3] },
     SweepCircle { radius: f64, start: [f64; 3], path: [f64; 3] },
     Counterbore { input: FeatureId, center: [f64; 2], hole_radius: f64, bore_radius: f64, bore_depth: f64, depth: f64 },
     Countersink { input: FeatureId, center: [f64; 2], hole_radius: f64, sink_radius: f64, sink_depth: f64, depth: f64 },
@@ -350,6 +357,7 @@ pub enum ToolPanel {
     Sew { input: FeatureId, tolerance: f64 },
     Split { input: FeatureId, tool: Option<FeatureId> },
     MidPlane { first_feature: FeatureId, first: SemanticReference, second_feature: FeatureId, second: SemanticReference },
+    PlanePattern { input: FeatureId, base_face: SemanticReference, spacing: f64, count: u32 },
 }
 
 /// Action chosen from a timeline chip's right-click menu.
@@ -984,6 +992,9 @@ impl FerroCadApp {
                     if ribbon_button(ui, "↕", "押出し面", face_selected, "選択面を法線方向へ押出し・引込みます") {
                         self.open_tool_panel(ToolKind::PushPull);
                     }
+                    if ribbon_button(ui, "↗", "面移動", face_selected, "選択面を任意ベクトル方向へ移動します") {
+                        self.open_tool_panel(ToolKind::FaceMove);
+                    }
                     if ribbon_button(ui, "⌒", "Sweep", feature_selected, "円形断面を直線パスに沿って掃引します") {
                         self.open_tool_panel(ToolKind::SweepCircle);
                     }
@@ -995,6 +1006,9 @@ impl FerroCadApp {
                     }
                     if ribbon_button(ui, "≡", "中間面", self.render_config.selected_faces.len() >= 2, "平行な2面の中間でスケッチを始めます") {
                         self.open_tool_panel(ToolKind::MidPlane);
+                    }
+                    if ribbon_button(ui, "▤", "平面配列", face_selected, "選択面から間隔・個数で基準平面を配列します") {
+                        self.open_tool_panel(ToolKind::PlanePattern);
                     }
                 });
                 ribbon_group(ui, "パターン・組み合わせ", |ui| {
@@ -3546,4 +3560,66 @@ mod tests {
         assert!(app.controller.document.features[&pocket].state == FeatureState::Clean);
         assert!((vol(&app, pocket) - ((5000.0 - hole) * 10.0 - 400.0)).abs() < 1.0);
     }
+
+    #[test]
+    fn m8_face_move_translates_face_via_tool() {
+        let mut app = FerroCadApp::new_with_mvp_demo();
+        app.execute_cmd(CadCommand::AddFeature {
+            name: "BaseBox".to_string(),
+            kind: FeatureKind::Box {
+                width: ScalarParam::mm(20.0),
+                height: ScalarParam::mm(20.0),
+                depth: ScalarParam::mm(20.0),
+            },
+            visible: true,
+            color_rgba: [1.0; 4],
+        });
+        let (&base, _) = app.controller.document.features.iter().next_back().unwrap();
+        let shape = app.controller.document.features[&base].cached_shape.unwrap();
+        let top = app.store.resolve_face_by_signature(shape, glam::DVec3::Z, None, 0.99).unwrap();
+
+        app.render_config.selected_face = Some((base, top.index));
+        app.open_tool_panel(ToolKind::FaceMove);
+        let mut panel = app.tool_panel.take().expect("face move panel");
+        if let ToolPanel::FaceMove { displacement, .. } = &mut panel {
+            displacement[2] = 10.0;
+        }
+        app.confirm_tool(panel);
+
+        let (&moved, _) = app.controller.document.features.iter().next_back().unwrap();
+        let vol = app.controller.document.features[&moved].cached_summary.unwrap().volume_mm3;
+        assert!((vol - 12000.0).abs() < 1.0, "expected 12000 mm3, got {vol}");
+    }
+
+    #[test]
+    fn m7_plane_pattern_creates_planes_via_tool() {
+        let mut app = FerroCadApp::new_with_mvp_demo();
+        app.execute_cmd(CadCommand::AddFeature {
+            name: "BaseBox".to_string(),
+            kind: FeatureKind::Box {
+                width: ScalarParam::mm(30.0),
+                height: ScalarParam::mm(30.0),
+                depth: ScalarParam::mm(10.0),
+            },
+            visible: true,
+            color_rgba: [1.0; 4],
+        });
+        let (&base, _) = app.controller.document.features.iter().next_back().unwrap();
+        let shape = app.controller.document.features[&base].cached_shape.unwrap();
+        let top = app.store.resolve_face_by_signature(shape, glam::DVec3::Z, None, 0.99).unwrap();
+
+        app.render_config.selected_face = Some((base, top.index));
+        app.open_tool_panel(ToolKind::PlanePattern);
+        let mut panel = app.tool_panel.take().expect("plane pattern panel");
+        if let ToolPanel::PlanePattern { spacing, count, .. } = &mut panel {
+            *spacing = 15.0;
+            *count = 4;
+        }
+        app.confirm_tool(panel);
+
+        let (&pattern, feat) = app.controller.document.features.iter().next_back().unwrap();
+        assert_eq!(pattern, feat.id);
+        assert!(matches!(feat.kind, FeatureKind::PlanePattern { count: 4, .. }));
+    }
 }
+
