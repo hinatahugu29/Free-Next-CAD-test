@@ -167,6 +167,7 @@ mod ffi {
             angle_deg: f64,
             reversed: bool,
         ) -> Result<UniquePtr<OcctShapeHandle>>;
+        fn push_pull_face(handle: &OcctShapeHandle, face_index: u32, distance: f64) -> Result<UniquePtr<OcctShapeHandle>>;
 
         fn compute_volume(handle: &OcctShapeHandle) -> Result<f64>;
         fn compute_surface_area(handle: &OcctShapeHandle) -> Result<f64>;
@@ -406,6 +407,11 @@ impl OcctShape {
         Self::from_ptr(ffi::draft_faces(
             self.as_ref()?, face_indices, neutral_face_index, angle_deg, reversed,
         )?)
+    }
+
+    /// Offsets a planar face by fusing/cutting a prism along its outward normal.
+    pub fn push_pull_face(&self, face_index: u32, distance: f64) -> Result<Self, OcctError> {
+        Self::from_ptr(ffi::push_pull_face(self.as_ref()?, face_index, distance)?)
     }
 
     /// Computes volume of the shape in cubic millimeters ($\text{mm}^3$).

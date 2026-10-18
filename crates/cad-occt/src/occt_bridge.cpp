@@ -681,6 +681,27 @@ std::unique_ptr<OcctShapeHandle> draft_faces(
     } catch (const Standard_Failure& e) { rethrow_occt_exception(e); }
 }
 
+std::unique_ptr<OcctShapeHandle> push_pull_face(
+    const OcctShapeHandle& handle, uint32_t face_index, double distance
+) {
+    if (!std::isfinite(distance) || std::abs(distance) < 1e-9)
+        throw std::invalid_argument("Push/Pull distance must be non-zero");
+    try {
+        TopTools_IndexedMapOfShape faces;
+        TopExp::MapShapes(handle.shape(), TopAbs_FACE, faces);
+        if (face_index >= static_cast<uint32_t>(faces.Extent())) throw std::out_of_range("Face index out of range");
+        TopoDS_Face face = TopoDS::Face(faces(face_index + 1));
+        BRepAdaptor_Surface surface(face);
+        if (surface.GetType() != GeomAbs_Plane) throw std::invalid_argument("Push/Pull supports planar faces only");
+        gp_Dir normal = surface.Plane().Axis().Direction();
+        BRepPrimAPI_MakePrism prism(face, gp_Vec(normal) * distance);
+        prism.Build();
+        if (!prism.IsDone()) throw std::runtime_error("Push/Pull prism failed");
+        if (distance > 0.0) { BRepAlgoAPI_Fuse fuse(handle.shape(), prism.Shape()); fuse.Build(); if (!fuse.IsDone()) throw std::runtime_error("Push/Pull fuse failed"); return std::make_unique<OcctShapeHandle>(fuse.Shape()); }
+        BRepAlgoAPI_Cut cut(handle.shape(), prism.Shape()); cut.Build(); if (!cut.IsDone()) throw std::runtime_error("Push/Pull cut failed"); return std::make_unique<OcctShapeHandle>(cut.Shape());
+    } catch (const Standard_Failure& e) { rethrow_occt_exception(e); }
+}
+
 double compute_volume(const OcctShapeHandle& handle) {
     try {
         GProp_GProps props;

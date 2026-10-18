@@ -127,6 +127,11 @@ std::unique_ptr<OcctShapeHandle> draft_faces(
     double angle_deg,
     bool reversed
 );
+std::unique_ptr<OcctShapeHandle> push_pull_face(
+    const OcctShapeHandle& handle,
+    uint32_t face_index,
+    double distance
+);
 
 double compute_volume(const OcctShapeHandle& handle);
 double compute_surface_area(const OcctShapeHandle& handle);
