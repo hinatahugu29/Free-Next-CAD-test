@@ -4337,4 +4337,18 @@ mod tests {
         assert!(doc.recompute(&mut store, TessellationOptions::default()).unwrap().is_all_clean());
         assert!(doc.features[&split].cached_summary.unwrap().solids >= 1);
     }
+
+    #[test]
+    fn sweep_start_position_moves_the_generated_solid() {
+        let mut store = ShapeStore::new();
+        let mut doc = Document::new("Positioned sweep");
+        let sweep = doc.add_feature("Sweep", FeatureKind::SweepCircle {
+            radius: ScalarParam::mm(2.0), start_x: ScalarParam::mm(30.0), start_y: ScalarParam::mm(40.0), start_z: ScalarParam::mm(5.0),
+            dx: ScalarParam::mm(0.0), dy: ScalarParam::mm(0.0), dz: ScalarParam::mm(20.0),
+        }, true, [1.0; 4]).unwrap();
+        assert!(doc.recompute(&mut store, TessellationOptions::default()).unwrap().is_all_clean());
+        let bounds = doc.features[&sweep].cached_summary.unwrap().bounds;
+        assert!((bounds.center().x - 30.0).abs() < 1e-3 && (bounds.center().y - 40.0).abs() < 1e-3);
+        assert!((bounds.min.z - 5.0).abs() < 1e-3);
+    }
 }
