@@ -2,7 +2,7 @@
 //! linear patterns, mirror, boolean, and shell.
 
 use super::*;
-use cad_core::{BooleanOp, PatternLayout};
+use cad_core::{BooleanOp, PatternLayout, PatternReferenceLayout, ReferenceAxis};
 
 const AXES: [(&str, [f64; 3]); 3] = [("X", [1.0, 0.0, 0.0]), ("Y", [0.0, 1.0, 0.0]), ("Z", [0.0, 0.0, 1.0])];
 const PLANES: [(&str, SketchPlane); 3] = [
@@ -155,6 +155,75 @@ impl FerroCadApp {
                 let Ok(face) = SemanticReference::from_face(fid, &self.store, shape, index) else { return; };
                 ToolPanel::PlanePattern { input: fid, base_face: face, spacing: 10.0, count: 3 }
             }
+            ToolKind::Hole => {
+                let plane = if let Some((fid, index)) = self.render_config.selected_face {
+                    if let Some(shape) = self.controller.document.features.get(&fid).and_then(|f| f.cached_shape) {
+                        if let Ok(face) = SemanticReference::from_face(fid, &self.store, shape, index) {
+                            SketchPlane::Face { feature: fid, face }
+                        } else {
+                            SketchPlane::XY
+                        }
+                    } else {
+                        SketchPlane::XY
+                    }
+                } else {
+                    SketchPlane::XY
+                };
+                ToolPanel::Hole {
+                    input,
+                    plane,
+                    center: [0.0, 0.0],
+                    radius: 3.0,
+                    depth: 15.0,
+                    through_all: false,
+                    hole_type_index: 0,
+                    bore_radius: 6.0,
+                    bore_depth: 4.0,
+                    sink_radius: 6.0,
+                    sink_depth: 3.0,
+                    thread_radius: 3.0,
+                    tap_drill_radius: 2.5,
+                    thread_depth: 10.0,
+                    has_tip_angle: false,
+                    tip_angle_deg: 118.0,
+                }
+            }
+            ToolKind::PatternOnReference => {
+                let reference = if let Some((fid, index)) = self.render_config.selected_edge {
+                    if let Some(shape) = self.controller.document.features.get(&fid).and_then(|f| f.cached_shape) {
+                        SemanticReference::from_edge(fid, &self.store, shape, index)
+                            .map(|edge| ReferenceAxis::Edge { feature: fid, edge })
+                            .unwrap_or(ReferenceAxis::Plane(SketchPlane::XY))
+                    } else {
+                        ReferenceAxis::Plane(SketchPlane::XY)
+                    }
+                } else if let Some((fid, index)) = self.render_config.selected_face {
+                    if let Some(shape) = self.controller.document.features.get(&fid).and_then(|f| f.cached_shape) {
+                        SemanticReference::from_face(fid, &self.store, shape, index)
+                            .map(|face| ReferenceAxis::Face { feature: fid, face })
+                            .unwrap_or(ReferenceAxis::Plane(SketchPlane::XY))
+                    } else {
+                        ReferenceAxis::Plane(SketchPlane::XY)
+                    }
+                } else {
+                    ReferenceAxis::Plane(SketchPlane::XY)
+                };
+                let is_circular = matches!(reference, ReferenceAxis::Face { .. });
+                let is_tool = self.tool_target(input).is_some()
+                    || matches!(
+                        self.controller.document.features.get(&input).map(|f| &f.kind),
+                        Some(FeatureKind::Hole { .. })
+                    );
+                ToolPanel::PatternOnReference {
+                    input,
+                    reference,
+                    is_circular,
+                    spacing: 20.0,
+                    count: 4,
+                    total_angle_deg: 360.0,
+                    tool_only: is_tool,
+                }
+            }
         });
     }
 
@@ -197,6 +266,8 @@ impl FerroCadApp {
             ToolPanel::MidPlane { .. } => "≡ 中間面からスケッチ",
             ToolPanel::FaceMove { .. } => "↗ 面移動（Face Move）",
             ToolPanel::PlanePattern { .. } => "▤ 基準平面配列（Plane Pattern）",
+            ToolPanel::Hole { .. } => "◎ 穴仕様（Hole）",
+            ToolPanel::PatternOnReference { .. } => "☍ 参照軸配列（PatternOnReference）",
         };
         let mut confirm = false;
         let mut cancel = false;
@@ -494,6 +565,145 @@ impl FerroCadApp {
                         ui.label(format!("面2: 「{}」", self.feature_name(*second_feature)));
                         ui.small("平行な二面のちょうど中間でスケッチを開始します。");
                     }
+                    ToolPanel::Hole {
+                        input,
+                        plane: _,
+                        center,
+                        radius,
+                        depth,
+                        through_all,
+                        hole_type_index,
+                        bore_radius,
+                        bore_depth,
+                        sink_radius,
+                        sink_depth,
+                        thread_radius,
+                        tap_drill_radius,
+                        thread_depth,
+                        has_tip_angle,
+                        tip_angle_deg,
+                    } => {
+                        ui.label(format!("対象: 「{}」", self.feature_name(*input)));
+                        ui.horizontal(|ui| {
+                            ui.label("種類:");
+                            egui::ComboBox::from_id_salt("hole_type_combo")
+                                .selected_text(match *hole_type_index {
+                                    1 => "座ぐり穴 (Counterbore)",
+                                    2 => "皿穴 (Countersink)",
+                                    3 => "ねじ下穴 (Tap)",
+                                    _ => "単純穴 (Simple)",
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(hole_type_index, 0, "単純穴 (Simple)");
+                                    ui.selectable_value(hole_type_index, 1, "座ぐり穴 (Counterbore)");
+                                    ui.selectable_value(hole_type_index, 2, "皿穴 (Countersink)");
+                                    ui.selectable_value(hole_type_index, 3, "ねじ下穴 (Tap)");
+                                });
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("中心 (U, V):");
+                            ui.add(egui::DragValue::new(&mut center[0]).speed(0.5).prefix("U: ").suffix(" mm"));
+                            ui.add(egui::DragValue::new(&mut center[1]).speed(0.5).prefix("V: ").suffix(" mm"));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("穴半径:");
+                            ui.add(egui::DragValue::new(radius).speed(0.1).range(0.1..=1000.0).suffix(" mm"));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.checkbox(through_all, "貫通 (Through All)");
+                            if !*through_all {
+                                ui.label("深さ:");
+                                ui.add(egui::DragValue::new(depth).speed(0.5).range(0.1..=1000.0).suffix(" mm"));
+                            }
+                        });
+                        match *hole_type_index {
+                            1 => {
+                                ui.horizontal(|ui| {
+                                    ui.label("座ぐり半径:");
+                                    ui.add(egui::DragValue::new(bore_radius).speed(0.1).range(0.1..=1000.0).suffix(" mm"));
+                                    ui.label("深さ:");
+                                    ui.add(egui::DragValue::new(bore_depth).speed(0.5).range(0.1..=1000.0).suffix(" mm"));
+                                });
+                            }
+                            2 => {
+                                ui.horizontal(|ui| {
+                                    ui.label("皿穴半径:");
+                                    ui.add(egui::DragValue::new(sink_radius).speed(0.1).range(0.1..=1000.0).suffix(" mm"));
+                                    ui.label("深さ:");
+                                    ui.add(egui::DragValue::new(sink_depth).speed(0.5).range(0.1..=1000.0).suffix(" mm"));
+                                });
+                            }
+                            3 => {
+                                ui.horizontal(|ui| {
+                                    ui.label("ねじ呼び半径:");
+                                    ui.add(egui::DragValue::new(thread_radius).speed(0.1).range(0.1..=1000.0).suffix(" mm"));
+                                    ui.label("下穴半径:");
+                                    ui.add(egui::DragValue::new(tap_drill_radius).speed(0.1).range(0.1..=1000.0).suffix(" mm"));
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("ねじ深さ:");
+                                    ui.add(egui::DragValue::new(thread_depth).speed(0.5).range(0.1..=1000.0).suffix(" mm"));
+                                });
+                            }
+                            _ => {}
+                        }
+                        if !*through_all {
+                            ui.horizontal(|ui| {
+                                ui.checkbox(has_tip_angle, "ドリル先端角");
+                                if *has_tip_angle {
+                                    ui.add(egui::DragValue::new(tip_angle_deg).speed(1.0).range(30.0..=160.0).suffix("°"));
+                                }
+                            });
+                        }
+                        ui.small("選択面の法線方向へ穴を切り取ります。各寸法は後からパラメータ編集可能です。");
+                    }
+                    ToolPanel::PatternOnReference {
+                        input,
+                        reference,
+                        is_circular,
+                        spacing,
+                        count,
+                        total_angle_deg,
+                        tool_only,
+                    } => {
+                        self.describe_pattern_input(ui, *input);
+                        ui.horizontal(|ui| {
+                            ui.label("参照軸:");
+                            let ref_label = match reference {
+                                ReferenceAxis::Edge { .. } => "選択エッジ（直線/円弧）",
+                                ReferenceAxis::Face { .. } => "選択面（円筒面/法線）",
+                                ReferenceAxis::Plane(p) => match p {
+                                    SketchPlane::XY => "XY平面法線 (Z軸)",
+                                    SketchPlane::XZ => "XZ平面法線 (Y軸)",
+                                    SketchPlane::YZ => "YZ平面法線 (X軸)",
+                                    _ => "平面法線",
+                                },
+                            };
+                            ui.monospace(ref_label);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("配列形式:");
+                            ui.radio_value(is_circular, false, "直線");
+                            ui.radio_value(is_circular, true, "円形 (回転)");
+                        });
+                        if *is_circular {
+                            ui.horizontal(|ui| {
+                                ui.label("個数:");
+                                ui.add(egui::DragValue::new(count).range(1..=360));
+                                ui.label("合計角度:");
+                                ui.add(egui::DragValue::new(total_angle_deg).range(-3600.0..=3600.0).suffix("°"));
+                            });
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.label("個数:");
+                                ui.add(egui::DragValue::new(count).range(1..=1000));
+                                ui.label("間隔:");
+                                ui.add(egui::DragValue::new(spacing).speed(0.5).suffix(" mm"));
+                            });
+                        }
+                        ui.checkbox(tool_only, "ツールのみ複製（穴・ポケット等を配列）");
+                        ui.small("選択したエッジの方向または円筒面の回転軸に沿ってパラメトリックに配列します。");
+                    }
                 }
 
                 ui.separator();
@@ -769,6 +979,115 @@ impl FerroCadApp {
             ToolPanel::PlanePattern { input, base_face, spacing, count } => self.add_replacing(
                 format!("PlanePattern_{n}"), FeatureKind::PlanePattern { input, base_face, spacing: ScalarParam::Literal(spacing), count, reverse: false }, input, &[input],
             ),
+            ToolPanel::Hole {
+                input,
+                plane,
+                center,
+                radius,
+                depth,
+                through_all,
+                hole_type_index,
+                bore_radius,
+                bore_depth,
+                sink_radius,
+                sink_depth,
+                thread_radius,
+                tap_drill_radius,
+                thread_depth,
+                has_tip_angle,
+                tip_angle_deg,
+            } => {
+                let hole_type = match hole_type_index {
+                    1 => cad_core::HoleType::Counterbore {
+                        bore_radius: ScalarParam::Literal(bore_radius),
+                        bore_depth: ScalarParam::Literal(bore_depth),
+                    },
+                    2 => cad_core::HoleType::Countersink {
+                        sink_radius: ScalarParam::Literal(sink_radius),
+                        sink_depth: ScalarParam::Literal(sink_depth),
+                    },
+                    3 => cad_core::HoleType::Tap {
+                        thread_radius: ScalarParam::Literal(thread_radius),
+                        tap_drill_radius: ScalarParam::Literal(tap_drill_radius),
+                        thread_depth: ScalarParam::Literal(thread_depth),
+                    },
+                    _ => cad_core::HoleType::Simple,
+                };
+                let tip = if has_tip_angle && !through_all {
+                    Some(ScalarParam::Literal(tip_angle_deg))
+                } else {
+                    None
+                };
+                let mut deps = vec![input];
+                for id in plane.features() {
+                    if !deps.contains(&id) {
+                        deps.push(id);
+                    }
+                }
+                self.add_replacing(
+                    format!("Hole_{n}"),
+                    FeatureKind::Hole {
+                        input,
+                        plane,
+                        center_x: ScalarParam::Literal(center[0]),
+                        center_y: ScalarParam::Literal(center[1]),
+                        radius: ScalarParam::Literal(radius),
+                        depth: ScalarParam::Literal(depth),
+                        through_all,
+                        hole_type,
+                        tip_angle_deg: tip,
+                    },
+                    input,
+                    &deps,
+                );
+            }
+            ToolPanel::PatternOnReference {
+                input,
+                reference,
+                is_circular,
+                spacing,
+                count,
+                total_angle_deg,
+                tool_only,
+            } => {
+                let layout = if is_circular {
+                    PatternReferenceLayout::Circular {
+                        count,
+                        total_angle_deg: ScalarParam::Literal(total_angle_deg),
+                    }
+                } else {
+                    PatternReferenceLayout::Linear {
+                        spacing: ScalarParam::Literal(spacing),
+                        count,
+                    }
+                };
+                let mut deps = vec![input];
+                match &reference {
+                    ReferenceAxis::Edge { feature, .. } | ReferenceAxis::Face { feature, .. } => {
+                        if !deps.contains(feature) {
+                            deps.push(*feature);
+                        }
+                    }
+                    ReferenceAxis::Plane(p) => {
+                        for id in p.features() {
+                            if !deps.contains(&id) {
+                                deps.push(id);
+                            }
+                        }
+                    }
+                }
+                self.add_replacing(
+                    format!("PatternOnRef_{n}"),
+                    FeatureKind::PatternOnReference {
+                        input,
+                        reference,
+                        layout,
+                        tool_only,
+                    },
+                    input,
+                    &deps,
+                );
+            }
         }
     }
 }

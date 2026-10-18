@@ -71,6 +71,9 @@
 #include <gp_Ax1.hxx>
 #include <gp_Ax2.hxx>
 #include <gp_Circ.hxx>
+#include <gp_Lin.hxx>
+#include <gp_Cylinder.hxx>
+#include <gp_Cone.hxx>
 #include <gp_Trsf.hxx>
 
 namespace ferrocad {
@@ -603,6 +606,99 @@ std::unique_ptr<OcctShapeHandle> fillet_selected_edges(
     }
 }
 
+std::unique_ptr<OcctShapeHandle> fillet_variable_edges(
+    const OcctShapeHandle& handle,
+    rust::Slice<const uint32_t> edge_indices,
+    double radius_start,
+    double radius_end
+) {
+    ensure_valid_positive(radius_start, "fillet start radius");
+    ensure_valid_positive(radius_end, "fillet end radius");
+    if (edge_indices.empty()) {
+        throw std::invalid_argument("No edge indices specified for fillet");
+    }
+    try {
+        BRepFilletAPI_MakeFillet fillet(handle.shape());
+        TopTools_IndexedMapOfShape edge_map;
+        TopExp::MapShapes(handle.shape(), TopAbs_EDGE, edge_map);
+        for (uint32_t idx : edge_indices) {
+            int one_based = static_cast<int>(idx) + 1;
+            if (one_based < 1 || one_based > edge_map.Extent()) {
+                throw std::out_of_range("Edge index out of range for fillet");
+            }
+            fillet.Add(radius_start, radius_end, TopoDS::Edge(edge_map(one_based)));
+        }
+        fillet.Build();
+        if (!fillet.IsDone()) {
+            throw std::runtime_error("BRepFilletAPI_MakeFillet failed on variable radius edges");
+        }
+        return std::make_unique<OcctShapeHandle>(fillet.Shape());
+    } catch (const Standard_Failure& e) {
+        rethrow_occt_exception(e);
+    }
+}
+
+rust::Vec<uint32_t> find_tangent_edges(
+    const OcctShapeHandle& handle,
+    uint32_t seed_edge_index,
+    double angular_tolerance_rad
+) {
+    rust::Vec<uint32_t> result;
+    TopTools_IndexedMapOfShape edge_map;
+    TopExp::MapShapes(handle.shape(), TopAbs_EDGE, edge_map);
+    int seed_one_based = static_cast<int>(seed_edge_index) + 1;
+    if (seed_one_based < 1 || seed_one_based > edge_map.Extent()) {
+        return result;
+    }
+    result.push_back(seed_edge_index);
+
+    double tol_cos = std::cos(angular_tolerance_rad > 0.0 ? angular_tolerance_rad : 0.087); // ~5 deg default
+
+    auto get_end_tangents = [](const TopoDS_Edge& edge, gp_Pnt& p_first, gp_Vec& t_first, gp_Pnt& p_last, gp_Vec& t_last) {
+        BRepAdaptor_Curve c(edge);
+        c.D1(c.FirstParameter(), p_first, t_first);
+        if (t_first.Magnitude() > 1e-7) t_first.Normalize();
+        c.D1(c.LastParameter(), p_last, t_last);
+        if (t_last.Magnitude() > 1e-7) t_last.Normalize();
+    };
+
+    std::vector<bool> visited(edge_map.Extent() + 1, false);
+    visited[seed_one_based] = true;
+    std::vector<int> queue;
+    queue.push_back(seed_one_based);
+
+    while (!queue.empty()) {
+        int curr_idx = queue.back();
+        queue.pop_back();
+
+        TopoDS_Edge curr_edge = TopoDS::Edge(edge_map(curr_idx));
+        gp_Pnt cp1, cp2;
+        gp_Vec cv1, cv2;
+        get_end_tangents(curr_edge, cp1, cv1, cp2, cv2);
+
+        for (int i = 1; i <= edge_map.Extent(); ++i) {
+            if (visited[i]) continue;
+            TopoDS_Edge other = TopoDS::Edge(edge_map(i));
+            gp_Pnt op1, op2;
+            gp_Vec ov1, ov2;
+            get_end_tangents(other, op1, ov1, op2, ov2);
+
+            bool tangent = false;
+            if (cp1.Distance(op1) < 1e-4 && std::abs(cv1.Dot(ov1)) >= tol_cos) tangent = true;
+            else if (cp1.Distance(op2) < 1e-4 && std::abs(cv1.Dot(ov2)) >= tol_cos) tangent = true;
+            else if (cp2.Distance(op1) < 1e-4 && std::abs(cv2.Dot(ov1)) >= tol_cos) tangent = true;
+            else if (cp2.Distance(op2) < 1e-4 && std::abs(cv2.Dot(ov2)) >= tol_cos) tangent = true;
+
+            if (tangent) {
+                visited[i] = true;
+                result.push_back(static_cast<uint32_t>(i - 1));
+                queue.push_back(i);
+            }
+        }
+    }
+    return result;
+}
+
 std::unique_ptr<OcctShapeHandle> chamfer_all_edges(
     const OcctShapeHandle& handle,
     double distance
@@ -1021,6 +1117,93 @@ rust::Vec<RawEdgeInfo> inspect_edges(const OcctShapeHandle& handle) {
             });
         }
         return result;
+    } catch (const Standard_Failure& e) {
+        rethrow_occt_exception(e);
+    }
+}
+
+RawAxisInfo inspect_face_axis(const OcctShapeHandle& handle, uint32_t face_index) {
+    try {
+        TopTools_IndexedMapOfShape face_map;
+        TopExp::MapShapes(handle.shape(), TopAbs_FACE, face_map);
+        if (face_index >= static_cast<uint32_t>(face_map.Extent())) {
+            throw std::runtime_error("Face index out of bounds");
+        }
+        const TopoDS_Face& face = TopoDS::Face(face_map(face_index + 1));
+        BRepAdaptor_Surface adapt(face);
+        GeomAbs_SurfaceType stype = adapt.GetType();
+        gp_Pnt loc(0, 0, 0);
+        gp_Dir dir(0, 0, 1);
+        if (stype == GeomAbs_Cylinder) {
+            gp_Ax1 ax = adapt.Cylinder().Axis();
+            loc = ax.Location();
+            dir = ax.Direction();
+        } else if (stype == GeomAbs_Cone) {
+            gp_Ax1 ax = adapt.Cone().Axis();
+            loc = ax.Location();
+            dir = ax.Direction();
+        } else if (stype == GeomAbs_Plane) {
+            gp_Ax1 ax = adapt.Plane().Axis();
+            loc = ax.Location();
+            dir = ax.Direction();
+            if (face.Orientation() == TopAbs_REVERSED) {
+                dir.Reverse();
+            }
+        } else {
+            GProp_GProps props;
+            BRepGProp::SurfaceProperties(face, props);
+            loc = props.CentreOfMass();
+            double u = (adapt.FirstUParameter() + adapt.LastUParameter()) * 0.5;
+            double v = (adapt.FirstVParameter() + adapt.LastVParameter()) * 0.5;
+            gp_Pnt p;
+            gp_Vec d1u, d1v;
+            adapt.D1(u, v, p, d1u, d1v);
+            gp_Vec n = d1u.Crossed(d1v);
+            if (n.SquareMagnitude() > 1e-12) {
+                dir = gp_Dir(n);
+                if (face.Orientation() == TopAbs_REVERSED) {
+                    dir.Reverse();
+                }
+            }
+        }
+        return RawAxisInfo{ loc.X(), loc.Y(), loc.Z(), dir.X(), dir.Y(), dir.Z() };
+    } catch (const Standard_Failure& e) {
+        rethrow_occt_exception(e);
+    }
+}
+
+RawAxisInfo inspect_edge_axis(const OcctShapeHandle& handle, uint32_t edge_index) {
+    try {
+        TopTools_IndexedMapOfShape edge_map;
+        TopExp::MapShapes(handle.shape(), TopAbs_EDGE, edge_map);
+        if (edge_index >= static_cast<uint32_t>(edge_map.Extent())) {
+            throw std::runtime_error("Edge index out of bounds");
+        }
+        const TopoDS_Edge& edge = TopoDS::Edge(edge_map(edge_index + 1));
+        BRepAdaptor_Curve adapt(edge);
+        GeomAbs_CurveType ctype = adapt.GetType();
+        gp_Pnt loc(0, 0, 0);
+        gp_Dir dir(0, 0, 1);
+        if (ctype == GeomAbs_Line) {
+            gp_Lin lin = adapt.Line();
+            loc = lin.Location();
+            dir = lin.Direction();
+        } else if (ctype == GeomAbs_Circle) {
+            gp_Ax1 ax = adapt.Circle().Axis();
+            loc = ax.Location();
+            dir = ax.Direction();
+        } else {
+            double f = adapt.FirstParameter();
+            double l = adapt.LastParameter();
+            gp_Pnt p1 = adapt.Value(f);
+            gp_Pnt p2 = adapt.Value(l);
+            loc = p1;
+            gp_Vec v(p1, p2);
+            if (v.SquareMagnitude() > 1e-12) {
+                dir = gp_Dir(v);
+            }
+        }
+        return RawAxisInfo{ loc.X(), loc.Y(), loc.Z(), dir.X(), dir.Y(), dir.Z() };
     } catch (const Standard_Failure& e) {
         rethrow_occt_exception(e);
     }

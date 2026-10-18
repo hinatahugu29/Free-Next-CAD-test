@@ -25,6 +25,7 @@ pub(crate) fn role_label(role: RefRole) -> String {
         RefRole::PushPullFace => "押出し・引込みの面".to_string(),
         RefRole::FaceMoveFace => "移動する面".to_string(),
         RefRole::PlanePatternFace => "基準平面配列の参照面".to_string(),
+        RefRole::PatternAxisRef => "配列の参照軸（辺・面）".to_string(),
     }
 }
 

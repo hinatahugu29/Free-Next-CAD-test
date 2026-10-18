@@ -14,8 +14,8 @@ use std::path::PathBuf;
 
 use cad_core::{
     CadCommand, CoreError, Document, DocumentController, ExtrudeMode, FeatureId, FeatureKind,
-    FeatureState, ParameterValue, PatternLayout, PlaneFrame, ScalarParam, SemanticReference, Sketch, SketchPlane,
-    build_perforated_plate_mvp,
+    FeatureState, ParameterValue, PatternLayout, PatternReferenceLayout, PlaneFrame, ReferenceAxis,
+    ScalarParam, SemanticReference, Sketch, SketchPlane, build_perforated_plate_mvp,
 };
 use cad_geometry::{ShapeStore, TessellationOptions};
 use cad_render::{
@@ -125,6 +125,29 @@ fn feature_parameter_slots(kind: &FeatureKind) -> Vec<(&'static str, &ScalarPara
         FeatureKind::Loft { distance, .. } => vec![("断面間距離", distance)],
         FeatureKind::PushPull { distance, .. } => vec![("移動距離", distance)],
         FeatureKind::SweepCircle { radius, start_x, start_y, start_z, dx, dy, dz } => vec![("半径", radius), ("開始 X", start_x), ("開始 Y", start_y), ("開始 Z", start_z), ("パス X", dx), ("パス Y", dy), ("パス Z", dz)],
+        FeatureKind::Hole { center_x, center_y, radius, depth, hole_type, tip_angle_deg, .. } => {
+            let mut list = vec![("中心 X", center_x), ("中心 Y", center_y), ("穴半径", radius), ("深さ", depth)];
+            match hole_type {
+                cad_core::HoleType::Simple => {}
+                cad_core::HoleType::Counterbore { bore_radius, bore_depth } => {
+                    list.push(("座ぐり半径", bore_radius));
+                    list.push(("座ぐり深さ", bore_depth));
+                }
+                cad_core::HoleType::Countersink { sink_radius, sink_depth } => {
+                    list.push(("皿穴半径", sink_radius));
+                    list.push(("皿深さ", sink_depth));
+                }
+                cad_core::HoleType::Tap { thread_radius, tap_drill_radius, thread_depth } => {
+                    list.push(("ねじ呼び半径", thread_radius));
+                    list.push(("下穴半径", tap_drill_radius));
+                    list.push(("ねじ深さ", thread_depth));
+                }
+            }
+            if let Some(tip) = tip_angle_deg {
+                list.push(("ドリル先端角", tip));
+            }
+            list
+        }
         FeatureKind::Counterbore { center_x, center_y, hole_radius, bore_radius, bore_depth, depth, .. } => vec![("中心 X", center_x), ("中心 Y", center_y), ("穴半径", hole_radius), ("座ぐり半径", bore_radius), ("座ぐり深さ", bore_depth), ("全深さ", depth)],
         FeatureKind::Countersink { center_x, center_y, hole_radius, sink_radius, sink_depth, depth, .. } => vec![("中心 X", center_x), ("中心 Y", center_y), ("穴半径", hole_radius), ("皿穴半径", sink_radius), ("皿深さ", sink_depth), ("全深さ", depth)],
         FeatureKind::ExtrudeCircle { radius, depth } => vec![("半径", radius), ("押し出し量", depth)],
@@ -134,7 +157,13 @@ fn feature_parameter_slots(kind: &FeatureKind) -> Vec<(&'static str, &ScalarPara
             ("移動 Z", dz),
             ("回転角", rot_angle_deg),
         ],
-        FeatureKind::Fillet { radius, .. } => vec![("フィレット半径", radius)],
+        FeatureKind::Fillet { radius, radius_end, .. } => {
+            let mut list = vec![("フィレット半径", radius)];
+            if let Some(r_end) = radius_end {
+                list.push(("終了半径", r_end));
+            }
+            list
+        }
         FeatureKind::Chamfer { distance, .. } => vec![("面取り距離", distance)],
         FeatureKind::Draft { angle_deg, .. } => vec![("ドラフト角", angle_deg)],
         FeatureKind::LinearPattern { spacing_x, spacing_y, spacing_z, .. } => {
@@ -148,6 +177,10 @@ fn feature_parameter_slots(kind: &FeatureKind) -> Vec<(&'static str, &ScalarPara
         FeatureKind::FaceMove { dx, dy, dz, .. } => vec![("移動 X", dx), ("移動 Y", dy), ("移動 Z", dz)],
         FeatureKind::Rib { thickness, depth, .. } => vec![("厚み", thickness), ("深さ", depth)],
         FeatureKind::PlanePattern { spacing, .. } => vec![("間隔", spacing)],
+        FeatureKind::PatternOnReference { layout, .. } => match layout {
+            PatternReferenceLayout::Circular { total_angle_deg, .. } => vec![("全体の角度", total_angle_deg)],
+            PatternReferenceLayout::Linear { spacing, .. } => vec![("間隔", spacing)],
+        },
         FeatureKind::Sweep { .. }
         | FeatureKind::Mirror { .. }
         | FeatureKind::Boolean { .. }
@@ -284,6 +317,8 @@ pub enum ToolKind {
     MidPlane,
     FaceMove,
     PlanePattern,
+    Hole,
+    PatternOnReference,
 }
 
 /// What the sketch being started will become.
@@ -358,6 +393,33 @@ pub enum ToolPanel {
     Split { input: FeatureId, tool: Option<FeatureId> },
     MidPlane { first_feature: FeatureId, first: SemanticReference, second_feature: FeatureId, second: SemanticReference },
     PlanePattern { input: FeatureId, base_face: SemanticReference, spacing: f64, count: u32 },
+    Hole {
+        input: FeatureId,
+        plane: SketchPlane,
+        center: [f64; 2],
+        radius: f64,
+        depth: f64,
+        through_all: bool,
+        hole_type_index: usize,
+        bore_radius: f64,
+        bore_depth: f64,
+        sink_radius: f64,
+        sink_depth: f64,
+        thread_radius: f64,
+        tap_drill_radius: f64,
+        thread_depth: f64,
+        has_tip_angle: bool,
+        tip_angle_deg: f64,
+    },
+    PatternOnReference {
+        input: FeatureId,
+        reference: ReferenceAxis,
+        is_circular: bool,
+        spacing: f64,
+        count: u32,
+        total_angle_deg: f64,
+        tool_only: bool,
+    },
 }
 
 /// Action chosen from a timeline chip's right-click menu.
@@ -810,6 +872,8 @@ impl FerroCadApp {
                 radius: ScalarParam::mm(1.5),
                 edge_indices: edge_indices.clone(),
                 semantic_refs,
+                radius_end: None,
+                propagate_tangent: false,
             }
         };
         let base = if chamfer { "Chamfer" } else { "Fillet" };
@@ -998,6 +1062,9 @@ impl FerroCadApp {
                     if ribbon_button(ui, "⌒", "Sweep", feature_selected, "円形断面を直線パスに沿って掃引します") {
                         self.open_tool_panel(ToolKind::SweepCircle);
                     }
+                    if ribbon_button(ui, "◎", "穴仕様", feature_selected || face_selected, "面基準で仕様（単純/座ぐり/皿穴/ねじ・先端角・貫通）を指定した穴を作ります") {
+                        self.open_tool_panel(ToolKind::Hole);
+                    }
                     if ribbon_button(ui, "⊙", "座ぐり穴", feature_selected, "XY位置・径・深さを指定して座ぐり穴を作ります") {
                         self.open_tool_panel(ToolKind::Counterbore);
                     }
@@ -1020,6 +1087,9 @@ impl FerroCadApp {
                     }
                     if ribbon_button(ui, "∥", "ミラー", feature_selected, if feature_selected { "選択中の形状を平面で鏡映します" } else { need }) {
                         self.open_tool_panel(ToolKind::Mirror);
+                    }
+                    if ribbon_button(ui, "☍", "参照配列", feature_selected, if feature_selected { "選択中の形状（穴・突起等）を参照エッジや円筒面軸に沿って直線/円形配列します" } else { need }) {
+                        self.open_tool_panel(ToolKind::PatternOnReference);
                     }
                     if ribbon_button(ui, "◆", "ブーリアン", feature_selected, if feature_selected { "2つのボディを足す・引く・重なりを取る" } else { need }) {
                         self.open_tool_panel(ToolKind::Boolean);
@@ -3620,6 +3690,94 @@ mod tests {
         let (&pattern, feat) = app.controller.document.features.iter().next_back().unwrap();
         assert_eq!(pattern, feat.id);
         assert!(matches!(feat.kind, FeatureKind::PlanePattern { count: 4, .. }));
+    }
+
+    #[test]
+    fn m10_hole_tool_creates_hole_on_face() {
+        let mut app = FerroCadApp::new_with_mvp_demo();
+        app.execute_cmd(CadCommand::AddFeature {
+            name: "BasePlate".to_string(),
+            kind: FeatureKind::Box {
+                width: ScalarParam::mm(50.0),
+                height: ScalarParam::mm(50.0),
+                depth: ScalarParam::mm(15.0),
+            },
+            visible: true,
+            color_rgba: [1.0; 4],
+        });
+        let (&base, _) = app.controller.document.features.iter().next_back().unwrap();
+        let shape = app.controller.document.features[&base].cached_shape.unwrap();
+        let top = app.store.resolve_face_by_signature(shape, glam::DVec3::Z, None, 0.99).unwrap();
+
+        app.render_config.selected_face = Some((base, top.index));
+        app.open_tool_panel(ToolKind::Hole);
+        let mut panel = app.tool_panel.take().expect("hole panel");
+        if let ToolPanel::Hole { center, radius, depth, hole_type_index, bore_radius, bore_depth, .. } = &mut panel {
+            center[0] = 25.0;
+            center[1] = 25.0;
+            *radius = 4.0;
+            *depth = 15.0;
+            *hole_type_index = 1; // Counterbore
+            *bore_radius = 7.0;
+            *bore_depth = 4.0;
+        }
+        app.confirm_tool(panel);
+
+        let (&hole_id, feat) = app.controller.document.features.iter().next_back().unwrap();
+        assert_eq!(hole_id, feat.id);
+        assert!(matches!(feat.kind, FeatureKind::Hole { hole_type: cad_core::HoleType::Counterbore { .. }, .. }));
+        let vol = app.controller.document.features[&hole_id].cached_summary.unwrap().volume_mm3;
+        // 50*50*15 = 37500. Hole cuts volume.
+        assert!(vol < 37500.0 - 1000.0, "volume was {vol}");
+    }
+
+    #[test]
+    fn m10_pattern_on_reference_tool_creates_pattern() {
+        let mut app = FerroCadApp::new_with_mvp_demo();
+        app.execute_cmd(CadCommand::AddFeature {
+            name: "Plate".to_string(),
+            kind: FeatureKind::Box {
+                width: ScalarParam::mm(100.0),
+                height: ScalarParam::mm(40.0),
+                depth: ScalarParam::mm(20.0),
+            },
+            visible: true,
+            color_rgba: [1.0; 4],
+        });
+        let (&base, _) = app.controller.document.features.iter().next_back().unwrap();
+        let shape = app.controller.document.features[&base].cached_shape.unwrap();
+        let edges = app.store.inspect_shape(shape).unwrap().edges;
+        let edge_idx = edges[0].index;
+
+        // Add a cylinder pin to pattern
+        app.execute_cmd(CadCommand::AddFeature {
+            name: "Pin".to_string(),
+            kind: FeatureKind::Cylinder {
+                radius: ScalarParam::mm(3.0),
+                height: ScalarParam::mm(15.0),
+            },
+            visible: true,
+            color_rgba: [1.0; 4],
+        });
+        let (&pin, _) = app.controller.document.features.iter().next_back().unwrap();
+
+        app.render_config.selected_feature = Some(pin);
+        app.render_config.selected_edge = Some((base, edge_idx));
+        app.open_tool_panel(ToolKind::PatternOnReference);
+        let mut panel = app.tool_panel.take().expect("pattern on reference panel");
+        if let ToolPanel::PatternOnReference { spacing, count, is_circular, .. } = &mut panel {
+            *spacing = 20.0;
+            *count = 3;
+            *is_circular = false;
+        }
+        app.confirm_tool(panel);
+
+        let (&pat_id, feat) = app.controller.document.features.iter().next_back().unwrap();
+        assert_eq!(pat_id, feat.id);
+        assert!(matches!(feat.kind, FeatureKind::PatternOnReference { .. }));
+        let vol = app.controller.document.features[&pat_id].cached_summary.unwrap().volume_mm3;
+        // 3 pins of r=3, h=15: 3 * pi * 9 * 15 ~= 1272 mm3
+        assert!((vol - 1272.3).abs() < 5.0, "volume was {vol}");
     }
 }
 

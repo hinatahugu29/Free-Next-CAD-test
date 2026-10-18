@@ -760,6 +760,32 @@ impl ShapeStore {
         self.insert(res)
     }
 
+    /// Fillets selected edges of `id` with variable radius from `radius_start` to `radius_end`.
+    pub fn fillet_variable_edges(
+        &mut self,
+        id: ShapeId,
+        edge_indices: &[u32],
+        radius_start: Length,
+        radius_end: Length,
+    ) -> Result<ShapeId, GeometryError> {
+        let r1 = radius_start.ensure_positive("radius_start")?;
+        let r2 = radius_end.ensure_positive("radius_end")?;
+        let s = self.get(id)?;
+        let res = s.fillet_variable_edges(edge_indices, r1, r2)?;
+        self.insert(res)
+    }
+
+    /// Finds all edges tangentially connected to `edge_index`.
+    pub fn find_tangent_edges(
+        &self,
+        id: ShapeId,
+        edge_index: u32,
+        angular_tolerance_rad: f64,
+    ) -> Result<Vec<u32>, GeometryError> {
+        let s = self.get(id)?;
+        Ok(s.find_tangent_edges(edge_index, angular_tolerance_rad)?)
+    }
+
     /// Chamfers all edges of `id` with `distance`.
     pub fn chamfer_all(&mut self, id: ShapeId, distance: Length) -> Result<ShapeId, GeometryError> {
         let d = distance.ensure_positive("distance")?;
@@ -899,6 +925,18 @@ impl ShapeStore {
             faces,
             edges,
         })
+    }
+
+    /// Extracts the natural geometric axis (origin, unit direction) of a face.
+    pub fn inspect_face_axis(&self, id: ShapeId, face_index: u32) -> Result<(DVec3, DVec3), GeometryError> {
+        let raw = self.get(id)?.inspect_face_axis(face_index)?;
+        Ok((DVec3::new(raw.ox, raw.oy, raw.oz), DVec3::new(raw.dx, raw.dy, raw.dz)))
+    }
+
+    /// Extracts the natural geometric axis (origin, unit direction) of an edge.
+    pub fn inspect_edge_axis(&self, id: ShapeId, edge_index: u32) -> Result<(DVec3, DVec3), GeometryError> {
+        let raw = self.get(id)?.inspect_edge_axis(edge_index)?;
+        Ok((DVec3::new(raw.ox, raw.oy, raw.oz), DVec3::new(raw.dx, raw.dy, raw.dz)))
     }
 
     /// Resolves a semantic face selector (normal direction + optional approximate centroid)

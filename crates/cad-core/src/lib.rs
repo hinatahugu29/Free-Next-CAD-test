@@ -199,7 +199,7 @@ pub enum SketchPlane {
 }
 
 impl SketchPlane {
-    fn features(&self) -> Vec<FeatureId> {
+    pub fn features(&self) -> Vec<FeatureId> {
         match self {
             Self::Face { feature, .. } | Self::OffsetFace { feature, .. } => vec![*feature],
             Self::MidFace { first_feature, second_feature, .. } if first_feature == second_feature => vec![*first_feature],
@@ -366,6 +366,8 @@ pub enum RefRole {
     FaceMoveFace,
     /// The base face for a PlanePattern feature.
     PlanePatternFace,
+    /// A referenced edge or face for PatternOnReference.
+    PatternAxisRef,
 }
 
 /// One face/edge reference held by a feature.
@@ -381,6 +383,45 @@ impl RefSlot {
     pub fn is_edge(&self) -> bool {
         matches!(self.role, RefRole::Edge(_))
     }
+}
+
+/// Reference geometry used as a direction or rotation axis for patterns (M10).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ReferenceAxis {
+    /// A linear edge direction or circular edge axis.
+    Edge {
+        feature: FeatureId,
+        edge: SemanticReference,
+    },
+    /// A cylindrical surface axis or planar face normal.
+    Face {
+        feature: FeatureId,
+        face: SemanticReference,
+    },
+    /// A reference datum plane or face plane.
+    Plane(SketchPlane),
+}
+
+impl ReferenceAxis {
+    pub fn features(&self) -> Vec<FeatureId> {
+        match self {
+            Self::Edge { feature, .. } | Self::Face { feature, .. } => vec![*feature],
+            Self::Plane(plane) => plane.features(),
+        }
+    }
+}
+
+/// Arrangement of pattern instances driven by a reference geometry (M10).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum PatternReferenceLayout {
+    Linear {
+        spacing: ScalarParam,
+        count: u32,
+    },
+    Circular {
+        count: u32,
+        total_angle_deg: ScalarParam,
+    },
 }
 
 /// Revolve axis in sketch coordinates.
@@ -632,9 +673,55 @@ impl ExtrudeMode {
     }
 }
 
+/// Types and specifications of machined holes (M10).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum HoleType {
+    /// Simple straight cylindrical hole.
+    Simple,
+    /// Counterbore hole with step diameter and depth.
+    Counterbore {
+        bore_radius: ScalarParam,
+        bore_depth: ScalarParam,
+    },
+    /// Countersink hole with taper diameter and depth.
+    Countersink {
+        sink_radius: ScalarParam,
+        sink_depth: ScalarParam,
+    },
+    /// Threaded / tapped hole with tap drill diameter and thread depth.
+    Tap {
+        thread_radius: ScalarParam,
+        tap_drill_radius: ScalarParam,
+        thread_depth: ScalarParam,
+    },
+}
+
+impl Default for HoleType {
+    fn default() -> Self {
+        Self::Simple
+    }
+}
+
 /// Parametric feature definition (Phase 2.2 & Phase 4.2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum FeatureKind {
+    /// Face-referenced parametric hole with machining specifications (M10).
+    Hole {
+        input: FeatureId,
+        plane: SketchPlane,
+        #[serde(default = "zero_scalar")]
+        center_x: ScalarParam,
+        #[serde(default = "zero_scalar")]
+        center_y: ScalarParam,
+        radius: ScalarParam,
+        depth: ScalarParam,
+        #[serde(default)]
+        through_all: bool,
+        #[serde(default)]
+        hole_type: HoleType,
+        #[serde(default)]
+        tip_angle_deg: Option<ScalarParam>,
+    },
     Box {
         width: ScalarParam,
         height: ScalarParam,
@@ -777,6 +864,12 @@ pub enum FeatureKind {
         /// `edge_indices`, which can silently point at the wrong edge after upstream edits.
         #[serde(default)]
         semantic_refs: Vec<SemanticReference>,
+        /// When set, applies a variable radius blend from `radius` (start) to `radius_end` (end).
+        #[serde(default)]
+        radius_end: Option<ScalarParam>,
+        /// When true, automatically propagates the fillet along tangent continuous edges.
+        #[serde(default)]
+        propagate_tangent: bool,
     },
     Chamfer {
         input: FeatureId,
@@ -843,6 +936,14 @@ pub enum FeatureKind {
         spacing_z: ScalarParam,
         count_x: u32,
         count_y: u32,
+    },
+    /// Repeats a feature along a reference direction or around a reference axis (M10).
+    PatternOnReference {
+        input: FeatureId,
+        reference: ReferenceAxis,
+        layout: PatternReferenceLayout,
+        #[serde(default)]
+        tool_only: bool,
     },
 }
 
@@ -912,9 +1013,18 @@ impl FeatureKind {
             | Self::Counterbore { input, .. }
             | Self::Countersink { input, .. }
             | Self::LinearPattern { input, .. } => vec![*input],
-            Self::Rib { input, plane, .. } => {
+            Self::Rib { input, plane, .. } | Self::Hole { input, plane, .. } => {
                 let mut deps = vec![*input];
                 for id in plane.features() {
+                    if !deps.contains(&id) {
+                        deps.push(id);
+                    }
+                }
+                deps
+            }
+            Self::PatternOnReference { input, reference, .. } => {
+                let mut deps = vec![*input];
+                for id in reference.features() {
                     if !deps.contains(&id) {
                         deps.push(id);
                     }
@@ -951,6 +1061,31 @@ impl FeatureKind {
             | Self::LinearPattern { input, .. }
             | Self::Pattern { input, .. }
             | Self::Shell { input, .. } => swap(input),
+            Self::Hole { input, plane, .. } | Self::Rib { input, plane, .. } => {
+                swap(input);
+                match plane {
+                    SketchPlane::Face { feature, .. } | SketchPlane::OffsetFace { feature, .. } => swap(feature),
+                    SketchPlane::MidFace { first_feature, second_feature, .. } => {
+                        swap(first_feature);
+                        swap(second_feature);
+                    }
+                    _ => {}
+                }
+            }
+            Self::PatternOnReference { input, reference, .. } => {
+                swap(input);
+                match reference {
+                    ReferenceAxis::Edge { feature, .. } | ReferenceAxis::Face { feature, .. } => swap(feature),
+                    ReferenceAxis::Plane(plane) => match plane {
+                        SketchPlane::Face { feature, .. } | SketchPlane::OffsetFace { feature, .. } => swap(feature),
+                        SketchPlane::MidFace { first_feature, second_feature, .. } => {
+                            swap(first_feature);
+                            swap(second_feature);
+                        }
+                        _ => {}
+                    }
+                }
+            }
             Self::Split { input, tool } => { swap(input); swap(tool); }
             Self::Mirror { input, plane, .. } => {
                 swap(input);
@@ -1019,7 +1154,7 @@ impl FeatureKind {
             Self::PushPull { input, face, .. } => out.push(RefSlot { role: RefRole::PushPullFace, upstream: *input, reference: face.clone() }),
             Self::FaceMove { input, face, .. } => out.push(RefSlot { role: RefRole::FaceMoveFace, upstream: *input, reference: face.clone() }),
             Self::PlanePattern { input, base_face, .. } => out.push(RefSlot { role: RefRole::PlanePatternFace, upstream: *input, reference: base_face.clone() }),
-            Self::Rib { plane, .. } => {
+            Self::Hole { plane, .. } | Self::Rib { plane, .. } => {
                 match plane {
                     SketchPlane::Face { feature, face } | SketchPlane::OffsetFace { feature, face, .. } => {
                         out.push(RefSlot { role: RefRole::Plane, upstream: *feature, reference: face.clone() });
@@ -1029,6 +1164,26 @@ impl FeatureKind {
                         out.push(RefSlot { role: RefRole::MidPlaneSecond, upstream: *second_feature, reference: second.clone() });
                     }
                     _ => {}
+                }
+            }
+            Self::PatternOnReference { reference, .. } => {
+                match reference {
+                    ReferenceAxis::Edge { feature, edge } => {
+                        out.push(RefSlot { role: RefRole::PatternAxisRef, upstream: *feature, reference: edge.clone() });
+                    }
+                    ReferenceAxis::Face { feature, face } => {
+                        out.push(RefSlot { role: RefRole::PatternAxisRef, upstream: *feature, reference: face.clone() });
+                    }
+                    ReferenceAxis::Plane(plane) => match plane {
+                        SketchPlane::Face { feature, face } | SketchPlane::OffsetFace { feature, face, .. } => {
+                            out.push(RefSlot { role: RefRole::Plane, upstream: *feature, reference: face.clone() });
+                        }
+                        SketchPlane::MidFace { first_feature, first, second_feature, second } => {
+                            out.push(RefSlot { role: RefRole::MidPlaneFirst, upstream: *first_feature, reference: first.clone() });
+                            out.push(RefSlot { role: RefRole::MidPlaneSecond, upstream: *second_feature, reference: second.clone() });
+                        }
+                        _ => {}
+                    }
                 }
             }
             Self::Shell {
@@ -1089,10 +1244,17 @@ impl FeatureKind {
             (Self::PushPull { face, .. }, RefRole::PushPullFace) => { *face = reference; true },
             (Self::FaceMove { face, .. }, RefRole::FaceMoveFace) => { *face = reference; true },
             (Self::PlanePattern { base_face, .. }, RefRole::PlanePatternFace) => { *base_face = reference; true },
+            (Self::PatternOnReference { reference: ref_axis, .. }, RefRole::PatternAxisRef) => match ref_axis {
+                ReferenceAxis::Edge { edge, .. } => { *edge = reference; true }
+                ReferenceAxis::Face { face, .. } => { *face = reference; true }
+                _ => false,
+            },
             (
                 Self::SketchExtrude { plane, .. }
                 | Self::SketchRevolve { plane, .. }
                 | Self::Rib { plane, .. }
+                | Self::Hole { plane, .. }
+                | Self::PatternOnReference { reference: ReferenceAxis::Plane(plane), .. }
                 | Self::Mirror { plane, .. },
                 RefRole::Plane,
             ) => match plane {
@@ -1105,6 +1267,8 @@ impl FeatureKind {
             (
                 Self::SketchExtrude { plane, .. }
                 | Self::SketchRevolve { plane, .. }
+                | Self::Hole { plane, .. }
+                | Self::PatternOnReference { reference: ReferenceAxis::Plane(plane), .. }
                 | Self::Mirror { plane, .. },
                 RefRole::MidPlaneFirst,
             ) => match plane {
@@ -1114,6 +1278,8 @@ impl FeatureKind {
             (
                 Self::SketchExtrude { plane, .. }
                 | Self::SketchRevolve { plane, .. }
+                | Self::Hole { plane, .. }
+                | Self::PatternOnReference { reference: ReferenceAxis::Plane(plane), .. }
                 | Self::Mirror { plane, .. },
                 RefRole::MidPlaneSecond,
             ) => match plane {
@@ -1137,6 +1303,9 @@ impl FeatureKind {
             | Self::SolidFromShell { input }
             | Self::Sew { input, .. }
             | Self::PushPull { input, .. }
+            | Self::FaceMove { input, .. }
+            | Self::Hole { input, .. }
+            | Self::PatternOnReference { input, .. }
             | Self::Counterbore { input, .. }
             | Self::Countersink { input, .. }
             | Self::LinearPattern { input, .. } => Some(*input),
@@ -1221,8 +1390,11 @@ impl FeatureKind {
                 add(dz);
                 add(rot_angle_deg);
             }
-            Self::Fillet { radius, .. } => {
+            Self::Fillet { radius, radius_end, .. } => {
                 add(radius);
+                if let Some(r_end) = radius_end {
+                    add(r_end);
+                }
             }
             Self::Chamfer { distance, .. } => {
                 add(distance);
@@ -1237,6 +1409,31 @@ impl FeatureKind {
             Self::FaceMove { dx, dy, dz, .. } => { add(dx); add(dy); add(dz); }
             Self::PlanePattern { spacing, .. } => add(spacing),
             Self::Rib { thickness, depth, .. } => { add(thickness); add(depth); }
+            Self::Hole { center_x, center_y, radius, depth, hole_type, tip_angle_deg, .. } => {
+                add(center_x);
+                add(center_y);
+                add(radius);
+                add(depth);
+                if let Some(angle) = tip_angle_deg {
+                    add(angle);
+                }
+                match hole_type {
+                    HoleType::Simple => {}
+                    HoleType::Counterbore { bore_radius, bore_depth } => {
+                        add(bore_radius);
+                        add(bore_depth);
+                    }
+                    HoleType::Countersink { sink_radius, sink_depth } => {
+                        add(sink_radius);
+                        add(sink_depth);
+                    }
+                    HoleType::Tap { thread_radius, tap_drill_radius, thread_depth } => {
+                        add(thread_radius);
+                        add(tap_drill_radius);
+                        add(thread_depth);
+                    }
+                }
+            }
             Self::LinearPattern {
                 spacing_x,
                 spacing_y,
@@ -1262,6 +1459,10 @@ impl FeatureKind {
             Self::Pattern { layout, .. } => match layout {
                 PatternLayout::Circular { total_angle_deg, .. } => add(total_angle_deg),
                 PatternLayout::Linear { spacing, .. } => add(spacing),
+            },
+            Self::PatternOnReference { layout, .. } => match layout {
+                PatternReferenceLayout::Linear { spacing, .. } => add(spacing),
+                PatternReferenceLayout::Circular { total_angle_deg, .. } => add(total_angle_deg),
             },
             Self::Mirror { .. } | Self::ImportedBody { .. } => {}
             Self::Shell { thickness, .. } => add(thickness),
@@ -1933,6 +2134,34 @@ impl Document {
         }
     }
 
+    /// Resolves a reference axis to a 3D origin and unit direction vector (M10).
+    pub fn resolve_reference_axis(
+        &self,
+        axis: &ReferenceAxis,
+        store: &ShapeStore,
+    ) -> Result<(DVec3, DVec3), CoreError> {
+        match axis {
+            ReferenceAxis::Edge { feature, edge } => {
+                let shape = self.features.get(feature).and_then(|f| f.cached_shape).ok_or(CoreError::FeatureNotFound(*feature))?;
+                let resolved = edge.resolve_edge(store, shape).map_err(|reason| CoreError::SemanticReferenceLost { feature: *feature, reason })?;
+                let (origin, dir) = store.inspect_edge_axis(shape, resolved.index)?;
+                let dir = dir.try_normalize().unwrap_or(DVec3::Z);
+                Ok((origin, dir))
+            }
+            ReferenceAxis::Face { feature, face } => {
+                let shape = self.features.get(feature).and_then(|f| f.cached_shape).ok_or(CoreError::FeatureNotFound(*feature))?;
+                let resolved = face.resolve_face(store, shape).map_err(|reason| CoreError::SemanticReferenceLost { feature: *feature, reason })?;
+                let (origin, dir) = store.inspect_face_axis(shape, resolved.index)?;
+                let dir = dir.try_normalize().unwrap_or(DVec3::Z);
+                Ok((origin, dir))
+            }
+            ReferenceAxis::Plane(plane) => {
+                let frame = self.sketch_plane_frame(plane, store)?;
+                Ok((frame.origin, frame.normal))
+            }
+        }
+    }
+
     /// Removes a feature together with everything that depends on it (in one step).
     /// Returns the removed ids, dependents first.
     pub fn remove_feature_cascade(
@@ -2281,15 +2510,189 @@ impl Document {
             .ok_or(CoreError::FeatureNotFound(id))
     }
 
-    /// True for sketch features that add to / cut from a target (their tool can be
-    /// repeated onto the target instead of repeating the whole body).
-    fn is_sketch_tool_feature(&self, id: FeatureId) -> bool {
+    /// True for features whose cutting/joining tool can be repeated onto a target.
+    fn is_tool_feature(&self, id: FeatureId) -> bool {
         self.features.get(&id).is_some_and(|f| match &f.kind {
             FeatureKind::SketchExtrude { mode, .. } | FeatureKind::SketchRevolve { mode, .. } => {
                 *mode != ExtrudeMode::NewBody
             }
+            FeatureKind::Hole { .. } => true,
             _ => false,
         })
+    }
+
+    fn hole_tool(
+        &self,
+        target_id: FeatureId,
+        plane: &SketchPlane,
+        cx: f64,
+        cy: f64,
+        r: f64,
+        d: f64,
+        through_all: bool,
+        hole_type: &HoleType,
+        tip_angle_deg: Option<&ScalarParam>,
+        params: &BTreeMap<String, f64>,
+        store: &mut ShapeStore,
+    ) -> Result<ShapeId, CoreError> {
+        let src = self.feature_shape(target_id)?;
+        if r <= 0.0 {
+            return Err(CoreError::Geometry(GeometryError::InvalidParameter {
+                name: "Hole".to_string(),
+                reason: "穴半径は正の数値である必要があります".to_string(),
+            }));
+        }
+        if !through_all && d <= 0.0 {
+            return Err(CoreError::Geometry(GeometryError::InvalidParameter {
+                name: "Hole".to_string(),
+                reason: "穴深さは正の数値である必要があります".to_string(),
+            }));
+        }
+
+        let frame = self.sketch_plane_frame(plane, store)?;
+        let bbox = store.bounding_box(src)?;
+        let diag = bbox.diagonal_length();
+        let actual_depth = if through_all {
+            (diag + 20.0).max(d).max(50.0)
+        } else {
+            d
+        };
+
+        let margin = 1.0;
+        let bottom_z = -actual_depth - if through_all { margin } else { 0.0 };
+        let total_length = margin - bottom_z;
+
+        let main_tool = match hole_type {
+            HoleType::Simple => {
+                let cyl = store.create_cylinder(Length::mm(r), Length::mm(total_length))?;
+                let cyl = store.translate(cyl, 0.0, 0.0, bottom_z)?;
+                store.translate(cyl, cx, cy, 0.0)?
+            }
+            HoleType::Counterbore { bore_radius, bore_depth } => {
+                let br = bore_radius.evaluate(params)?;
+                let bd = bore_depth.evaluate(params)?;
+                if br < r || bd <= 0.0 || (!through_all && bd > d) {
+                    return Err(CoreError::Geometry(GeometryError::InvalidParameter {
+                        name: "Hole".to_string(),
+                        reason: "座ぐり径は穴径以上、座ぐり深さは全深さ以下にしてください".to_string(),
+                    }));
+                }
+                let bore_len = bd + margin;
+                let bore = store.create_cylinder(Length::mm(br), Length::mm(bore_len))?;
+                let bore = store.translate(bore, 0.0, 0.0, -bd)?;
+                let shaft_len = (-bd - bottom_z).max(0.1);
+                let shaft = store.create_cylinder(Length::mm(r), Length::mm(shaft_len))?;
+                let shaft = store.translate(shaft, 0.0, 0.0, bottom_z)?;
+                let combined = store.fuse(bore, shaft)?;
+                store.translate(combined, cx, cy, 0.0)?
+            }
+            HoleType::Countersink { sink_radius, sink_depth } => {
+                let sr = sink_radius.evaluate(params)?;
+                let sd = sink_depth.evaluate(params)?;
+                if sr < r || sd <= 0.0 || (!through_all && sd > d) {
+                    return Err(CoreError::Geometry(GeometryError::InvalidParameter {
+                        name: "Hole".to_string(),
+                        reason: "皿穴径は穴径以上、皿深さは全深さ以下にしてください".to_string(),
+                    }));
+                }
+                let sink_len = sd + margin;
+                let cone = store.create_cone(Length::mm(r), Length::mm(sr), Length::mm(sink_len))?;
+                let cone = store.translate(cone, 0.0, 0.0, -sd)?;
+                let shaft_len = (-sd - bottom_z).max(0.1);
+                let shaft = store.create_cylinder(Length::mm(r), Length::mm(shaft_len))?;
+                let shaft = store.translate(shaft, 0.0, 0.0, bottom_z)?;
+                let combined = store.fuse(cone, shaft)?;
+                store.translate(combined, cx, cy, 0.0)?
+            }
+            HoleType::Tap { thread_radius, tap_drill_radius, thread_depth } => {
+                let tr = thread_radius.evaluate(params)?;
+                let tdr = tap_drill_radius.evaluate(params)?;
+                let td = thread_depth.evaluate(params)?;
+                if tr < tdr || td <= 0.0 || (!through_all && td > d) {
+                    return Err(CoreError::Geometry(GeometryError::InvalidParameter {
+                        name: "Hole".to_string(),
+                        reason: "ねじ呼び径は下穴径以上、ねじ深さは全深さ以下にしてください".to_string(),
+                    }));
+                }
+                let thread_len = td + margin;
+                let thread_cyl = store.create_cylinder(Length::mm(tr), Length::mm(thread_len))?;
+                let thread_cyl = store.translate(thread_cyl, 0.0, 0.0, -td)?;
+                let drill_len = (-td - bottom_z).max(0.1);
+                let drill_cyl = store.create_cylinder(Length::mm(tdr), Length::mm(drill_len))?;
+                let drill_cyl = store.translate(drill_cyl, 0.0, 0.0, bottom_z)?;
+                let combined = store.fuse(thread_cyl, drill_cyl)?;
+                store.translate(combined, cx, cy, 0.0)?
+            }
+        };
+
+        let full_tool = if !through_all {
+            if let Some(tip_deg_param) = tip_angle_deg {
+                let tip_deg = tip_deg_param.evaluate(params)?;
+                if tip_deg > 10.0 && tip_deg < 179.0 {
+                    let half_angle_rad = (tip_deg * 0.5).to_radians();
+                    let tip_height = r / half_angle_rad.tan();
+                    let tip_cone = store.create_cone(Length::mm(0.001), Length::mm(r), Length::mm(tip_height))?;
+                    let tip_cone = store.translate(tip_cone, 0.0, 0.0, -actual_depth - tip_height)?;
+                    let tip_cone = store.translate(tip_cone, cx, cy, 0.0)?;
+                    store.fuse(main_tool, tip_cone)?
+                } else {
+                    main_tool
+                }
+            } else {
+                main_tool
+            }
+        } else {
+            main_tool
+        };
+
+        place_on_frame(store, full_tool, &frame, 0.0)
+    }
+
+    /// The solid tool a feature produces before it is combined with its target.
+    fn feature_tool(
+        &self,
+        kind: &FeatureKind,
+        params: &BTreeMap<String, f64>,
+        store: &mut ShapeStore,
+    ) -> Result<ShapeId, CoreError> {
+        match kind {
+            FeatureKind::SketchExtrude { .. } | FeatureKind::SketchRevolve { .. } => {
+                self.sketch_tool(kind, params, store)
+            }
+            FeatureKind::Hole {
+                input,
+                plane,
+                center_x,
+                center_y,
+                radius,
+                depth,
+                through_all,
+                hole_type,
+                tip_angle_deg,
+            } => {
+                let cx = center_x.evaluate(params)?;
+                let cy = center_y.evaluate(params)?;
+                let r = radius.evaluate(params)?;
+                let d = depth.evaluate(params)?;
+                self.hole_tool(
+                    *input,
+                    plane,
+                    cx,
+                    cy,
+                    r,
+                    d,
+                    *through_all,
+                    hole_type,
+                    tip_angle_deg.as_ref(),
+                    params,
+                    store,
+                )
+            }
+            _ => Err(CoreError::Geometry(GeometryError::InvalidParameter {
+                name: "feature".to_string(),
+                reason: "not a tool feature".to_string(),
+            })),
+        }
     }
 
     /// The solid a sketch feature produces before it is combined with its target: the
@@ -2430,16 +2833,19 @@ impl Document {
     ) -> Result<ShapeId, CoreError> {
         let feat = self.features.get(&input).ok_or(CoreError::FeatureNotFound(input))?;
         if use_tool {
-            let mode = match &feat.kind {
-                FeatureKind::SketchExtrude { mode, .. } | FeatureKind::SketchRevolve { mode, .. } => *mode,
+            let (target_id, is_cut) = match &feat.kind {
+                FeatureKind::SketchExtrude { mode, .. } | FeatureKind::SketchRevolve { mode, .. } => {
+                    (mode.target().unwrap(), matches!(mode, ExtrudeMode::Cut { .. }))
+                }
+                FeatureKind::Hole { input: target, .. } => (*target, true),
                 _ => unreachable!(),
             };
-            let tool = self.sketch_tool(&feat.kind, params, store)?;
-            let mut current = self.feature_shape(mode.target().unwrap())?;
+            let tool = self.feature_tool(&feat.kind, params, store)?;
+            let mut current = self.feature_shape(target_id)?;
             let mut owned = false;
             for inst in instances {
                 let placed = inst.apply(store, tool)?;
-                let next = if matches!(mode, ExtrudeMode::Cut { .. }) {
+                let next = if is_cut {
                     store.cut(current, placed)
                 } else {
                     store.fuse(current, placed)
@@ -2553,6 +2959,39 @@ impl Document {
                 let shape = store.sweep_circle(Length::mm(radius.evaluate(params)?), DVec3::new(dx.evaluate(params)?, dy.evaluate(params)?, dz.evaluate(params)?))?;
                 Ok(store.translate(shape, start_x.evaluate(params)?, start_y.evaluate(params)?, start_z.evaluate(params)?)?)
             },
+            FeatureKind::Hole {
+                input,
+                plane,
+                center_x,
+                center_y,
+                radius,
+                depth,
+                through_all,
+                hole_type,
+                tip_angle_deg,
+            } => {
+                let src = lookup_shape(*input)?;
+                let cx = center_x.evaluate(params)?;
+                let cy = center_y.evaluate(params)?;
+                let r = radius.evaluate(params)?;
+                let d = depth.evaluate(params)?;
+                let placed_tool = self.hole_tool(
+                    *input,
+                    plane,
+                    cx,
+                    cy,
+                    r,
+                    d,
+                    *through_all,
+                    hole_type,
+                    tip_angle_deg.as_ref(),
+                    params,
+                    store,
+                )?;
+                let cut = store.cut(src, placed_tool)?;
+                let _ = store.remove(placed_tool);
+                Ok(cut)
+            }
             FeatureKind::Counterbore { input, center_x, center_y, hole_radius, bore_radius, bore_depth, depth } => {
                 let src = lookup_shape(*input)?;
                 let center_x = center_x.evaluate(params)?;
@@ -2595,7 +3034,58 @@ impl Document {
                 tool_only,
             } => {
                 let instances = layout.instances(params)?;
-                let tool = *tool_only && self.is_sketch_tool_feature(*input);
+                let tool = *tool_only && self.is_tool_feature(*input);
+                self.replicate(*input, &instances, tool, params, store)
+            }
+            FeatureKind::PatternOnReference {
+                input,
+                reference,
+                layout,
+                tool_only,
+            } => {
+                let (origin, dir) = self.resolve_reference_axis(reference, store)?;
+                let instances: Vec<Instance> = match layout {
+                    PatternReferenceLayout::Linear { spacing, count } => {
+                        if *count < 1 {
+                            return Err(CoreError::Geometry(GeometryError::InvalidParameter {
+                                name: "PatternOnReference".to_string(),
+                                reason: "個数は1以上を指定してください".to_string(),
+                            }));
+                        }
+                        let s = spacing.evaluate(params)?;
+                        (0..*count)
+                            .map(|i| match i {
+                                0 => Instance::Identity,
+                                _ => Instance::Translate(dir * (s * i as f64)),
+                            })
+                            .collect()
+                    }
+                    PatternReferenceLayout::Circular { count, total_angle_deg } => {
+                        if *count < 1 {
+                            return Err(CoreError::Geometry(GeometryError::InvalidParameter {
+                                name: "PatternOnReference".to_string(),
+                                reason: "個数は1以上を指定してください".to_string(),
+                            }));
+                        }
+                        let total = total_angle_deg.evaluate(params)?;
+                        let step = if (total.abs() - 360.0).abs() < 1e-6 || *count == 1 {
+                            total / *count as f64
+                        } else {
+                            total / (*count - 1) as f64
+                        };
+                        (0..*count)
+                            .map(|i| match i {
+                                0 => Instance::Identity,
+                                _ => Instance::Rotate {
+                                    origin,
+                                    axis: dir,
+                                    angle_deg: step * i as f64,
+                                },
+                            })
+                            .collect()
+                    }
+                };
+                let tool = *tool_only && self.is_tool_feature(*input);
                 self.replicate(*input, &instances, tool, params, store)
             }
             FeatureKind::Mirror {
@@ -2609,7 +3099,7 @@ impl Document {
                     origin: frame.origin,
                     normal: frame.normal,
                 };
-                let tool = *tool_only && self.is_sketch_tool_feature(*input);
+                let tool = *tool_only && self.is_tool_feature(*input);
                 let instances = if *merge || tool {
                     vec![Instance::Identity, mirror]
                 } else {
@@ -2786,16 +3276,47 @@ impl Document {
                 radius,
                 edge_indices,
                 semantic_refs,
+                radius_end,
+                propagate_tangent,
             } => {
                 let src = lookup_shape(*input)?;
                 let r = radius.evaluate(params)?;
-                if !semantic_refs.is_empty() {
-                    let resolved = self.resolve_semantic_edges(*input, semantic_refs, store)?;
-                    Ok(store.fillet_edges(src, &resolved, Length::mm(r))?)
+                let target_edges = if !semantic_refs.is_empty() {
+                    self.resolve_semantic_edges(*input, semantic_refs, store)?
                 } else if edge_indices.is_empty() {
+                    Vec::new()
+                } else {
+                    edge_indices.clone()
+                };
+
+                let final_edges = if *propagate_tangent && !target_edges.is_empty() {
+                    let mut expanded = std::collections::BTreeSet::new();
+                    for &e in &target_edges {
+                        expanded.insert(e);
+                        if let Ok(tangents) = store.find_tangent_edges(src, e, 0.087) {
+                            for t in tangents {
+                                expanded.insert(t);
+                            }
+                        }
+                    }
+                    expanded.into_iter().collect::<Vec<_>>()
+                } else {
+                    target_edges
+                };
+
+                if let Some(r_end_param) = radius_end {
+                    let r2 = r_end_param.evaluate(params)?;
+                    if final_edges.is_empty() {
+                        return Err(CoreError::Geometry(GeometryError::InvalidParameter {
+                            name: "Fillet".to_string(),
+                            reason: "可変フィレットには対象辺の指定が必要です".to_string(),
+                        }));
+                    }
+                    Ok(store.fillet_variable_edges(src, &final_edges, Length::mm(r), Length::mm(r2))?)
+                } else if final_edges.is_empty() {
                     Ok(store.fillet_all(src, Length::mm(r))?)
                 } else {
-                    Ok(store.fillet_edges(src, edge_indices, Length::mm(r))?)
+                    Ok(store.fillet_edges(src, &final_edges, Length::mm(r))?)
                 }
             }
             FeatureKind::Chamfer {
@@ -3557,6 +4078,8 @@ mod tests {
                         radius: ScalarParam::mm(1.0),
                         edge_indices: vec![any_edge],
                         semantic_refs: vec![good_ref],
+                        radius_end: None,
+                        propagate_tangent: false,
                     },
                     visible: true,
                     color_rgba: [1.0, 1.0, 1.0, 1.0],
@@ -4544,5 +5067,205 @@ mod tests {
         assert!(doc.recompute(&mut store, TessellationOptions::default()).unwrap().is_all_clean());
         let rib_shape = doc.features[&rib].cached_shape.unwrap();
         assert!(store.volume(rib_shape).unwrap() > 2000.0);
+    }
+
+    #[test]
+    fn hole_feature_on_face_with_specifications() {
+        let mut store = ShapeStore::new();
+        let mut doc = Document::new("Hole Specifications");
+        let b = doc.add_feature("Base", FeatureKind::Box {
+            width: ScalarParam::mm(60.0),
+            height: ScalarParam::mm(60.0),
+            depth: ScalarParam::mm(20.0),
+        }, true, [1.0; 4]).unwrap();
+        assert!(doc.recompute(&mut store, TessellationOptions::default()).unwrap().is_all_clean());
+
+        let base_shape = doc.features[&b].cached_shape.unwrap();
+        let init_vol = store.volume(base_shape).unwrap();
+        // 60 * 60 * 20 = 72000
+        assert!((init_vol - 72000.0).abs() < 1e-1);
+
+        let faces = store.inspect_shape(base_shape).unwrap().faces;
+        let top_face = faces.iter().find(|f| (f.normal.z - 1.0).abs() < 1e-3).expect("top face");
+        let face_ref = SemanticReference::from_face(b, &store, base_shape, top_face.index).expect("top face ref");
+
+        // 1. Through-all Simple Hole (r=5.0) on face
+        let h1 = doc.add_feature("ThroughHole", FeatureKind::Hole {
+            input: b,
+            plane: SketchPlane::Face { feature: b, face: face_ref.clone() },
+            center_x: ScalarParam::mm(15.0),
+            center_y: ScalarParam::mm(15.0),
+            radius: ScalarParam::mm(5.0),
+            depth: ScalarParam::mm(20.0),
+            through_all: true,
+            hole_type: HoleType::Simple,
+            tip_angle_deg: None,
+        }, true, [1.0; 4]).unwrap();
+
+        // 2. Counterbore Blind Hole (r=3.0, d=15.0, bore_r=6.0, bore_d=5.0)
+        let h2 = doc.add_feature("CounterboreHole", FeatureKind::Hole {
+            input: h1,
+            plane: SketchPlane::Face { feature: b, face: face_ref.clone() },
+            center_x: ScalarParam::mm(45.0),
+            center_y: ScalarParam::mm(15.0),
+            radius: ScalarParam::mm(3.0),
+            depth: ScalarParam::mm(15.0),
+            through_all: false,
+            hole_type: HoleType::Counterbore {
+                bore_radius: ScalarParam::mm(6.0),
+                bore_depth: ScalarParam::mm(5.0),
+            },
+            tip_angle_deg: None,
+        }, true, [1.0; 4]).unwrap();
+
+        // 3. Countersink Blind Hole with 118° drill tip
+        let h3 = doc.add_feature("CountersinkHole", FeatureKind::Hole {
+            input: h2,
+            plane: SketchPlane::Face { feature: b, face: face_ref.clone() },
+            center_x: ScalarParam::mm(45.0),
+            center_y: ScalarParam::mm(45.0),
+            radius: ScalarParam::mm(3.0),
+            depth: ScalarParam::mm(12.0),
+            through_all: false,
+            hole_type: HoleType::Countersink {
+                sink_radius: ScalarParam::mm(5.0),
+                sink_depth: ScalarParam::mm(3.0),
+            },
+            tip_angle_deg: Some(ScalarParam::Literal(118.0)),
+        }, true, [1.0; 4]).unwrap();
+
+        // 4. Tap Hole (M6: thread_r=3.0, tap_drill_r=2.5, thread_d=10.0, d=16.0)
+        let h4 = doc.add_feature("TapHole", FeatureKind::Hole {
+            input: h3,
+            plane: SketchPlane::Face { feature: b, face: face_ref },
+            center_x: ScalarParam::mm(15.0),
+            center_y: ScalarParam::mm(45.0),
+            radius: ScalarParam::mm(2.5),
+            depth: ScalarParam::mm(16.0),
+            through_all: false,
+            hole_type: HoleType::Tap {
+                thread_radius: ScalarParam::mm(3.0),
+                tap_drill_radius: ScalarParam::mm(2.5),
+                thread_depth: ScalarParam::mm(10.0),
+            },
+            tip_angle_deg: Some(ScalarParam::Literal(118.0)),
+        }, true, [1.0; 4]).unwrap();
+
+        assert!(doc.recompute(&mut store, TessellationOptions::default()).unwrap().is_all_clean());
+
+        let final_shape = doc.features[&h4].cached_shape.unwrap();
+        let final_vol = store.volume(final_shape).unwrap();
+        // Each hole reduces volume significantly
+        assert!(final_vol < init_vol - 2500.0, "final vol was {final_vol}, initial was {init_vol}");
+
+        // Modify upstream Box height to 30.0: holes should follow the moving top face
+        doc.update_feature(b, None, Some(FeatureKind::Box {
+            width: ScalarParam::mm(60.0),
+            height: ScalarParam::mm(60.0),
+            depth: ScalarParam::mm(30.0),
+        }), None, None).unwrap();
+        assert!(doc.recompute(&mut store, TessellationOptions::default()).unwrap().is_all_clean());
+        let resized_shape = doc.features[&h4].cached_shape.unwrap();
+        let resized_vol = store.volume(resized_shape).unwrap();
+        // Base is now 60*60*30 = 108000. Through hole now cuts through 30mm thickness.
+        assert!(resized_vol > final_vol + 30000.0, "resized vol was {resized_vol}");
+    }
+
+    #[test]
+    fn pattern_on_reference_edge_and_cylinder_axis() {
+        let mut store = ShapeStore::new();
+        let mut doc = Document::new("Pattern on Reference");
+
+        // 1. Base Box 100 x 50 x 20
+        let b = doc.add_feature("Base", FeatureKind::Box {
+            width: ScalarParam::mm(100.0),
+            height: ScalarParam::mm(50.0),
+            depth: ScalarParam::mm(20.0),
+        }, true, [1.0; 4]).unwrap();
+        assert!(doc.recompute(&mut store, TessellationOptions::default()).unwrap().is_all_clean());
+
+        let base_shape = doc.features[&b].cached_shape.unwrap();
+        let edges = store.inspect_shape(base_shape).unwrap().edges;
+        // Find an edge parallel to X-axis (length 100)
+        let x_edge = edges.iter().find(|e| (e.length_mm - 100.0).abs() < 1e-3).expect("x edge");
+        let edge_ref = SemanticReference::from_edge(b, &store, base_shape, x_edge.index).expect("edge ref");
+
+        // 2. Through-hole near the start (x=15, y=25)
+        let faces = store.inspect_shape(base_shape).unwrap().faces;
+        let top_face = faces.iter().find(|f| (f.normal.z - 1.0).abs() < 1e-3).expect("top face");
+        let face_ref = SemanticReference::from_face(b, &store, base_shape, top_face.index).expect("top face ref");
+
+        let h = doc.add_feature("Hole", FeatureKind::Hole {
+            input: b,
+            plane: SketchPlane::Face { feature: b, face: face_ref.clone() },
+            center_x: ScalarParam::mm(15.0),
+            center_y: ScalarParam::mm(25.0),
+            radius: ScalarParam::mm(4.0),
+            depth: ScalarParam::mm(20.0),
+            through_all: true,
+            hole_type: HoleType::Simple,
+            tip_angle_deg: None,
+        }, true, [1.0; 4]).unwrap();
+
+        // 3. Linear pattern along the referenced Edge: 4 holes with spacing 20mm
+        let pat_lin = doc.add_feature("LinearPat", FeatureKind::PatternOnReference {
+            input: h,
+            reference: ReferenceAxis::Edge { feature: b, edge: edge_ref },
+            layout: PatternReferenceLayout::Linear {
+                spacing: ScalarParam::mm(20.0),
+                count: 4,
+            },
+            tool_only: true,
+        }, true, [1.0; 4]).unwrap();
+
+        assert!(doc.recompute(&mut store, TessellationOptions::default()).unwrap().is_all_clean());
+        let pat_shape = doc.features[&pat_lin].cached_shape.unwrap();
+        let pat_vol = store.volume(pat_shape).unwrap();
+        // Base is 100000. 4 through-holes of r=4, depth=20 cut ~4 * pi * 16 * 20 ~= 4021 mm3
+        assert!(pat_vol < 100000.0 - 3500.0, "pat_vol was {pat_vol}");
+
+        // 4. Cylinder face as a rotation axis reference
+        let cyl = doc.add_feature("CenterBoss", FeatureKind::Cylinder {
+            radius: ScalarParam::mm(10.0),
+            height: ScalarParam::mm(30.0),
+        }, true, [1.0; 4]).unwrap();
+        assert!(doc.recompute(&mut store, TessellationOptions::default()).unwrap().is_all_clean());
+
+        let cyl_shape = doc.features[&cyl].cached_shape.unwrap();
+        let cyl_faces = store.inspect_shape(cyl_shape).unwrap().faces;
+        let cyl_face = cyl_faces.iter().find(|f| f.normal.z.abs() < 1e-3).expect("cyl face");
+        let cyl_face_ref = SemanticReference::from_face(cyl, &store, cyl_shape, cyl_face.index).expect("cyl face ref");
+
+        // Tool pin to rotate: Small cylinder offset at x=20
+        let pin = doc.add_feature("Pin", FeatureKind::Cylinder {
+            radius: ScalarParam::mm(2.0),
+            height: ScalarParam::mm(10.0),
+        }, true, [1.0; 4]).unwrap();
+        let pin_moved = doc.add_feature("PinMoved", FeatureKind::Transform {
+            input: pin,
+            dx: ScalarParam::mm(20.0),
+            dy: ScalarParam::mm(0.0),
+            dz: ScalarParam::mm(0.0),
+            rot_origin: [0.0; 3],
+            rot_axis: [0.0, 0.0, 1.0],
+            rot_angle_deg: ScalarParam::Literal(0.0),
+        }, true, [1.0; 4]).unwrap();
+
+        // Circular pattern on cylinder face axis: 6 pins around the boss
+        let pat_circ = doc.add_feature("CircularPat", FeatureKind::PatternOnReference {
+            input: pin_moved,
+            reference: ReferenceAxis::Face { feature: cyl, face: cyl_face_ref },
+            layout: PatternReferenceLayout::Circular {
+                count: 6,
+                total_angle_deg: ScalarParam::Literal(360.0),
+            },
+            tool_only: false,
+        }, true, [1.0; 4]).unwrap();
+
+        assert!(doc.recompute(&mut store, TessellationOptions::default()).unwrap().is_all_clean());
+        let circ_shape = doc.features[&pat_circ].cached_shape.unwrap();
+        let circ_vol = store.volume(circ_shape).unwrap();
+        // 6 pins of r=2, h=10: 6 * pi * 4 * 10 ~= 753.98 mm3
+        assert!((circ_vol - 753.98).abs() < 5.0, "circ_vol was {circ_vol}");
     }
 }

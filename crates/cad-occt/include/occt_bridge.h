@@ -22,6 +22,7 @@ struct RawBBox;
 struct RawTopoCounts;
 struct RawFaceInfo;
 struct RawEdgeInfo;
+struct RawAxisInfo;
 struct RawMeshResult;
 
 std::unique_ptr<OcctShapeHandle> clone_shape(const OcctShapeHandle& handle);
@@ -115,6 +116,17 @@ std::unique_ptr<OcctShapeHandle> fillet_selected_edges(
     rust::Slice<const uint32_t> edge_indices,
     double radius
 );
+std::unique_ptr<OcctShapeHandle> fillet_variable_edges(
+    const OcctShapeHandle& handle,
+    rust::Slice<const uint32_t> edge_indices,
+    double radius_start,
+    double radius_end
+);
+rust::Vec<uint32_t> find_tangent_edges(
+    const OcctShapeHandle& handle,
+    uint32_t edge_index,
+    double angular_tolerance_rad
+);
 std::unique_ptr<OcctShapeHandle> chamfer_all_edges(
     const OcctShapeHandle& handle,
     double distance
@@ -160,6 +172,8 @@ std::unique_ptr<OcctShapeHandle> sew_shape(const OcctShapeHandle& handle, double
 RawTopoCounts get_topology_counts(const OcctShapeHandle& handle);
 rust::Vec<RawFaceInfo> inspect_faces(const OcctShapeHandle& handle);
 rust::Vec<RawEdgeInfo> inspect_edges(const OcctShapeHandle& handle);
+RawAxisInfo inspect_face_axis(const OcctShapeHandle& handle, uint32_t face_index);
+RawAxisInfo inspect_edge_axis(const OcctShapeHandle& handle, uint32_t edge_index);
 
 void write_step_file(const OcctShapeHandle& handle, rust::Str file_path);
 std::unique_ptr<OcctShapeHandle> read_step_file(rust::Str file_path);

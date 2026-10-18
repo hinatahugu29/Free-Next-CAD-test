@@ -52,6 +52,16 @@ mod ffi {
         pub cz: f64,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct RawAxisInfo {
+        pub ox: f64,
+        pub oy: f64,
+        pub oz: f64,
+        pub dx: f64,
+        pub dy: f64,
+        pub dz: f64,
+    }
+
     #[derive(Debug, Clone, Default)]
     pub struct RawMeshResult {
         pub positions: Vec<f32>,
@@ -152,6 +162,17 @@ mod ffi {
             edge_indices: &[u32],
             radius: f64,
         ) -> Result<UniquePtr<OcctShapeHandle>>;
+        fn fillet_variable_edges(
+            handle: &OcctShapeHandle,
+            edge_indices: &[u32],
+            radius_start: f64,
+            radius_end: f64,
+        ) -> Result<UniquePtr<OcctShapeHandle>>;
+        fn find_tangent_edges(
+            handle: &OcctShapeHandle,
+            edge_index: u32,
+            angular_tolerance_rad: f64,
+        ) -> Vec<u32>;
         fn chamfer_all_edges(
             handle: &OcctShapeHandle,
             distance: f64,
@@ -184,6 +205,8 @@ mod ffi {
         fn get_topology_counts(handle: &OcctShapeHandle) -> Result<RawTopoCounts>;
         fn inspect_faces(handle: &OcctShapeHandle) -> Result<Vec<RawFaceInfo>>;
         fn inspect_edges(handle: &OcctShapeHandle) -> Result<Vec<RawEdgeInfo>>;
+        fn inspect_face_axis(handle: &OcctShapeHandle, face_index: u32) -> Result<RawAxisInfo>;
+        fn inspect_edge_axis(handle: &OcctShapeHandle, edge_index: u32) -> Result<RawAxisInfo>;
 
         fn write_step_file(handle: &OcctShapeHandle, file_path: &str) -> Result<()>;
         fn read_step_file(file_path: &str) -> Result<UniquePtr<OcctShapeHandle>>;
@@ -196,7 +219,7 @@ mod ffi {
     }
 }
 
-pub use ffi::{RawBBox, RawEdgeInfo, RawFaceInfo, RawMeshResult, RawTopoCounts};
+pub use ffi::{RawAxisInfo, RawBBox, RawEdgeInfo, RawFaceInfo, RawMeshResult, RawTopoCounts};
 
 /// Error type returned by OCCT FFI operations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Error)]
@@ -394,6 +417,26 @@ impl OcctShape {
         )?)
     }
 
+    /// Fillets specific edges with variable radius from `radius_start` to `radius_end`.
+    pub fn fillet_variable_edges(
+        &self,
+        edge_indices: &[u32],
+        radius_start: f64,
+        radius_end: f64,
+    ) -> Result<Self, OcctError> {
+        Self::from_ptr(ffi::fillet_variable_edges(
+            self.as_ref()?,
+            edge_indices,
+            radius_start,
+            radius_end,
+        )?)
+    }
+
+    /// Finds all edges tangentially connected to `edge_index`.
+    pub fn find_tangent_edges(&self, edge_index: u32, angular_tolerance_rad: f64) -> Result<Vec<u32>, OcctError> {
+        Ok(ffi::find_tangent_edges(self.as_ref()?, edge_index, angular_tolerance_rad))
+    }
+
     /// Chamfers all edges of the shape with symmetric `distance`.
     pub fn chamfer_all_edges(&self, distance: f64) -> Result<Self, OcctError> {
         Self::from_ptr(ffi::chamfer_all_edges(self.as_ref()?, distance)?)
@@ -500,6 +543,16 @@ impl OcctShape {
     /// Returns geometric descriptors for each edge (length, centroid).
     pub fn inspect_edges(&self) -> Result<Vec<RawEdgeInfo>, OcctError> {
         Ok(ffi::inspect_edges(self.as_ref()?)?)
+    }
+
+    /// Extracts the natural geometric axis (origin and unit direction) of a face (e.g. cylinder/cone axis or plane normal).
+    pub fn inspect_face_axis(&self, face_index: u32) -> Result<RawAxisInfo, OcctError> {
+        Ok(ffi::inspect_face_axis(self.as_ref()?, face_index)?)
+    }
+
+    /// Extracts the natural geometric axis (origin and unit direction) of an edge (e.g. line direction or circle axis).
+    pub fn inspect_edge_axis(&self, edge_index: u32) -> Result<RawAxisInfo, OcctError> {
+        Ok(ffi::inspect_edge_axis(self.as_ref()?, edge_index)?)
     }
 
     /// Exports the shape to a STEP (`.step` / `.stp`) file.
@@ -673,6 +726,47 @@ mod tests {
         let hollow = base.thick_solid(&[0], 2.0).expect("thick solid");
         assert!(hollow.is_valid().expect("hollow valid"));
         assert!(hollow.volume().expect("hollow volume") < 27000.0);
+    }
+
+    #[test]
+    fn geometric_axis_inspection() {
+        let cyl = OcctShape::make_cylinder(5.0, 20.0).expect("cyl");
+        let faces = cyl.inspect_faces().expect("inspect faces");
+        let mut found_cyl = false;
+        for f in &faces {
+            let axis = cyl.inspect_face_axis(f.index).expect("axis");
+            if axis.dx.abs() < 1e-3 && axis.dy.abs() < 1e-3 && (axis.dz.abs() - 1.0).abs() < 1e-3 {
+                found_cyl = true;
+            }
+        }
+        assert!(found_cyl, "should find cylindrical face axis");
+
+        let b = OcctShape::make_box(10.0, 20.0, 30.0).expect("box");
+        let edges = b.inspect_edges().expect("inspect edges");
+        let mut found_z_edge = false;
+        for e in &edges {
+            let axis = b.inspect_edge_axis(e.index).expect("edge axis");
+            if axis.dx.abs() < 1e-3 && axis.dy.abs() < 1e-3 && (axis.dz.abs() - 1.0).abs() < 1e-3 {
+                found_z_edge = true;
+            }
+        }
+        assert!(found_z_edge, "should find Z-aligned edge axis");
+    }
+
+    #[test]
+    fn edge_blend_variable_radius_and_tangent_chain() {
+        let b = OcctShape::make_box(20.0, 20.0, 20.0).expect("box");
+        let edges = b.inspect_edges().expect("edges");
+        // Fillet an edge with variable radius 1.0 -> 4.0
+        let blended = b.fillet_variable_edges(&[edges[0].index], 1.0, 4.0).expect("variable fillet");
+        assert!(blended.is_valid().expect("valid"));
+        let vol = blended.volume().expect("volume");
+        // 20^3 = 8000. Fillet cuts volume.
+        assert!(vol < 8000.0 && vol > 7900.0);
+
+        // Find tangent edges on the box (edges meet at 90 deg, so none are tangent within 5 deg)
+        let tangents = b.find_tangent_edges(edges[0].index, 0.087).expect("tangents");
+        assert_eq!(tangents.len(), 1); // Only the seed edge itself
     }
 }
 
