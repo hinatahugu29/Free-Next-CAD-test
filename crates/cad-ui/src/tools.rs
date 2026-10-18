@@ -45,6 +45,13 @@ impl FerroCadApp {
         };
         self.floating_editor_pos = None;
         self.tool_panel = Some(match kind {
+            ToolKind::Transform => ToolPanel::Transform {
+                input,
+                insert_after: None,
+                translation: [0.0; 3],
+                rotation_axis: 2,
+                rotation_angle_deg: 0.0,
+            },
             ToolKind::CircularPattern => {
                 // A ring of holes usually goes around the centre of the body they cut.
                 let center = self
@@ -87,11 +94,25 @@ impl FerroCadApp {
         });
     }
 
+    /// Opens a transform for the Boolean's tool (secondary input), not for the Boolean
+    /// result. The confirm path inserts it after the tool so the Boolean is retargeted.
+    pub(crate) fn open_boolean_tool_transform(&mut self, _boolean: FeatureId, tool: FeatureId) {
+        self.floating_editor_pos = None;
+        self.tool_panel = Some(ToolPanel::Transform {
+            input: tool,
+            insert_after: Some(tool),
+            translation: [0.0; 3],
+            rotation_axis: 2,
+            rotation_angle_deg: 0.0,
+        });
+    }
+
     pub(crate) fn render_tool_panel(&mut self, ctx: &Context) {
         let Some(mut panel) = self.tool_panel.clone() else {
             return;
         };
         let title = match panel {
+            ToolPanel::Transform { .. } => "↔ 移動・回転",
             ToolPanel::CircularPattern { .. } => "⟲ 円形パターン",
             ToolPanel::LinearPattern { .. } => "… 直線パターン",
             ToolPanel::Mirror { .. } => "∥ ミラー",
@@ -115,6 +136,36 @@ impl FerroCadApp {
             .show(ctx, |ui| {
                 ui.set_min_width(300.0);
                 match &mut panel {
+                    ToolPanel::Transform {
+                        input,
+                        translation,
+                        rotation_axis,
+                        rotation_angle_deg,
+                        ..
+                    } => {
+                        ui.label(format!("対象: 「{}」", self.feature_name(*input)));
+                        ui.strong("移動量:");
+                        ui.horizontal(|ui| {
+                            ui.add(egui::DragValue::new(&mut translation[0]).speed(0.5).prefix("X: ").suffix(" mm"));
+                            ui.add(egui::DragValue::new(&mut translation[1]).speed(0.5).prefix("Y: ").suffix(" mm"));
+                            ui.add(egui::DragValue::new(&mut translation[2]).speed(0.5).prefix("Z: ").suffix(" mm"));
+                        });
+                        ui.horizontal(|ui| {
+                            if ui.small_button("原点に戻す").clicked() {
+                                *translation = [0.0; 3];
+                            }
+                        });
+                        ui.separator();
+                        ui.strong("回転（任意）:");
+                        ui.horizontal(|ui| {
+                            ui.label("軸:");
+                            for (i, (label, _)) in AXES.iter().enumerate() {
+                                ui.selectable_value(rotation_axis, i, *label);
+                            }
+                            ui.add(egui::DragValue::new(rotation_angle_deg).speed(1.0).suffix("°"));
+                        });
+                        ui.small("回転は形状の中心を通る軸を基準にします");
+                    }
                     ToolPanel::CircularPattern {
                         input,
                         axis,
@@ -312,6 +363,38 @@ impl FerroCadApp {
     pub(crate) fn confirm_tool(&mut self, panel: ToolPanel) {
         let n = self.controller.document.features.len() + 1;
         match panel {
+            ToolPanel::Transform {
+                input,
+                insert_after,
+                translation,
+                rotation_axis,
+                rotation_angle_deg,
+            } => {
+                let center = self.bbox_center(input).unwrap_or([0.0; 3]);
+                let kind = FeatureKind::Transform {
+                    input,
+                    dx: ScalarParam::Literal(translation[0]),
+                    dy: ScalarParam::Literal(translation[1]),
+                    dz: ScalarParam::Literal(translation[2]),
+                    rot_origin: center,
+                    rot_axis: AXES[rotation_axis].1,
+                    rot_angle_deg: ScalarParam::Literal(rotation_angle_deg),
+                };
+                if let Some(marker) = insert_after {
+                    // `add_feature` already knows how to insert after a rollback marker
+                    // and retarget later uses of its input (including the Boolean tool).
+                    self.set_rollback(Some(marker));
+                    self.execute_cmd(CadCommand::AddFeature {
+                        name: format!("ToolTransform_{n}"),
+                        kind,
+                        visible: false,
+                        color_rgba: self.controller.document.features[&input].color_rgba,
+                    });
+                    self.set_rollback(None);
+                } else {
+                    self.add_replacing(format!("Transform_{n}"), kind, input, &[input]);
+                }
+            }
             ToolPanel::CircularPattern {
                 input,
                 axis,

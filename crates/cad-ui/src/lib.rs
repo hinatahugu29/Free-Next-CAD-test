@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use cad_core::{
     CadCommand, CoreError, Document, DocumentController, ExtrudeMode, FeatureId, FeatureKind,
-    FeatureState, ParameterValue, PlaneFrame, ScalarParam, SemanticReference, Sketch, SketchPlane,
+    FeatureState, ParameterValue, PatternLayout, PlaneFrame, ScalarParam, SemanticReference, Sketch, SketchPlane,
     build_perforated_plate_mvp,
 };
 use cad_geometry::{ShapeStore, TessellationOptions};
@@ -104,6 +104,54 @@ fn ribbon_group(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut e
     ui.separator();
 }
 
+/// Named, user-facing scalar inputs of a feature. This is deliberately separate from
+/// `referenced_parameters`: the UI needs to explain *which dimension* uses a name.
+fn feature_parameter_slots(kind: &FeatureKind) -> Vec<(&'static str, &ScalarParam)> {
+    match kind {
+        FeatureKind::Box { width, height, depth } => {
+            vec![("幅", width), ("高さ", height), ("厚み", depth)]
+        }
+        FeatureKind::Cylinder { radius, height } => vec![("半径", radius), ("高さ", height)],
+        FeatureKind::Sphere { radius } => vec![("半径", radius)],
+        FeatureKind::Cone { bottom_radius, top_radius, height } => {
+            vec![("底面半径", bottom_radius), ("上面半径", top_radius), ("高さ", height)]
+        }
+        FeatureKind::SketchExtrude { depth, .. } | FeatureKind::ExtrudePolygon { depth, .. } => {
+            vec![("押し出し量", depth)]
+        }
+        FeatureKind::SketchRevolve { angle_deg, .. } | FeatureKind::RevolvePolygon { angle_deg, .. } => {
+            vec![("回転角", angle_deg)]
+        }
+        FeatureKind::ExtrudeCircle { radius, depth } => vec![("半径", radius), ("押し出し量", depth)],
+        FeatureKind::Transform { dx, dy, dz, rot_angle_deg, .. } => vec![
+            ("移動 X", dx),
+            ("移動 Y", dy),
+            ("移動 Z", dz),
+            ("回転角", rot_angle_deg),
+        ],
+        FeatureKind::Fillet { radius, .. } => vec![("フィレット半径", radius)],
+        FeatureKind::Chamfer { distance, .. } => vec![("面取り距離", distance)],
+        FeatureKind::LinearPattern { spacing_x, spacing_y, spacing_z, .. } => {
+            vec![("ピッチ X", spacing_x), ("ピッチ Y", spacing_y), ("ピッチ Z", spacing_z)]
+        }
+        FeatureKind::Pattern { layout, .. } => match layout {
+            PatternLayout::Circular { total_angle_deg, .. } => vec![("全体の角度", total_angle_deg)],
+            PatternLayout::Linear { spacing, .. } => vec![("間隔", spacing)],
+        },
+        FeatureKind::Shell { thickness, .. } => vec![("壁の厚さ", thickness)],
+        FeatureKind::Mirror { .. }
+        | FeatureKind::Boolean { .. }
+        | FeatureKind::ImportedBody { .. } => Vec::new(),
+    }
+}
+
+fn scalar_expression(param: &ScalarParam) -> Option<&str> {
+    match param {
+        ScalarParam::Expr(expr) => Some(expr),
+        ScalarParam::Literal(_) => None,
+    }
+}
+
 /// Main GUI application state for FerroCAD.
 pub struct FerroCadApp {
     pub controller: DocumentController,
@@ -120,6 +168,8 @@ pub struct FerroCadApp {
     pub status_logs: Vec<String>,
     pub new_param_name: String,
     pub new_param_expr: String,
+    pub new_param_unit: String,
+    pub new_param_description: String,
     pub current_file_path: Option<PathBuf>,
     /// Screen position where the floating on-canvas property editor should appear
     /// (set by double-clicking a face/edge directly in the 3D viewport).
@@ -189,6 +239,7 @@ pub struct FerroCadApp {
 /// Which modify tool a ribbon button opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolKind {
+    Transform,
     CircularPattern,
     LinearPattern,
     Mirror,
@@ -207,6 +258,15 @@ pub enum SketchStart {
 /// State of an open modify-tool panel.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToolPanel {
+    Transform {
+        input: FeatureId,
+        /// When set, the transform is inserted immediately after this feature so an
+        /// existing Boolean can keep using the moved tool instead of moving its result.
+        insert_after: Option<FeatureId>,
+        translation: [f64; 3],
+        rotation_axis: usize,
+        rotation_angle_deg: f64,
+    },
     CircularPattern {
         input: FeatureId,
         axis: usize,
@@ -335,6 +395,8 @@ impl FerroCadApp {
             status_logs: logs,
             new_param_name: String::new(),
             new_param_expr: String::new(),
+            new_param_unit: "mm".to_string(),
+            new_param_description: String::new(),
             current_file_path: None,
             floating_editor_pos: None,
             sketch_mode: false,
@@ -739,6 +801,8 @@ impl FerroCadApp {
             Ok((_, e)) => format!("選択中の{}本の辺にまとめて適用します", e.len()),
             Err(reason) => reason.to_string(),
         };
+        let feature_selected = self.render_config.selected_feature.is_some();
+        let need = "先にタイムラインか3Dビューで対象を選択してください";
         ui.horizontal(|ui| match self.ribbon_tab {
             RibbonTab::Solid => {
                 ribbon_group(ui, "スケッチ", |ui| {
@@ -796,6 +860,9 @@ impl FerroCadApp {
                     }
                 });
                 ribbon_group(ui, "修正", |ui| {
+                    if ribbon_button(ui, "↔", "移動", feature_selected, if feature_selected { "選択中の形状を XYZ 方向へ移動・回転します" } else { need }) {
+                        self.open_tool_panel(ToolKind::Transform);
+                    }
                     if ribbon_button(ui, "⌒", "フィレット", edge_selected, &edge_hint) {
                         self.add_edge_modifier_on_selection(false);
                     }
@@ -817,8 +884,6 @@ impl FerroCadApp {
                         self.open_tool_panel(ToolKind::Shell);
                     }
                 });
-                let feature_selected = self.render_config.selected_feature.is_some();
-                let need = "先にタイムラインか3Dビューで対象を選択してください";
                 ribbon_group(ui, "パターン・組み合わせ", |ui| {
                     if ribbon_button(ui, "⟲", "円形", feature_selected, if feature_selected { "選択中の形状（穴なら穴）を円周上に並べます" } else { need }) {
                         self.open_tool_panel(ToolKind::CircularPattern);
@@ -1121,8 +1186,50 @@ impl FerroCadApp {
             .values()
             .cloned()
             .collect();
+        let parameter_uses: std::collections::BTreeMap<String, Vec<String>> = self
+            .controller
+            .document
+            .features
+            .values()
+            .flat_map(|feature| {
+                feature_parameter_slots(&feature.kind)
+                    .into_iter()
+                    .flat_map(move |(label, scalar)| {
+                        scalar_expression(scalar)
+                            .into_iter()
+                            .flat_map(move |expr| {
+                                scalar
+                                    .referenced_parameters()
+                                    .into_iter()
+                                    .map(move |name| {
+                                        (name, format!("{} → {}（{}）", feature.name, label, expr))
+                                    })
+                            })
+                    })
+            })
+            .fold(std::collections::BTreeMap::new(), |mut uses, (name, slot)| {
+                uses.entry(name).or_default().push(slot);
+                uses
+            });
+        let parameter_dependents: std::collections::BTreeMap<String, Vec<String>> = self
+            .controller
+            .document
+            .parameters
+            .values()
+            .flat_map(|parameter| {
+                parameter
+                    .value
+                    .referenced_parameters()
+                    .into_iter()
+                    .map(move |name| (name, parameter.name.clone()))
+            })
+            .fold(std::collections::BTreeMap::new(), |mut dependents, (name, dependent)| {
+                dependents.entry(name).or_default().push(dependent);
+                dependents
+            });
 
         let mut pending_param_cmd: Option<CadCommand> = None;
+        let mut remove_parameter: Option<String> = None;
 
         egui::Grid::new("param_grid")
             .striped(true)
@@ -1130,11 +1237,28 @@ impl FerroCadApp {
             .show(ui, |ui| {
                 ui.strong("名前");
                 ui.strong("値 / 数式");
-                ui.strong("評価値");
+                ui.strong("評価値 / 使用先");
                 ui.end_row();
 
                 for p in params_snapshot {
-                    ui.label(&p.name).on_hover_text(&p.description);
+                    let feature_uses = parameter_uses.get(&p.name).cloned().unwrap_or_default();
+                    let expression_dependents = parameter_dependents.get(&p.name).cloned().unwrap_or_default();
+                    let can_remove = feature_uses.is_empty() && expression_dependents.is_empty();
+                    ui.horizontal(|ui| {
+                        ui.label(&p.name).on_hover_text(&p.description);
+                        let hint = if can_remove {
+                            "この未使用パラメータを削除します"
+                        } else {
+                            "使用中のため削除できません。使用しているフィーチャーや数式を先に変更してください"
+                        };
+                        if ui
+                            .add_enabled(can_remove, egui::Button::new("×").small())
+                            .on_hover_text(hint)
+                            .clicked()
+                        {
+                            remove_parameter = Some(p.name.clone());
+                        }
+                    });
                     match p.value {
                         ParameterValue::Number(mut val) => {
                             if ui
@@ -1166,13 +1290,25 @@ impl FerroCadApp {
                         }
                     }
                     let eval_val = resolved.get(&p.name).copied().unwrap_or(f64::NAN);
-                    ui.label(format!("{eval_val:.2} {}", p.unit));
+                    ui.vertical(|ui| {
+                        ui.label(format!("{eval_val:.2} {}", p.unit));
+                        match parameter_uses.get(&p.name) {
+                            Some(slots) => ui.small(format!("使用先: {}", slots.join("、"))),
+                            None => ui.small("未使用"),
+                        };
+                        if let Some(dependents) = parameter_dependents.get(&p.name) {
+                            ui.small(format!("数式で使用: {}", dependents.join("、")));
+                        }
+                    });
                     ui.end_row();
                 }
             });
 
         if let Some(cmd) = pending_param_cmd {
             self.execute_cmd(cmd);
+        }
+        if let Some(name) = remove_parameter {
+            self.execute_cmd(CadCommand::RemoveParameter { name });
         }
 
         ui.add_space(6.0);
@@ -1185,6 +1321,15 @@ impl FerroCadApp {
                 ui.label("値/式:");
                 ui.text_edit_singleline(&mut self.new_param_expr);
             });
+            ui.horizontal(|ui| {
+                ui.label("単位:");
+                ui.text_edit_singleline(&mut self.new_param_unit);
+            });
+            ui.horizontal(|ui| {
+                ui.label("説明:");
+                ui.text_edit_singleline(&mut self.new_param_description);
+            });
+            ui.small("例: plate_width / 100 / mm、または hole_offset / plate_width * 0.15 / mm");
             if ui.button("追加").clicked() && !self.new_param_name.trim().is_empty() {
                 let val = if let Ok(num) = self.new_param_expr.trim().parse::<f64>() {
                     ParameterValue::Number(num)
@@ -1194,11 +1339,21 @@ impl FerroCadApp {
                 self.execute_cmd(CadCommand::SetParameter {
                     name: self.new_param_name.trim().to_string(),
                     value: val,
-                    unit: "mm".to_string(),
-                    description: "ユーザー定義パラメータ".to_string(),
+                    unit: if self.new_param_unit.trim().is_empty() {
+                        "mm".to_string()
+                    } else {
+                        self.new_param_unit.trim().to_string()
+                    },
+                    description: if self.new_param_description.trim().is_empty() {
+                        "ユーザー定義パラメータ".to_string()
+                    } else {
+                        self.new_param_description.trim().to_string()
+                    },
                 });
                 self.new_param_name.clear();
                 self.new_param_expr.clear();
+                self.new_param_unit = "mm".to_string();
+                self.new_param_description.clear();
             }
         });
 
@@ -1516,9 +1671,19 @@ impl FerroCadApp {
 
         ui.separator();
         ui.strong("形状寸法・パラメータ編集:");
+        let bindings: Vec<_> = feature_parameter_slots(&feat.kind)
+            .into_iter()
+            .filter_map(|(label, scalar)| scalar_expression(scalar).map(|expr| format!("{label} = {expr}")))
+            .collect();
+        if bindings.is_empty() {
+            ui.small("数値欄の fx を押すと、パラメータ名や数式で寸法を指定できます");
+        } else {
+            ui.small(format!("このフィーチャーのパラメータ指定: {}", bindings.join(" / ")));
+        }
 
         let mut updated_kind = feat.kind.clone();
         let mut kind_changed = false;
+        let mut captured_parameter: Option<(String, f64)> = None;
 
         match &mut updated_kind {
             FeatureKind::Box {
@@ -1526,25 +1691,25 @@ impl FerroCadApp {
                 height,
                 depth,
             } => {
-                kind_changed |= edit_scalar_param(ui, "幅 (width)", width);
-                kind_changed |= edit_scalar_param(ui, "高さ (height)", height);
-                kind_changed |= edit_scalar_param(ui, "厚み (depth)", depth);
+                kind_changed |= edit_scalar_param_capture(ui, "幅 (width)", width, format!("f{}_width", feat.id.0), &mut captured_parameter);
+                kind_changed |= edit_scalar_param_capture(ui, "高さ (height)", height, format!("f{}_height", feat.id.0), &mut captured_parameter);
+                kind_changed |= edit_scalar_param_capture(ui, "厚み (depth)", depth, format!("f{}_depth", feat.id.0), &mut captured_parameter);
             }
             FeatureKind::Cylinder { radius, height } => {
-                kind_changed |= edit_scalar_param(ui, "半径 (radius)", radius);
-                kind_changed |= edit_scalar_param(ui, "高さ (height)", height);
+                kind_changed |= edit_scalar_param_capture(ui, "半径 (radius)", radius, format!("f{}_radius", feat.id.0), &mut captured_parameter);
+                kind_changed |= edit_scalar_param_capture(ui, "高さ (height)", height, format!("f{}_height", feat.id.0), &mut captured_parameter);
             }
             FeatureKind::Sphere { radius } => {
-                kind_changed |= edit_scalar_param(ui, "半径 (radius)", radius);
+                kind_changed |= edit_scalar_param_capture(ui, "半径 (radius)", radius, format!("f{}_radius", feat.id.0), &mut captured_parameter);
             }
             FeatureKind::Cone {
                 bottom_radius,
                 top_radius,
                 height,
             } => {
-                kind_changed |= edit_scalar_param(ui, "底面半径", bottom_radius);
-                kind_changed |= edit_scalar_param(ui, "上面半径", top_radius);
-                kind_changed |= edit_scalar_param(ui, "高さ", height);
+                kind_changed |= edit_scalar_param_capture(ui, "底面半径", bottom_radius, format!("f{}_bottom_radius", feat.id.0), &mut captured_parameter);
+                kind_changed |= edit_scalar_param_capture(ui, "上面半径", top_radius, format!("f{}_top_radius", feat.id.0), &mut captured_parameter);
+                kind_changed |= edit_scalar_param_capture(ui, "高さ", height, format!("f{}_height", feat.id.0), &mut captured_parameter);
             }
             FeatureKind::Transform {
                 dx,
@@ -1553,10 +1718,10 @@ impl FerroCadApp {
                 rot_angle_deg,
                 ..
             } => {
-                kind_changed |= edit_scalar_param(ui, "移動 X (dx)", dx);
-                kind_changed |= edit_scalar_param(ui, "移動 Y (dy)", dy);
-                kind_changed |= edit_scalar_param(ui, "移動 Z (dz)", dz);
-                kind_changed |= edit_scalar_param(ui, "回転角 (deg)", rot_angle_deg);
+                kind_changed |= edit_scalar_param_capture(ui, "移動 X (dx)", dx, format!("f{}_move_x", feat.id.0), &mut captured_parameter);
+                kind_changed |= edit_scalar_param_capture(ui, "移動 Y (dy)", dy, format!("f{}_move_y", feat.id.0), &mut captured_parameter);
+                kind_changed |= edit_scalar_param_capture(ui, "移動 Z (dz)", dz, format!("f{}_move_z", feat.id.0), &mut captured_parameter);
+                kind_changed |= edit_scalar_param_capture(ui, "回転角 (deg)", rot_angle_deg, format!("f{}_rotation_deg", feat.id.0), &mut captured_parameter);
             }
             FeatureKind::LinearPattern {
                 spacing_x,
@@ -1611,8 +1776,24 @@ impl FerroCadApp {
                     "対象1: Feature #{} / 対象2: Feature #{}",
                     primary.0, secondary.0
                 ));
+                if ui
+                    .button("対象2（相手ボディ）を移動")
+                    .on_hover_text("ブーリアン結果全体ではなく、相手ボディだけの移動を履歴へ差し込みます")
+                    .clicked()
+                {
+                    self.open_boolean_tool_transform(feat.id, *secondary);
+                }
             }
             _ => {}
+        }
+
+        if let Some((name, value)) = captured_parameter {
+            self.execute_cmd(CadCommand::SetParameter {
+                description: format!("{} の値を取り込んだパラメータ", feat.name),
+                name,
+                value: ParameterValue::Number(value),
+                unit: "mm".to_string(),
+            });
         }
 
         if kind_changed {
@@ -2105,8 +2286,91 @@ fn edit_scalar_param(ui: &mut egui::Ui, label: &str, param: &mut ScalarParam) ->
     edit_scalar_param_unit(ui, label, param, " mm")
 }
 
+/// Property-panel variant that can turn the current literal into a named document
+/// parameter in one click. `captured` is applied by the caller together with the
+/// feature update, keeping undo/recompute history coherent.
+fn edit_scalar_param_capture(
+    ui: &mut egui::Ui,
+    label: &str,
+    param: &mut ScalarParam,
+    parameter_name: String,
+    captured: &mut Option<(String, f64)>,
+) -> bool {
+    let mut changed = false;
+    let mut convert_to_expression = None;
+    let mut capture_value = None;
+    let mut revert_to_literal = None;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        match param {
+            ScalarParam::Literal(value) => {
+                changed |= ui
+                    .add(egui::DragValue::new(value).speed(0.5).suffix(" mm"))
+                    .changed();
+                if ui.small_button("fx").on_hover_text("数式入力へ切り替え").clicked() {
+                    convert_to_expression = Some(value.to_string());
+                }
+                if ui
+                    .small_button("＋変数")
+                    .on_hover_text("現在値でパラメータを作成し、この寸法にすぐ結び付けます")
+                    .clicked()
+                {
+                    capture_value = Some(*value);
+                }
+            }
+            ScalarParam::Expr(expr) => {
+                let collapse_id = ui.make_persistent_id(("collapse_formula", label));
+                let collapsed = ui.data(|data| data.get_temp::<bool>(collapse_id).unwrap_or(false));
+                if collapsed {
+                    if ui
+                        .small_button(format!("ƒx {expr}"))
+                        .on_hover_text("クリックして数式を編集します")
+                        .clicked()
+                    {
+                        ui.data_mut(|data| data.insert_temp(collapse_id, false));
+                    }
+                } else {
+                    let resp = ui.text_edit_singleline(expr).on_hover_text("例: plate_width * 0.15");
+                    // The editable feature clone is rebuilt every frame. Commit every edit so
+                    // partially typed expressions do not revert before they can be completed.
+                    changed |= resp.changed();
+                    let escape = resp.has_focus() && ui.input(|input| input.key_pressed(Key::Escape));
+                    if escape {
+                        // `fx` starts with the previous literal as its expression. Esc is
+                        // cancellation in that case, so restore the compact number widget.
+                        if let Ok(value) = expr.trim().parse::<f64>() {
+                            revert_to_literal = Some(value);
+                        } else {
+                            ui.data_mut(|data| data.insert_temp(collapse_id, true));
+                        }
+                        ui.memory_mut(|memory| memory.surrender_focus(resp.id));
+                    } else if ui.small_button("▴").on_hover_text("数式欄を畳む").clicked() {
+                        ui.data_mut(|data| data.insert_temp(collapse_id, true));
+                        ui.memory_mut(|memory| memory.surrender_focus(resp.id));
+                    }
+                }
+                ui.label("fx").on_hover_text("数式またはパラメータ名で駆動中");
+            }
+        }
+    });
+    if let Some(value) = revert_to_literal {
+        *param = ScalarParam::Literal(value);
+        changed = true;
+    } else if let Some(value) = capture_value {
+        *param = ScalarParam::Expr(parameter_name.clone());
+        *captured = Some((parameter_name, value));
+        changed = true;
+    } else if let Some(expr) = convert_to_expression {
+        *param = ScalarParam::Expr(expr);
+        changed = true;
+    }
+    changed
+}
+
 fn edit_scalar_param_unit(ui: &mut egui::Ui, label: &str, param: &mut ScalarParam, unit: &str) -> bool {
     let mut changed = false;
+    let mut convert_to_expression = None;
+    let mut revert_to_literal = None;
     ui.horizontal(|ui| {
         ui.label(label);
         match param {
@@ -2117,15 +2381,54 @@ fn edit_scalar_param_unit(ui: &mut egui::Ui, label: &str, param: &mut ScalarPara
                 {
                     changed = true;
                 }
+                if ui
+                    .small_button("fx")
+                    .on_hover_text("数値をパラメータ名または数式で指定する入力欄に切り替えます")
+                    .clicked()
+                {
+                    convert_to_expression = Some(val.to_string());
+                }
             }
             ScalarParam::Expr(expr) => {
-                let resp = ui.text_edit_singleline(expr);
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                    changed = true;
+                let collapse_id = ui.make_persistent_id(("collapse_formula", label));
+                let collapsed = ui.data(|data| data.get_temp::<bool>(collapse_id).unwrap_or(false));
+                if collapsed {
+                    if ui
+                        .small_button(format!("ƒx {expr}"))
+                        .on_hover_text("クリックして数式を編集します")
+                        .clicked()
+                    {
+                        ui.data_mut(|data| data.insert_temp(collapse_id, false));
+                    }
+                } else {
+                    let resp = ui
+                        .text_edit_singleline(expr)
+                        .on_hover_text("例: plate_width、plate_width * 0.15、offset_x + 10");
+                    changed |= resp.changed();
+                    let escape = resp.has_focus() && ui.input(|input| input.key_pressed(Key::Escape));
+                    if escape {
+                        if let Ok(value) = expr.trim().parse::<f64>() {
+                            revert_to_literal = Some(value);
+                        } else {
+                            ui.data_mut(|data| data.insert_temp(collapse_id, true));
+                        }
+                        ui.memory_mut(|memory| memory.surrender_focus(resp.id));
+                    } else if ui.small_button("▴").on_hover_text("数式欄を畳む").clicked() {
+                        ui.data_mut(|data| data.insert_temp(collapse_id, true));
+                        ui.memory_mut(|memory| memory.surrender_focus(resp.id));
+                    }
                 }
+                ui.label("fx").on_hover_text("数式またはパラメータ名で駆動中");
             }
         }
     });
+    if let Some(value) = revert_to_literal {
+        *param = ScalarParam::Literal(value);
+        changed = true;
+    } else if let Some(expr) = convert_to_expression {
+        *param = ScalarParam::Expr(expr);
+        changed = true;
+    }
     changed
 }
 
@@ -2371,6 +2674,83 @@ mod tests {
             .volume_mm3;
         let expected_vol = 120.0 * 60.0 * 10.0 - 4.0 * std::f64::consts::PI * 3.3 * 3.3 * 10.0;
         assert!((vol - expected_vol).abs() < 1.0);
+    }
+
+    #[test]
+    fn transform_tool_moves_a_selected_body_and_replaces_its_display() {
+        let mut app = FerroCadApp::new_with_mvp_demo();
+        let input = app.render_config.selected_feature.unwrap();
+        let before = app.controller.document.features[&input]
+            .cached_summary
+            .unwrap()
+            .bounds;
+
+        app.open_tool_panel(ToolKind::Transform);
+        let mut panel = app.tool_panel.take().unwrap();
+        match &mut panel {
+            ToolPanel::Transform { translation, .. } => *translation = [25.0, -10.0, 5.0],
+            other => panic!("unexpected panel {other:?}"),
+        }
+        app.confirm_tool(panel);
+
+        let moved = app.render_config.selected_feature.unwrap();
+        let after = app.controller.document.features[&moved]
+            .cached_summary
+            .unwrap()
+            .bounds;
+        assert_eq!(after.min - before.min, glam::DVec3::new(25.0, -10.0, 5.0));
+        assert!(!app.controller.document.features[&input].visible);
+        assert!(app.controller.document.features[&moved].visible);
+    }
+
+    #[test]
+    fn parameter_usage_labels_identify_the_feature_dimension() {
+        let kind = FeatureKind::Transform {
+            input: FeatureId(1),
+            dx: ScalarParam::expr("offset_x"),
+            dy: ScalarParam::mm(0.0),
+            dz: ScalarParam::mm(0.0),
+            rot_origin: [0.0; 3],
+            rot_axis: [0.0, 0.0, 1.0],
+            rot_angle_deg: ScalarParam::expr("rotation"),
+        };
+        let slots = feature_parameter_slots(&kind);
+        assert_eq!(slots.len(), 4);
+        assert_eq!(slots[0].0, "移動 X");
+        assert_eq!(scalar_expression(slots[0].1), Some("offset_x"));
+        assert_eq!(slots[3].0, "回転角");
+        assert_eq!(scalar_expression(slots[3].1), Some("rotation"));
+    }
+
+    #[test]
+    fn boolean_tool_move_inserts_transform_before_boolean() {
+        let mut app = FerroCadApp::new_with_mvp_demo();
+        let boolean = FeatureId(5);
+        let tool = match &app.controller.document.features[&boolean].kind {
+            FeatureKind::Boolean { secondary, .. } => *secondary,
+            other => panic!("expected Boolean, got {other:?}"),
+        };
+
+        app.open_boolean_tool_transform(boolean, tool);
+        let mut panel = app.tool_panel.take().unwrap();
+        match &mut panel {
+            ToolPanel::Transform { translation, .. } => *translation = [12.0, 0.0, 0.0],
+            other => panic!("unexpected panel {other:?}"),
+        }
+        app.confirm_tool(panel);
+
+        let moved_tool = match &app.controller.document.features[&boolean].kind {
+            FeatureKind::Boolean { secondary, .. } => *secondary,
+            other => panic!("expected Boolean, got {other:?}"),
+        };
+        assert_ne!(moved_tool, tool);
+        assert!(matches!(
+            app.controller.document.features[&moved_tool].kind,
+            FeatureKind::Transform { input, .. } if input == tool
+        ));
+        let timeline = app.controller.document.timeline();
+        let pos = |id| timeline.iter().position(|&item| item == id).unwrap();
+        assert!(pos(tool) < pos(moved_tool) && pos(moved_tool) < pos(boolean));
     }
 
     /// Drives the M2 flow through the app: pick the plate's top face, draw a 10x10
