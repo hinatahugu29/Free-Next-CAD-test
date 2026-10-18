@@ -669,6 +669,14 @@ pub enum FeatureKind {
     },
     /// Circular profile swept along one straight parametric path.
     SweepCircle { radius: ScalarParam, dx: ScalarParam, dy: ScalarParam, dz: ScalarParam },
+    /// Counterbore hole cut along +Z from the body's XY origin.
+    Counterbore {
+        input: FeatureId,
+        hole_radius: ScalarParam,
+        bore_radius: ScalarParam,
+        bore_depth: ScalarParam,
+        depth: ScalarParam,
+    },
     /// Repeats a feature. With `tool_only` and a sketch Join/Cut input, the input's tool
     /// is repeated on its target (e.g. a ring of holes); otherwise the input's body is
     /// repeated and fused. The choice is stored, not inferred, so re-wiring the input
@@ -815,6 +823,7 @@ impl FeatureKind {
             | Self::Draft { input, .. }
             | Self::Heal { input }
             | Self::PushPull { input, .. }
+            | Self::Counterbore { input, .. }
             | Self::LinearPattern { input, .. } => vec![*input],
         }
     }
@@ -835,6 +844,7 @@ impl FeatureKind {
             | Self::Draft { input, .. }
             | Self::Heal { input }
             | Self::PushPull { input, .. }
+            | Self::Counterbore { input, .. }
             | Self::LinearPattern { input, .. }
             | Self::Pattern { input, .. }
             | Self::Shell { input, .. } => swap(input),
@@ -972,6 +982,7 @@ impl FeatureKind {
             | Self::Draft { input, .. }
             | Self::Heal { input }
             | Self::PushPull { input, .. }
+            | Self::Counterbore { input, .. }
             | Self::LinearPattern { input, .. } => Some(*input),
             Self::Boolean { primary, .. } => Some(*primary),
             Self::SketchExtrude { mode, .. } | Self::SketchRevolve { mode, .. } => mode.target(),
@@ -1075,6 +1086,7 @@ impl FeatureKind {
             Self::SketchRevolve { angle_deg, .. } => add(angle_deg),
             Self::Loft { distance, .. } => add(distance),
             Self::SweepCircle { radius, dx, dy, dz } => { add(radius); add(dx); add(dy); add(dz); }
+            Self::Counterbore { hole_radius, bore_radius, bore_depth, depth, .. } => { add(hole_radius); add(bore_radius); add(bore_depth); add(depth); }
             Self::Pattern { layout, .. } => match layout {
                 PatternLayout::Circular { total_angle_deg, .. } => add(total_angle_deg),
                 PatternLayout::Linear { spacing, .. } => add(spacing),
@@ -2358,6 +2370,20 @@ impl Document {
                 Length::mm(radius.evaluate(params)?),
                 DVec3::new(dx.evaluate(params)?, dy.evaluate(params)?, dz.evaluate(params)?),
             )?),
+            FeatureKind::Counterbore { input, hole_radius, bore_radius, bore_depth, depth } => {
+                let src = lookup_shape(*input)?;
+                let hole_radius = hole_radius.evaluate(params)?;
+                let bore_radius = bore_radius.evaluate(params)?;
+                let bore_depth = bore_depth.evaluate(params)?;
+                let depth = depth.evaluate(params)?;
+                if bore_radius < hole_radius || bore_depth <= 0.0 || bore_depth > depth {
+                    return Err(CoreError::Geometry(GeometryError::InvalidParameter { name: "Counterbore".to_string(), reason: "座ぐり径は穴径以上、座ぐり深さは全深さ以下にしてください".to_string() }));
+                }
+                let through = store.create_cylinder(Length::mm(hole_radius), Length::mm(depth))?;
+                let bore = store.create_cylinder(Length::mm(bore_radius), Length::mm(bore_depth))?;
+                let tool = store.fuse(through, bore)?;
+                Ok(store.cut(src, tool)?)
+            }
             FeatureKind::Pattern {
                 input,
                 layout,
