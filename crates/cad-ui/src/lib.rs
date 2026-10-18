@@ -56,6 +56,38 @@ pub fn install_japanese_font(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+/// Tabs of the Office-style ribbon toolbar at the top of the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RibbonTab {
+    #[default]
+    Solid,
+    View,
+}
+
+/// One ribbon button: a large icon glyph above a short label, fixed width so groups
+/// line up like a desktop CAD ribbon.
+fn ribbon_button(ui: &mut egui::Ui, icon: &str, label: &str, enabled: bool, hint: &str) -> bool {
+    let text = RichText::new(format!("{icon}\n{label}")).size(12.0);
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(text).min_size(Vec2::new(58.0, 48.0)).frame(false),
+    )
+    .on_hover_text(hint)
+    .on_disabled_hover_text(hint)
+    .clicked()
+}
+
+/// A titled ribbon group (e.g. "作成", "修正"): buttons in a row, group name below.
+fn ribbon_group(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
+    ui.vertical(|ui| {
+        ui.horizontal(add_contents);
+        ui.vertical_centered(|ui| {
+            ui.label(RichText::new(title).size(11.0).weak());
+        });
+    });
+    ui.separator();
+}
+
 /// Main GUI application state for FerroCAD.
 pub struct FerroCadApp {
     pub controller: DocumentController,
@@ -87,6 +119,7 @@ pub struct FerroCadApp {
     /// features (projected onto the sketch's XY plane) — a lightweight version of the
     /// object-snap found in most CAD sketchers.
     pub sketch_snap_enabled: bool,
+    pub ribbon_tab: RibbonTab,
 }
 
 impl Default for FerroCadApp {
@@ -157,7 +190,191 @@ impl FerroCadApp {
             sketch_points: Vec::new(),
             sketch_depth: 10.0,
             sketch_snap_enabled: true,
+            ribbon_tab: RibbonTab::default(),
         }
+    }
+
+    fn add_primitive(&mut self, base_name: &str, kind: FeatureKind, color_rgba: [f32; 4]) {
+        self.execute_cmd(CadCommand::AddFeature {
+            name: format!("{base_name}_{}", self.controller.document.features.len() + 1),
+            kind,
+            visible: true,
+            color_rgba,
+        });
+    }
+
+    fn start_sketch(&mut self) {
+        self.sketch_mode = true;
+        self.sketch_points.clear();
+        self.sketch_depth = 10.0;
+        self.floating_editor_pos = None;
+    }
+
+    /// Adds a fillet or chamfer on the currently selected edge, capturing a semantic
+    /// reference so the edge is re-identified (not trusted by raw index) after upstream
+    /// edits. Returns false when no edge is selected.
+    fn add_edge_modifier_on_selection(&mut self, chamfer: bool) -> bool {
+        let Some((fid, edge_idx)) = self.render_config.selected_edge else {
+            return false;
+        };
+        let Some(feat) = self.controller.document.features.get(&fid).cloned() else {
+            return false;
+        };
+        let semantic_refs = feat
+            .cached_shape
+            .and_then(|sid| SemanticReference::from_edge(fid, &self.store, sid, edge_idx).ok())
+            .map(|r| vec![r])
+            .unwrap_or_default();
+        let kind = if chamfer {
+            FeatureKind::Chamfer {
+                input: fid,
+                distance: ScalarParam::mm(1.0),
+                edge_indices: vec![edge_idx],
+                semantic_refs,
+            }
+        } else {
+            FeatureKind::Fillet {
+                input: fid,
+                radius: ScalarParam::mm(1.5),
+                edge_indices: vec![edge_idx],
+                semantic_refs,
+            }
+        };
+        let base = if chamfer { "Chamfer" } else { "Fillet" };
+        self.execute_cmd(CadCommand::AddFeature {
+            name: format!("{base}_Edge{edge_idx}"),
+            kind,
+            visible: true,
+            color_rgba: feat.color_rgba,
+        });
+        true
+    }
+
+    fn fit_all(&mut self) {
+        if let Some(bbox) = self.controller.document.visible_bounding_box() {
+            self.camera.fit_bounding_box(&bbox);
+            self.viewport_dirty = true;
+        }
+    }
+
+    fn render_ribbon(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            for (tab, label) in [(RibbonTab::Solid, "ソリッド"), (RibbonTab::View, "表示")] {
+                if ui.selectable_label(self.ribbon_tab == tab, RichText::new(label).size(13.0)).clicked() {
+                    self.ribbon_tab = tab;
+                }
+            }
+        });
+        ui.separator();
+
+        let edge_selected = self.render_config.selected_edge.is_some();
+        ui.horizontal(|ui| match self.ribbon_tab {
+            RibbonTab::Solid => {
+                ribbon_group(ui, "スケッチ", |ui| {
+                    if ribbon_button(ui, "✏", "スケッチ", true, "2Dで輪郭を描いて押し出し") {
+                        self.start_sketch();
+                    }
+                });
+                ribbon_group(ui, "作成", |ui| {
+                    if ribbon_button(ui, "■", "直方体", true, "直方体を追加") {
+                        self.add_primitive(
+                            "Box",
+                            FeatureKind::Box {
+                                width: ScalarParam::mm(40.0),
+                                height: ScalarParam::mm(40.0),
+                                depth: ScalarParam::mm(20.0),
+                            },
+                            [0.35, 0.65, 0.90, 1.0],
+                        );
+                    }
+                    if ribbon_button(ui, "◉", "円柱", true, "円柱を追加") {
+                        self.add_primitive(
+                            "Cylinder",
+                            FeatureKind::Cylinder {
+                                radius: ScalarParam::mm(15.0),
+                                height: ScalarParam::mm(40.0),
+                            },
+                            [0.45, 0.78, 0.55, 1.0],
+                        );
+                    }
+                    if ribbon_button(ui, "●", "球", true, "球を追加") {
+                        self.add_primitive(
+                            "Sphere",
+                            FeatureKind::Sphere {
+                                radius: ScalarParam::mm(20.0),
+                            },
+                            [0.85, 0.55, 0.35, 1.0],
+                        );
+                    }
+                    if ribbon_button(ui, "▲", "円錐", true, "円錐を追加") {
+                        self.add_primitive(
+                            "Cone",
+                            FeatureKind::Cone {
+                                bottom_radius: ScalarParam::mm(20.0),
+                                top_radius: ScalarParam::mm(5.0),
+                                height: ScalarParam::mm(35.0),
+                            },
+                            [0.75, 0.50, 0.85, 1.0],
+                        );
+                    }
+                });
+                ribbon_group(ui, "修正", |ui| {
+                    let hint = if edge_selected {
+                        "選択中の辺に適用"
+                    } else {
+                        "先に3Dビューで辺をクリックして選択してください"
+                    };
+                    if ribbon_button(ui, "◜", "フィレット", edge_selected, hint) {
+                        self.add_edge_modifier_on_selection(false);
+                    }
+                    if ribbon_button(ui, "◸", "面取り", edge_selected, hint) {
+                        self.add_edge_modifier_on_selection(true);
+                    }
+                });
+            }
+            RibbonTab::View => {
+                ribbon_group(ui, "視点", |ui| {
+                    for (icon, label, view) in [
+                        ("◆", "等角", StandardView::Isometric),
+                        ("▔", "上面", StandardView::Top),
+                        ("▯", "正面", StandardView::Front),
+                        ("▷", "右側面", StandardView::Right),
+                    ] {
+                        if ribbon_button(ui, icon, label, true, label) {
+                            self.camera.set_standard_view(view);
+                            self.viewport_dirty = true;
+                        }
+                    }
+                    if ribbon_button(ui, "⛶", "全体表示", true, "全体が収まるように表示 [F]") {
+                        self.fit_all();
+                    }
+                });
+                ribbon_group(ui, "表示方法", |ui| {
+                    for (icon, label, mode) in [
+                        ("▣", "面+辺", DisplayMode::ShadedWithEdges),
+                        ("■", "面のみ", DisplayMode::Shaded),
+                        ("□", "線画", DisplayMode::Wireframe),
+                    ] {
+                        if ribbon_button(ui, icon, label, self.render_config.display_mode != mode, label) {
+                            self.render_config.display_mode = mode;
+                            self.viewport_dirty = true;
+                        }
+                    }
+                    let proj = match self.camera.projection {
+                        ProjectionMode::Perspective { .. } => "透視",
+                        ProjectionMode::Orthographic { .. } => "平行",
+                    };
+                    if ribbon_button(ui, "◫", proj, true, "透視投影 / 平行投影を切り替え") {
+                        self.camera.toggle_projection();
+                        self.viewport_dirty = true;
+                    }
+                    if ribbon_button(ui, "▦", "グリッド", true, "グリッドと座標軸の表示切替") {
+                        self.render_config.show_grid = !self.render_config.show_grid;
+                        self.viewport_dirty = true;
+                    }
+                });
+            }
+        });
     }
 
     /// Existing visible geometry projected onto the sketch's XY plane (Z dropped), taken
@@ -377,89 +594,6 @@ impl FerroCadApp {
                 }
             });
 
-            ui.menu_button("フィーチャー追加 (Create)", |ui| {
-                if ui.button("直方体 (Box)").clicked() {
-                    self.execute_cmd(CadCommand::AddFeature {
-                        name: format!("Box_{}", self.controller.document.features.len() + 1),
-                        kind: FeatureKind::Box {
-                            width: ScalarParam::mm(40.0),
-                            height: ScalarParam::mm(40.0),
-                            depth: ScalarParam::mm(20.0),
-                        },
-                        visible: true,
-                        color_rgba: [0.35, 0.65, 0.90, 1.0],
-                    });
-                    ui.close_menu();
-                }
-                if ui.button("円柱 (Cylinder)").clicked() {
-                    self.execute_cmd(CadCommand::AddFeature {
-                        name: format!("Cylinder_{}", self.controller.document.features.len() + 1),
-                        kind: FeatureKind::Cylinder {
-                            radius: ScalarParam::mm(15.0),
-                            height: ScalarParam::mm(40.0),
-                        },
-                        visible: true,
-                        color_rgba: [0.45, 0.78, 0.55, 1.0],
-                    });
-                    ui.close_menu();
-                }
-                if ui.button("球 (Sphere)").clicked() {
-                    self.execute_cmd(CadCommand::AddFeature {
-                        name: format!("Sphere_{}", self.controller.document.features.len() + 1),
-                        kind: FeatureKind::Sphere {
-                            radius: ScalarParam::mm(20.0),
-                        },
-                        visible: true,
-                        color_rgba: [0.85, 0.55, 0.35, 1.0],
-                    });
-                    ui.close_menu();
-                }
-                if ui.button("円錐 (Cone)").clicked() {
-                    self.execute_cmd(CadCommand::AddFeature {
-                        name: format!("Cone_{}", self.controller.document.features.len() + 1),
-                        kind: FeatureKind::Cone {
-                            bottom_radius: ScalarParam::mm(20.0),
-                            top_radius: ScalarParam::mm(5.0),
-                            height: ScalarParam::mm(35.0),
-                        },
-                        visible: true,
-                        color_rgba: [0.75, 0.50, 0.85, 1.0],
-                    });
-                    ui.close_menu();
-                }
-                ui.separator();
-                if ui.button("✏ スケッチから押し出し... (2D描画)").clicked() {
-                    self.sketch_mode = true;
-                    self.sketch_points.clear();
-                    self.sketch_depth = 10.0;
-                    ui.close_menu();
-                }
-            });
-
-            ui.menu_button("表示 (View)", |ui| {
-                if ui.button("全体フィット (Fit All) [F]").clicked() {
-                    if let Some(bbox) = self.controller.document.visible_bounding_box() {
-                        self.camera.fit_bounding_box(&bbox);
-                        self.viewport_dirty = true;
-                    }
-                    ui.close_menu();
-                }
-                if ui.button("投影切替 (透視 / 平行)").clicked() {
-                    self.camera.toggle_projection();
-                    self.viewport_dirty = true;
-                    ui.close_menu();
-                }
-                if ui
-                    .checkbox(
-                        &mut self.render_config.show_grid,
-                        "基準グリッド・座標軸表示",
-                    )
-                    .changed()
-                {
-                    self.viewport_dirty = true;
-                }
-            });
-
             ui.separator();
             if ui
                 .button(RichText::new("⌘ コマンドパレット (Ctrl+K)").strong())
@@ -576,13 +710,12 @@ impl FerroCadApp {
             }
         });
 
-        ui.add_space(12.0);
-        // A flat, chronological timeline rather than a nested tree: each feature is
-        // listed in the order it was created, so "what happened, in what order" stays
-        // readable without digging through nesting (UX concept B).
-        ui.heading("🕒 操作タイムライン (作成順)");
-        ui.separator();
+    }
 
+    /// Horizontal, chronological timeline along the bottom of the window (like the
+    /// history bar in Fusion-style CAD): one chip per feature in creation order, flat
+    /// rather than a nested tree (UX concept B).
+    fn render_bottom_timeline(&mut self, ui: &mut egui::Ui) {
         let features_list: Vec<_> = self
             .controller
             .document
@@ -610,56 +743,62 @@ impl FerroCadApp {
             })
             .unwrap_or_default();
 
-        for feat in &features_list {
+        ui.horizontal(|ui| {
+            ui.strong("🕒 タイムライン");
+            if selected.is_some() && (!direct_upstream.is_empty() || !direct_downstream.is_empty()) {
+                ui.small("  ← 青: 選択中が参照している元 / 橙: それを参照している先 →");
+            }
+        });
+        egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
-                let mut vis = feat.visible;
-                if ui
-                    .checkbox(&mut vis, "")
-                    .on_hover_text("表示 / 非表示")
-                    .changed()
-                {
-                    visibility_toggle = Some((feat.id, vis));
+                for (i, feat) in features_list.iter().enumerate() {
+                    if i > 0 {
+                        ui.label(RichText::new("›").weak());
+                    }
+                    let (badge, badge_color) = match &feat.state {
+                        FeatureState::Clean => ("✓", Color32::from_rgb(80, 210, 120)),
+                        FeatureState::Dirty => ("⟳", Color32::from_rgb(230, 190, 70)),
+                        FeatureState::Computing => ("…", Color32::from_rgb(100, 180, 240)),
+                        FeatureState::Failed(_) => ("✗", Color32::from_rgb(240, 85, 85)),
+                        FeatureState::Blocked { .. } => ("⊘", Color32::from_rgb(235, 140, 60)),
+                    };
+                    let is_selected = selected == Some(feat.id);
+                    let stroke_color = if is_selected {
+                        Color32::from_rgb(250, 200, 60)
+                    } else if direct_upstream.contains(&feat.id) {
+                        Color32::from_rgb(120, 180, 255)
+                    } else if direct_downstream.contains(&feat.id) {
+                        Color32::from_rgb(255, 180, 110)
+                    } else {
+                        Color32::from_rgb(60, 66, 78)
+                    };
+                    egui::Frame::group(ui.style())
+                        .stroke(egui::Stroke::new(1.5_f32, stroke_color))
+                        .inner_margin(egui::Margin::symmetric(6, 3))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let mut vis = feat.visible;
+                                if ui.checkbox(&mut vis, "").on_hover_text("表示 / 非表示").changed() {
+                                    visibility_toggle = Some((feat.id, vis));
+                                }
+                                ui.colored_label(badge_color, badge);
+                                let resp = ui.selectable_label(is_selected, &feat.name);
+                                let resp = if let FeatureState::Failed(msg) = &feat.state {
+                                    resp.on_hover_text(msg)
+                                } else {
+                                    resp
+                                };
+                                if resp.clicked() {
+                                    self.render_config.selected_feature = Some(feat.id);
+                                    self.render_config.selected_face = None;
+                                    self.render_config.selected_edge = None;
+                                    self.viewport_dirty = true;
+                                }
+                            });
+                        });
                 }
-
-                let (badge, badge_color) = match &feat.state {
-                    FeatureState::Clean => ("✓ Clean", Color32::from_rgb(80, 210, 120)),
-                    FeatureState::Dirty => ("⟳ Dirty", Color32::from_rgb(230, 190, 70)),
-                    FeatureState::Computing => ("… Computing", Color32::from_rgb(100, 180, 240)),
-                    FeatureState::Failed(_) => ("✗ Failed", Color32::from_rgb(240, 85, 85)),
-                    FeatureState::Blocked { .. } => ("⊘ Blocked", Color32::from_rgb(235, 140, 60)),
-                };
-
-                let is_selected = selected == Some(feat.id);
-                let rel_marker = if is_selected {
-                    ""
-                } else if direct_upstream.contains(&feat.id) {
-                    "↑ "
-                } else if direct_downstream.contains(&feat.id) {
-                    "↓ "
-                } else {
-                    "  "
-                };
-                let label_text = format!("{rel_marker}#{} {}", feat.id.0, feat.name);
-                let label = if direct_upstream.contains(&feat.id) {
-                    RichText::new(label_text).color(Color32::from_rgb(120, 180, 255))
-                } else if direct_downstream.contains(&feat.id) {
-                    RichText::new(label_text).color(Color32::from_rgb(255, 180, 110))
-                } else {
-                    RichText::new(label_text)
-                };
-                if ui.selectable_label(is_selected, label).clicked() {
-                    self.render_config.selected_feature = Some(feat.id);
-                    self.render_config.selected_face = None;
-                    self.render_config.selected_edge = None;
-                    self.viewport_dirty = true;
-                }
-                ui.colored_label(badge_color, badge);
             });
-        }
-        if selected.is_some() && (!direct_upstream.is_empty() || !direct_downstream.is_empty()) {
-            ui.add_space(4.0);
-            ui.small("↑ 選択中のフィーチャーが参照している元 / ↓ それを参照している先");
-        }
+        });
 
         if let Some((fid, new_vis)) = visibility_toggle {
             self.execute_cmd(CadCommand::UpdateFeature {
@@ -885,23 +1024,7 @@ impl FerroCadApp {
                     edge.centroid.x, edge.centroid.y, edge.centroid.z
                 ));
                 if ui.button("この辺に 1.5mm フィレットを追加").clicked() {
-                    // Capture a stable semantic reference for this edge (TNP mitigation):
-                    // later edits to upstream dimensions re-identify the edge by geometric
-                    // signature instead of trusting this raw index, which can drift.
-                    let semantic_refs = SemanticReference::from_edge(feat.id, &self.store, sid, edge_idx)
-                        .map(|r| vec![r])
-                        .unwrap_or_default();
-                    self.execute_cmd(CadCommand::AddFeature {
-                        name: format!("Fillet_Edge{edge_idx}"),
-                        kind: FeatureKind::Fillet {
-                            input: feat.id,
-                            radius: ScalarParam::mm(1.5),
-                            edge_indices: vec![edge_idx],
-                            semantic_refs,
-                        },
-                        visible: true,
-                        color_rgba: feat.color_rgba,
-                    });
+                    self.add_edge_modifier_on_selection(false);
                 }
             }
         }
@@ -1422,6 +1545,10 @@ impl eframe::App for FerroCadApp {
             self.render_top_menubar(ui);
         });
 
+        egui::TopBottomPanel::top("ribbon").show(ctx, |ui| {
+            ui.add_enabled_ui(!self.sketch_mode, |ui| self.render_ribbon(ui));
+        });
+
         egui::TopBottomPanel::bottom("bottom_status_panel")
             .resizable(true)
             .default_height(85.0)
@@ -1440,6 +1567,12 @@ impl eframe::App for FerroCadApp {
                             ui.label(log);
                         }
                     });
+            });
+
+        egui::TopBottomPanel::bottom("bottom_timeline")
+            .resizable(false)
+            .show(ctx, |ui| {
+                self.render_bottom_timeline(ui);
             });
 
         egui::SidePanel::left("left_tree_panel")
