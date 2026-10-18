@@ -248,6 +248,7 @@ pub enum ToolKind {
     Shell,
     /// Start a sketch on a plane parallel to the currently selected face.
     OffsetPlane,
+    Draft,
 }
 
 /// What the sketch being started will become.
@@ -301,6 +302,13 @@ pub enum ToolPanel {
         input: FeatureId,
         face: SemanticReference,
         offset: f64,
+    },
+    Draft {
+        input: FeatureId,
+        faces: Vec<SemanticReference>,
+        neutral_index: usize,
+        angle_deg: f64,
+        reversed: bool,
     },
 }
 
@@ -905,6 +913,15 @@ impl FerroCadApp {
                         },
                     ) {
                         self.open_tool_panel(ToolKind::OffsetPlane);
+                    }
+                    if ribbon_button(
+                        ui,
+                        "◢",
+                        "ドラフト",
+                        self.render_config.selected_faces.len() >= 2,
+                        "同じボディの面を2つ以上選び、固定面と傾ける面を指定します",
+                    ) {
+                        self.open_tool_panel(ToolKind::Draft);
                     }
                 });
                 ribbon_group(ui, "パターン・組み合わせ", |ui| {

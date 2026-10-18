@@ -108,6 +108,16 @@ impl FerroCadApp {
                     offset: 10.0,
                 }
             }
+            ToolKind::Draft => {
+                let Some((fid, _)) = self.render_config.selected_face else { return; };
+                let Some(shape) = self.controller.document.features.get(&fid).and_then(|f| f.cached_shape) else { return; };
+                let faces: Option<Vec<_>> = self.open_faces_on(fid).into_iter()
+                    .map(|idx| SemanticReference::from_face(fid, &self.store, shape, idx).ok()).collect();
+                let Some(faces) = faces.filter(|v| v.len() >= 2) else {
+                    self.status_logs.push("同じボディの面を2つ以上選んでください".to_string()); return;
+                };
+                ToolPanel::Draft { input: fid, faces, neutral_index: 0, angle_deg: 3.0, reversed: false }
+            }
         });
     }
 
@@ -136,6 +146,7 @@ impl FerroCadApp {
             ToolPanel::Boolean { .. } => "◆ ブーリアン",
             ToolPanel::Shell { .. } => "□ シェル",
             ToolPanel::OffsetPlane { .. } => "▱ オフセット面からスケッチ",
+            ToolPanel::Draft { .. } => "◢ ドラフト",
         };
         let mut confirm = false;
         let mut cancel = false;
@@ -310,6 +321,19 @@ impl FerroCadApp {
                             ui.add(egui::DragValue::new(offset).speed(0.5).suffix(" mm"));
                         });
                         ui.small("プラスは面の法線方向、マイナスは反対方向です。確定すると、この平面でスケッチを開始します。");
+                    }
+                    ToolPanel::Draft { input, faces, neutral_index, angle_deg, reversed } => {
+                        ui.label(format!("対象: 「{}」", self.feature_name(*input)));
+                        ui.label(format!("選択面: {} 面", faces.len()));
+                        ui.horizontal(|ui| {
+                            ui.label("固定面:");
+                            egui::ComboBox::from_id_salt("draft_neutral").selected_text(format!("面 {}", *neutral_index + 1)).show_ui(ui, |ui| {
+                                for i in 0..faces.len() { ui.selectable_value(neutral_index, i, format!("面 {}", i + 1)); }
+                            });
+                        });
+                        ui.horizontal(|ui| { ui.label("角度:"); ui.add(egui::DragValue::new(angle_deg).range(0.1..=88.0).suffix("°")); });
+                        ui.checkbox(reversed, "反対方向へ傾ける");
+                        ui.small("固定面以外の選択面を傾けます。初期版は平面の固定面に対応します。");
                     }
                 }
 
@@ -522,6 +546,15 @@ impl FerroCadApp {
                     Some(input),
                 );
                 self.status_logs.push("オフセット面でスケッチを開始しました".to_string());
+            }
+            ToolPanel::Draft { input, faces, neutral_index, angle_deg, reversed } => {
+                let neutral_face = faces[neutral_index].clone();
+                let draft_faces = faces.into_iter().enumerate().filter_map(|(i, f)| (i != neutral_index).then_some(f)).collect();
+                self.add_replacing(
+                    format!("Draft_{n}"),
+                    FeatureKind::Draft { input, faces: draft_faces, neutral_face, angle_deg: ScalarParam::Literal(angle_deg), reversed },
+                    input, &[input],
+                );
             }
         }
     }
