@@ -3306,7 +3306,11 @@ mod tests {
     /// parallel faces reports their gap; unsaved work is guarded.
     #[test]
     fn m6_autosave_recovery_files_and_measure() {
-        let dir = std::env::temp_dir().join(format!("ferrocad_ui_m6_{}", std::process::id()));
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("ferrocad_ui_m6_{}_{}", std::process::id(), nonce));
         let _ = std::fs::remove_dir_all(&dir);
 
         let mut app = FerroCadApp::new_with_mvp_demo().with_persistence(dir.clone());
