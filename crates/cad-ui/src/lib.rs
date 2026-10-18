@@ -409,6 +409,7 @@ impl FerroCadApp {
     fn cancel_sketch(&mut self) {
         self.sketch_plane_picking = false;
         self.sketch_mode = false;
+        self.viewport_dirty = true;
         self.sketch_editing = None;
         self.sketch_pending.clear();
         self.sketch_selection.clear();
@@ -1760,8 +1761,13 @@ impl FerroCadApp {
                 .rect_filled(rect, 0.0, Color32::from_rgb(28, 33, 41));
         }
 
-        // Mouse camera manipulation (Orbit, Pan, Zoom)
-        if response.dragged() {
+        // Sketching happens on its plane over the live 3D view.
+        if self.sketch_mode {
+            self.render_sketch_overlay(ctx, ui, rect, &response);
+        }
+
+        // Mouse camera manipulation (Orbit, Pan, Zoom); dragging a sketch point wins.
+        if response.dragged() && self.sketch_drag.is_none() {
             let delta = response.drag_delta();
             let shift = ctx.input(|i| i.modifiers.shift);
             if response.dragged_by(egui::PointerButton::Secondary)
@@ -1900,6 +1906,11 @@ impl FerroCadApp {
         }
 
         self.render_floating_editor(ctx);
+
+        // The sketch HUD takes this corner while sketching.
+        if self.sketch_mode {
+            return;
+        }
 
         // Top-Left HUD Overlay (View & Display Quick Controls)
         let hud_rect =
@@ -2225,11 +2236,7 @@ impl eframe::App for FerroCadApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
-                if self.sketch_mode {
-                    self.render_sketch_canvas(ctx, ui);
-                } else {
-                    self.render_central_viewport(ctx, ui);
-                }
+                self.render_central_viewport(ctx, ui);
             });
 
         if !self.sketch_mode {

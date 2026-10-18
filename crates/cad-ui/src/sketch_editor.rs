@@ -14,26 +14,87 @@ const COLOR_BAD: Color32 = Color32::from_rgb(240, 90, 90);
 const COLOR_SELECTED: Color32 = Color32::from_rgb(250, 200, 60);
 const COLOR_HOVER: Color32 = Color32::from_rgb(235, 235, 245);
 
+/// Maps between the sketch plane and the 3D viewport through the camera, so the
+/// sketch is drawn on (and clicked onto) its plane from whatever angle it is viewed.
 #[derive(Clone, Copy)]
 struct View {
-    origin: Pos2,
-    px: f32,
+    rect: Rect,
+    vp: glam::Mat4,
+    /// Inverse in double precision: un-projecting through the far plane in f32 loses
+    /// hundredths of a millimetre.
+    inv_vp: glam::DMat4,
+    frame: PlaneFrame,
 }
 
 impl View {
-    fn to_screen(self, p: [f64; 2]) -> Pos2 {
+    fn new(camera: &Camera, rect: Rect, frame: PlaneFrame) -> Self {
+        let vp = camera.view_proj_matrix(rect.width() / rect.height().max(1.0));
+        Self {
+            rect,
+            vp,
+            inv_vp: vp.as_dmat4().inverse(),
+            frame,
+        }
+    }
+
+    fn world_to_screen(self, w: glam::DVec3) -> Pos2 {
+        let clip = self.vp * glam::Vec4::new(w.x as f32, w.y as f32, w.z as f32, 1.0);
+        let ndc = clip.truncate() / clip.w.max(1e-4);
         Pos2::new(
-            self.origin.x + p[0] as f32 * self.px,
-            self.origin.y - p[1] as f32 * self.px,
+            self.rect.min.x + (ndc.x * 0.5 + 0.5) * self.rect.width(),
+            self.rect.min.y + (0.5 - ndc.y * 0.5) * self.rect.height(),
         )
     }
 
-    fn to_mm(self, p: Pos2) -> [f64; 2] {
-        [
-            ((p.x - self.origin.x) / self.px) as f64,
-            (-(p.y - self.origin.y) / self.px) as f64,
-        ]
+    fn to_screen(self, p: [f64; 2]) -> Pos2 {
+        self.world_to_screen(self.frame.to_world(p[0], p[1]))
     }
+
+    /// Where the view ray under `pos` meets the sketch plane, in sketch coordinates.
+    /// `None` when the ray runs (almost) parallel to the plane or meets it behind the eye.
+    fn to_mm(self, pos: Pos2) -> Option<[f64; 2]> {
+        let ndc_x = ((pos.x - self.rect.min.x) / self.rect.width()) as f64 * 2.0 - 1.0;
+        let ndc_y = 1.0 - ((pos.y - self.rect.min.y) / self.rect.height()) as f64 * 2.0;
+        let unproject = |z: f64| {
+            let v = self.inv_vp * glam::DVec4::new(ndc_x, ndc_y, z, 1.0);
+            v.truncate() / v.w
+        };
+        let near = unproject(0.0);
+        let dir = (unproject(1.0) - near).normalize_or_zero();
+        let denom = dir.dot(self.frame.normal);
+        if denom.abs() < 1e-6 {
+            return None;
+        }
+        let t = (self.frame.origin - near).dot(self.frame.normal) / denom;
+        if t < 0.0 {
+            return None;
+        }
+        Some(self.frame.to_local(near + dir * t))
+    }
+
+    /// Screen pixels per millimetre on the plane around `at` (averaged over both axes).
+    fn px_per_mm(self, at: [f64; 2]) -> f32 {
+        let o = self.to_screen(at);
+        let x = self.to_screen([at[0] + 1.0, at[1]]).distance(o);
+        let y = self.to_screen([at[0], at[1] + 1.0]).distance(o);
+        ((x + y) * 0.5).max(1e-4)
+    }
+
+    /// A circle or arc on the plane, as a screen-space polyline.
+    fn arc(self, c: [f64; 2], r: f64, a0: f64, sweep: f64, n: usize) -> Vec<Pos2> {
+        (0..=n)
+            .map(|i| {
+                let t = a0 + sweep * i as f64 / n as f64;
+                self.to_screen([c[0] + r * t.cos(), c[1] + r * t.sin()])
+            })
+            .collect()
+    }
+}
+
+fn polyline_dist(p: Pos2, pts: &[Pos2]) -> f32 {
+    pts.windows(2)
+        .map(|w| seg_dist(p, w[0], w[1]))
+        .fold(f32::INFINITY, f32::min)
 }
 
 fn seg_dist(p: Pos2, a: Pos2, b: Pos2) -> f32 {
@@ -46,30 +107,6 @@ fn dist_mm(a: [f64; 2], b: [f64; 2]) -> f64 {
     (a[0] - b[0]).hypot(a[1] - b[1])
 }
 
-/// Counter-clockwise angle test: is `ang` within the sweep from `a0` to `a1`?
-fn angle_in_arc(ang: f64, a0: f64, a1: f64) -> bool {
-    let tau = std::f64::consts::TAU;
-    let sweep = (a1 - a0).rem_euclid(tau);
-    (ang - a0).rem_euclid(tau) <= sweep
-}
-
-/// Initial view framing the existing geometry and the sketch.
-fn fit_view(points: &[[f64; 2]], rect: Rect) -> ([f64; 2], f32) {
-    let mut min = [f64::INFINITY; 2];
-    let mut max = [f64::NEG_INFINITY; 2];
-    for p in points {
-        for i in 0..2 {
-            min[i] = min[i].min(p[i]);
-            max[i] = max[i].max(p[i]);
-        }
-    }
-    if !min[0].is_finite() {
-        return ([0.0, 0.0], 3.0);
-    }
-    let extent = (max[0] - min[0]).max(max[1] - min[1]).max(10.0) as f32;
-    let px = (rect.width().min(rect.height()) * 0.7 / extent).clamp(0.3, 30.0);
-    ([(min[0] + max[0]) * 0.5, (min[1] + max[1]) * 0.5], px)
-}
 
 /// Short Japanese description of a constraint, for lists and messages.
 pub(crate) fn describe_constraint(c: &SketchConstraint) -> String {
@@ -96,13 +133,14 @@ impl FerroCadApp {
             .unwrap_or([0.0, 0.0])
     }
 
-    /// Existing visible geometry projected onto the sketch plane (excluding the feature
-    /// being re-edited): outline segments plus snap targets at edge endpoints/midpoints.
-    fn sketch_reference_geometry(&self) -> (Vec<[[f64; 2]; 2]>, Vec<[f64; 2]>) {
+    /// Snap targets from existing geometry that lies on the sketch plane (excluding the
+    /// feature being re-edited): edge endpoints and midpoints, in sketch coordinates.
+    fn sketch_reference_snaps(&self) -> Vec<[f64; 2]> {
         let frame = self.sketch_frame;
-        let local =
-            |p: [f32; 3]| frame.to_local(glam::DVec3::new(p[0] as f64, p[1] as f64, p[2] as f64));
-        let mut segments = Vec::new();
+        let on_plane = |p: [f32; 3]| {
+            let w = glam::DVec3::new(p[0] as f64, p[1] as f64, p[2] as f64);
+            ((w - frame.origin).dot(frame.normal).abs() < 1e-3).then(|| frame.to_local(w))
+        };
         let mut snaps = Vec::new();
         for feat in self.controller.document.features.values() {
             if !feat.visible || Some(feat.id) == self.sketch_editing {
@@ -114,9 +152,9 @@ impl FerroCadApp {
             let mut edges: std::collections::BTreeMap<u32, Vec<[[f64; 2]; 2]>> =
                 std::collections::BTreeMap::new();
             for (seg, &eid) in mesh.edge_segments.iter().zip(&mesh.edge_segment_ids) {
-                let s = [local(seg[0]), local(seg[1])];
-                segments.push(s);
-                edges.entry(eid).or_default().push(s);
+                if let (Some(a), Some(b)) = (on_plane(seg[0]), on_plane(seg[1])) {
+                    edges.entry(eid).or_default().push([a, b]);
+                }
             }
             for segs in edges.values() {
                 let (Some(first), Some(last)) = (segs.first(), segs.last()) else {
@@ -133,7 +171,7 @@ impl FerroCadApp {
                 }
             }
         }
-        (segments, snaps)
+        snaps
     }
 
     /// Solves the sketch in place and records the result.
@@ -249,8 +287,8 @@ impl FerroCadApp {
         for ent in self.sketch.entities.values() {
             match ent {
                 SketchEntity::Circle { id, center, radius } => {
-                    let c = view.to_screen(self.sketch_pos(*center));
-                    consider((c.distance(pos) - *radius as f32 * view.px).abs(), SketchSel::Curve(*id), 0.0);
+                    let pts = view.arc(self.sketch_pos(*center), *radius, 0.0, std::f64::consts::TAU, 64);
+                    consider(polyline_dist(pos, &pts), SketchSel::Curve(*id), 0.0);
                 }
                 SketchEntity::Arc {
                     id,
@@ -260,15 +298,11 @@ impl FerroCadApp {
                     radius,
                 } => {
                     let c = self.sketch_pos(*center);
-                    let m = view.to_mm(pos);
-                    let ang = (m[1] - c[1]).atan2(m[0] - c[0]);
                     let (s, e) = (self.sketch_pos(*start), self.sketch_pos(*end));
                     let a0 = (s[1] - c[1]).atan2(s[0] - c[0]);
-                    let a1 = (e[1] - c[1]).atan2(e[0] - c[0]);
-                    if angle_in_arc(ang, a0, a1) {
-                        let cs = view.to_screen(c);
-                        consider((cs.distance(pos) - *radius as f32 * view.px).abs(), SketchSel::Curve(*id), 0.0);
-                    }
+                    let sweep = ((e[1] - c[1]).atan2(e[0] - c[0]) - a0).rem_euclid(std::f64::consts::TAU);
+                    let pts = view.arc(c, *radius, a0, sweep, 48);
+                    consider(polyline_dist(pos, &pts), SketchSel::Curve(*id), 0.0);
                 }
                 _ => {}
             }
@@ -283,9 +317,10 @@ impl FerroCadApp {
         pos: Pos2,
         reference_snaps: &[[f64; 2]],
         grid_mm: f64,
-    ) -> ([f64; 2], Option<PointId>) {
+    ) -> Option<([f64; 2], Option<PointId>)> {
+        let raw = view.to_mm(pos)?;
         if !self.sketch_snap_enabled {
-            return (view.to_mm(pos), None);
+            return Some((raw, None));
         }
         let mut best: Option<(f32, [f64; 2], Option<PointId>)> = None;
         let mut consider = |cand: [f64; 2], pid: Option<PointId>, bias: f32| {
@@ -300,13 +335,12 @@ impl FerroCadApp {
         for p in reference_snaps {
             consider(*p, None, 1.0);
         }
-        let raw = view.to_mm(pos);
         consider(
             [(raw[0] / grid_mm).round() * grid_mm, (raw[1] / grid_mm).round() * grid_mm],
             None,
             0.0,
         );
-        best.map(|(_, p, pid)| (p, pid)).unwrap_or((raw, None))
+        Some(best.map(|(_, p, pid)| (p, pid)).unwrap_or((raw, None)))
     }
 
     fn delete_sketch_selection(&mut self) {
@@ -331,78 +365,63 @@ impl FerroCadApp {
         self.resolve_sketch();
     }
 
-    pub(crate) fn render_sketch_canvas(&mut self, ctx: &Context, ui: &mut egui::Ui) {
-        let avail = ui.available_size();
-        let (rect, response) = ui.allocate_exact_size(avail, Sense::click_and_drag());
-        let (reference_segments, reference_snaps) = self.sketch_reference_geometry();
-
-        // View: fitted on first show; wheel zooms, right-drag pans.
-        let (mut center, mut px) = *self.sketch_view.get_or_insert_with(|| {
-            let mut pts: Vec<[f64; 2]> = reference_segments.iter().flatten().copied().collect();
-            pts.extend(self.sketch.points.values().map(|p| [p.x, p.y]));
-            // Frame the geometry in the area to the right of the HUD panel when there is room.
-            let mut visible = rect;
-            if rect.width() > 900.0 {
-                visible.min.x += 490.0;
-            }
-            let (c, px) = fit_view(&pts, visible);
-            let shift = (visible.center().x - rect.center().x) / px;
-            ([c[0] - shift as f64, c[1]], px)
-        });
-        if response.hovered() {
-            let scroll_y = ctx.input(|i| i.smooth_scroll_delta.y);
-            if scroll_y.abs() > 0.1 {
-                px = (px * (1.0 + scroll_y * 0.0018).clamp(0.75, 1.35)).clamp(0.1, 60.0);
-            }
-        }
-        if response.dragged_by(egui::PointerButton::Secondary) {
-            let d = response.drag_delta();
-            center[0] -= (d.x / px) as f64;
-            center[1] += (d.y / px) as f64;
-        }
-        self.sketch_view = Some((center, px));
-        let view = View {
-            origin: rect.center() - Vec2::new(center[0] as f32 * px, -(center[1] as f32) * px),
-            px,
-        };
-
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, Color32::from_rgb(24, 27, 33));
-        let grid_mm: f32 = [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0]
-            .into_iter()
-            .find(|g| g * px >= 15.0)
-            .unwrap_or(1000.0);
-        let grid_px = grid_mm * px;
-        let grid_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(38, 42, 50));
-        let mut gx = (view.origin.x - rect.min.x).rem_euclid(grid_px);
-        while gx < rect.width() {
-            let x = rect.min.x + gx;
-            painter.line_segment([Pos2::new(x, rect.min.y), Pos2::new(x, rect.max.y)], grid_stroke);
-            gx += grid_px;
-        }
-        let mut gy = (view.origin.y - rect.min.y).rem_euclid(grid_px);
-        while gy < rect.height() {
-            let y = rect.min.y + gy;
-            painter.line_segment([Pos2::new(rect.min.x, y), Pos2::new(rect.max.x, y)], grid_stroke);
-            gy += grid_px;
-        }
-        painter.line_segment(
-            [Pos2::new(rect.min.x, view.origin.y), Pos2::new(rect.max.x, view.origin.y)],
-            egui::Stroke::new(1.5_f32, Color32::from_rgb(90, 60, 60)),
-        );
-        painter.line_segment(
-            [Pos2::new(view.origin.x, rect.min.y), Pos2::new(view.origin.x, rect.max.y)],
-            egui::Stroke::new(1.5_f32, Color32::from_rgb(60, 90, 60)),
-        );
-        let outline = egui::Stroke::new(1.2_f32, Color32::from_rgb(110, 125, 145));
-        for seg in &reference_segments {
-            painter.line_segment([view.to_screen(seg[0]), view.to_screen(seg[1])], outline);
-        }
+    /// Draws and edits the sketch on its plane, over the live 3D view: the camera can be
+    /// orbited / zoomed / panned while sketching, and clicks land where the view ray
+    /// meets the plane.
+    pub(crate) fn render_sketch_overlay(
+        &mut self,
+        ctx: &Context,
+        ui: &mut egui::Ui,
+        rect: Rect,
+        response: &egui::Response,
+    ) {
+        let view = View::new(&self.camera, rect, self.sketch_frame);
         let reference_snaps = if self.sketch_snap_enabled {
-            reference_snaps
+            self.sketch_reference_snaps()
         } else {
             Vec::new()
         };
+        let painter = ui.painter_at(rect);
+        // Sketch strokes get a dark outline so they stay visible over the shaded model.
+        let halo = Color32::from_rgba_unmultiplied(8, 12, 20, 210);
+        let stroke_line = |pts: Vec<Pos2>, color: Color32| {
+            painter.add(egui::Shape::line(pts.clone(), egui::Stroke::new(5.0_f32, halo)));
+            painter.add(egui::Shape::line(pts, egui::Stroke::new(2.2_f32, color)));
+        };
+
+        // Grid on the plane around the point under the view centre, spaced so lines stay
+        // readable at the current zoom; the grid also sets the snap step.
+        let focus = view.to_mm(rect.center()).unwrap_or([0.0, 0.0]);
+        let ppm = view.px_per_mm(focus);
+        let grid_mm: f64 = [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0]
+            .into_iter()
+            .find(|g| *g as f32 * ppm >= 15.0)
+            .unwrap_or(1000.0);
+        let half_lines = (((self.camera.distance as f64) * 0.6 / grid_mm).ceil() as i64).clamp(4, 30);
+        let reach = half_lines as f64 * grid_mm;
+        let cx = (focus[0] / grid_mm).round() * grid_mm;
+        let cy = (focus[1] / grid_mm).round() * grid_mm;
+        let grid_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(170, 190, 220, 22));
+        for i in -half_lines..=half_lines {
+            let o = i as f64 * grid_mm;
+            painter.line_segment(
+                [view.to_screen([cx + o, cy - reach]), view.to_screen([cx + o, cy + reach])],
+                grid_stroke,
+            );
+            painter.line_segment(
+                [view.to_screen([cx - reach, cy + o]), view.to_screen([cx + reach, cy + o])],
+                grid_stroke,
+            );
+        }
+        let axis_reach = reach + focus[0].abs().max(focus[1].abs());
+        painter.line_segment(
+            [view.to_screen([-axis_reach, 0.0]), view.to_screen([axis_reach, 0.0])],
+            egui::Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(230, 90, 90, 150)),
+        );
+        painter.line_segment(
+            [view.to_screen([0.0, -axis_reach]), view.to_screen([0.0, axis_reach])],
+            egui::Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(90, 220, 110, 150)),
+        );
         for p in &reference_snaps {
             painter.circle_stroke(
                 view.to_screen(*p),
@@ -417,10 +436,9 @@ impl FerroCadApp {
         } else {
             None
         };
-        let snap_preview =
-            hover_pos.map(|p| self.snap_click(view, p, &reference_snaps, grid_mm as f64));
+        let snap_preview = hover_pos.and_then(|p| self.snap_click(view, p, &reference_snaps, grid_mm));
 
-        self.handle_sketch_input(ctx, &response, view, hovered, &reference_snaps, grid_mm as f64);
+        self.handle_sketch_input(ctx, response, view, hovered, &reference_snaps, grid_mm);
 
         // Geometry, coloured by constraint state.
         let status_color = match self.sketch_report.as_ref().map(|r| &r.status) {
@@ -438,19 +456,16 @@ impl FerroCadApp {
             }
         };
         for (a, b) in self.sketch.segments() {
-            painter.line_segment(
-                [view.to_screen(self.sketch_pos(a)), view.to_screen(self.sketch_pos(b))],
-                egui::Stroke::new(2.0_f32, color_for(SketchSel::Segment(a, b))),
+            stroke_line(
+                vec![view.to_screen(self.sketch_pos(a)), view.to_screen(self.sketch_pos(b))],
+                color_for(SketchSel::Segment(a, b)),
             );
         }
         for ent in self.sketch.entities.values() {
             match ent {
                 SketchEntity::Circle { id, center, radius } => {
-                    painter.circle_stroke(
-                        view.to_screen(self.sketch_pos(*center)),
-                        *radius as f32 * px,
-                        egui::Stroke::new(2.0_f32, color_for(SketchSel::Curve(*id))),
-                    );
+                    let pts = view.arc(self.sketch_pos(*center), *radius, 0.0, std::f64::consts::TAU, 64);
+                    stroke_line(pts, color_for(SketchSel::Curve(*id)));
                 }
                 SketchEntity::Arc {
                     id,
@@ -463,16 +478,7 @@ impl FerroCadApp {
                     let (s, e) = (self.sketch_pos(*start), self.sketch_pos(*end));
                     let a0 = (s[1] - c[1]).atan2(s[0] - c[0]);
                     let sweep = ((e[1] - c[1]).atan2(e[0] - c[0]) - a0).rem_euclid(std::f64::consts::TAU);
-                    let pts: Vec<Pos2> = (0..=48)
-                        .map(|i| {
-                            let t = a0 + sweep * i as f64 / 48.0;
-                            view.to_screen([c[0] + radius * t.cos(), c[1] + radius * t.sin()])
-                        })
-                        .collect();
-                    painter.add(egui::Shape::line(
-                        pts,
-                        egui::Stroke::new(2.0_f32, color_for(SketchSel::Curve(*id))),
-                    ));
+                    stroke_line(view.arc(c, *radius, a0, sweep, 48), color_for(SketchSel::Curve(*id)));
                 }
                 _ => {}
             }
@@ -490,14 +496,16 @@ impl FerroCadApp {
             let s = view.to_screen(self.sketch_pos(pid));
             let col = color_for(SketchSel::Point(pid));
             if fixed.contains(&pid) {
+                painter.rect_filled(Rect::from_center_size(s, Vec2::splat(10.0)), 1.0, halo);
                 painter.rect_filled(Rect::from_center_size(s, Vec2::splat(7.0)), 1.0, col);
             } else {
-                painter.circle_filled(s, 3.0, col);
+                painter.circle_filled(s, 4.8, halo);
+                painter.circle_filled(s, 3.2, col);
             }
         }
         self.draw_constraint_glyphs(&painter, view);
 
-        // Revolve axis, extended across the canvas.
+        // Revolve axis, extended across the plane.
         if self.sketch_revolve {
             let (a, d) = match self.sketch_axis {
                 cad_core::SketchAxis::Y => ([0.0, 0.0], [0.0, 1.0]),
@@ -508,9 +516,8 @@ impl FerroCadApp {
                     (pa, [(pb[0] - pa[0]) / len, (pb[1] - pa[1]) / len])
                 }
             };
-            let reach = (rect.width() + rect.height()) as f64 / px as f64;
-            let p0 = view.to_screen([a[0] - d[0] * reach, a[1] - d[1] * reach]);
-            let p1 = view.to_screen([a[0] + d[0] * reach, a[1] + d[1] * reach]);
+            let p0 = view.to_screen([a[0] - d[0] * axis_reach, a[1] - d[1] * axis_reach]);
+            let p1 = view.to_screen([a[0] + d[0] * axis_reach, a[1] + d[1] * axis_reach]);
             painter.extend(egui::Shape::dashed_line(
                 &[p0, p1],
                 egui::Stroke::new(1.5_f32, Color32::from_rgb(200, 120, 255)),
@@ -519,9 +526,9 @@ impl FerroCadApp {
             ));
         }
 
-        // Preview of the shape the active tool will create.
+        // Preview of the shape the active tool will create (drawn on the plane).
         if let Some((cur, _)) = snap_preview {
-            let preview = egui::Stroke::new(1.5_f32, COLOR_FREE.gamma_multiply(0.6));
+            let preview = egui::Stroke::new(1.5_f32, COLOR_FREE.gamma_multiply(0.7));
             let cs = view.to_screen(cur);
             painter.circle_stroke(cs, 4.0, egui::Stroke::new(1.0_f32, COLOR_HOVER));
             match (self.sketch_tool, self.sketch_pending.as_slice()) {
@@ -529,11 +536,17 @@ impl FerroCadApp {
                     painter.line_segment([view.to_screen(*p), cs], preview);
                 }
                 (SketchTool::Rect, [(p, _)]) => {
-                    let q = view.to_screen(*p);
-                    painter.rect_stroke(Rect::from_two_pos(q, cs), 0.0, preview, egui::StrokeKind::Middle);
+                    let corners = [*p, [cur[0], p[1]], cur, [p[0], cur[1]], *p];
+                    painter.add(egui::Shape::line(
+                        corners.iter().map(|c| view.to_screen(*c)).collect(),
+                        preview,
+                    ));
                 }
                 (SketchTool::Circle, [(p, _)]) => {
-                    painter.circle_stroke(view.to_screen(*p), view.to_screen(*p).distance(cs), preview);
+                    painter.add(egui::Shape::line(
+                        view.arc(*p, dist_mm(*p, cur), 0.0, std::f64::consts::TAU, 64),
+                        preview,
+                    ));
                 }
                 (SketchTool::Arc, [(c, _)]) => {
                     painter.line_segment([view.to_screen(*c), cs], preview);
@@ -542,13 +555,7 @@ impl FerroCadApp {
                     let r = dist_mm(*c, *s);
                     let a0 = (s[1] - c[1]).atan2(s[0] - c[0]);
                     let sweep = ((cur[1] - c[1]).atan2(cur[0] - c[0]) - a0).rem_euclid(std::f64::consts::TAU);
-                    let pts: Vec<Pos2> = (0..=32)
-                        .map(|i| {
-                            let t = a0 + sweep * i as f64 / 32.0;
-                            view.to_screen([c[0] + r * t.cos(), c[1] + r * t.sin()])
-                        })
-                        .collect();
-                    painter.add(egui::Shape::line(pts, preview));
+                    painter.add(egui::Shape::line(view.arc(*c, r, a0, sweep, 32), preview));
                 }
                 _ => {}
             }
@@ -556,6 +563,34 @@ impl FerroCadApp {
 
         self.draw_dimensions(ui, view);
         self.render_sketch_hud(ui, rect);
+    }
+
+    /// Turns the camera to look straight at the sketch plane (only on request).
+    pub(crate) fn face_sketch_plane(&mut self) {
+        let f = self.sketch_frame;
+        let center = if self.sketch.points.is_empty() {
+            let t = self.camera.target;
+            let t = glam::DVec3::new(t.x as f64, t.y as f64, t.z as f64);
+            let local = f.to_local(t);
+            f.to_world(local[0], local[1])
+        } else {
+            let n = self.sketch.points.len() as f64;
+            let (sx, sy) = self.sketch.points.values().fold((0.0, 0.0), |(x, y), p| (x + p.x, y + p.y));
+            f.to_world(sx / n, sy / n)
+        };
+        self.camera.look_at_plane(
+            glam::Vec3::new(center.x as f32, center.y as f32, center.z as f32),
+            glam::Vec3::new(f.normal.x as f32, f.normal.y as f32, f.normal.z as f32),
+        );
+        self.viewport_dirty = true;
+    }
+
+    /// How squarely the camera faces the sketch plane (1 = head-on, 0 = edge-on).
+    pub(crate) fn sketch_facing(&self) -> f64 {
+        let fwd = self.camera.forward_dir();
+        glam::DVec3::new(fwd.x as f64, fwd.y as f64, fwd.z as f64)
+            .dot(self.sketch_frame.normal)
+            .abs()
     }
 
     fn handle_sketch_input(
@@ -610,12 +645,13 @@ impl FerroCadApp {
             if let (Some(p), Some(pos)) = (self.sketch_drag, response.interact_pointer_pos())
                 && response.dragged_by(egui::PointerButton::Primary)
             {
-                let m = view.to_mm(pos);
-                if let Some(pt) = self.sketch.points.get_mut(&p) {
+                if let Some(m) = view.to_mm(pos)
+                    && let Some(pt) = self.sketch.points.get_mut(&p)
+                {
                     pt.x = m[0];
                     pt.y = m[1];
+                    self.resolve_sketch();
                 }
-                self.resolve_sketch();
             }
             if response.drag_stopped() {
                 self.sketch_drag = None;
@@ -643,7 +679,9 @@ impl FerroCadApp {
         let Some(pos) = response.interact_pointer_pos() else {
             return;
         };
-        let click = self.snap_click(view, pos, reference_snaps, grid_mm);
+        let Some(click) = self.snap_click(view, pos, reference_snaps, grid_mm) else {
+            return;
+        };
         match self.sketch_tool {
             SketchTool::Line => {
                 if let Some(&prev) = self.sketch_pending.last() {
@@ -786,9 +824,9 @@ impl FerroCadApp {
                         SketchEntity::Circle { center, .. } | SketchEntity::Arc { center, .. } => *center,
                         _ => return None,
                     };
-                    let c = view.to_screen(self.sketch_pos(center));
-                    let off = radius as f32 * view.px * std::f32::consts::FRAC_1_SQRT_2;
-                    Some((i, c + Vec2::new(off, -off), radius, true))
+                    let c = self.sketch_pos(center);
+                    let k = std::f64::consts::FRAC_1_SQRT_2 * radius;
+                    Some((i, view.to_screen([c[0] + k, c[1] + k]), radius, true))
                 }
                 _ => None,
             })
@@ -974,7 +1012,22 @@ impl FerroCadApp {
                         (SketchTool::Arc, _) => "終点をクリック（反時計回り）",
                     };
                     ui.small(hint);
-                    ui.small("ホイール: 拡大縮小 / 右ドラッグ: 移動");
+                    ui.horizontal(|ui| {
+                        ui.small("左ドラッグ: 回転 / 右ドラッグ: 移動 / ホイール: 拡大縮小");
+                        if ui
+                            .small_button("面を正面に向ける")
+                            .on_hover_text("スケッチ面を真正面から見る向きにカメラを回します")
+                            .clicked()
+                        {
+                            self.face_sketch_plane();
+                        }
+                    });
+                    if self.sketch_facing() < 0.2 {
+                        ui.colored_label(
+                            Color32::from_rgb(240, 170, 70),
+                            "面をほぼ真横から見ているため、クリック位置がずれやすくなっています。回転するか［面を正面に向ける］を押してください",
+                        );
+                    }
 
                     ui.separator();
                     let options = self.applicable_constraints();
@@ -1275,5 +1328,41 @@ impl FerroCadApp {
         self.sketch_mode = false;
         self.sketch_pending.clear();
         self.sketch_selection.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// From an oblique camera, a point on the sketch plane projected to the screen and
+    /// clicked there maps back to the same sketch coordinates (top face of a plate, and
+    /// a tilted plane).
+    #[test]
+    fn oblique_view_round_trips_between_screen_and_plane() {
+        let mut camera = Camera::default();
+        camera.target = glam::Vec3::new(50.0, 30.0, 10.0);
+        camera.distance = 200.0;
+        camera.yaw_rad = -0.9;
+        camera.pitch_rad = 0.45;
+        let rect = Rect::from_min_size(Pos2::new(300.0, 120.0), Vec2::new(1000.0, 700.0));
+        for frame in [
+            PlaneFrame::from_point_normal(glam::DVec3::new(0.0, 0.0, 10.0), glam::DVec3::Z),
+            PlaneFrame::from_point_normal(glam::DVec3::new(20.0, 10.0, 5.0), glam::DVec3::new(0.3, -0.5, 0.8)),
+        ] {
+            let view = View::new(&camera, rect, frame);
+            for p in [[0.0, 0.0], [37.5, 12.25], [-20.0, 44.0], [90.0, -15.0]] {
+                let screen = view.to_screen(p);
+                let back = view.to_mm(screen).expect("plane is in front of the camera");
+                assert!(dist_mm(p, back) < 1e-3, "{p:?} -> {screen:?} -> {back:?}");
+            }
+        }
+
+        // Looking along the plane (edge-on) gives no usable intersection.
+        let mut edge_on = camera.clone();
+        edge_on.pitch_rad = 0.0;
+        let flat = PlaneFrame::from_point_normal(glam::DVec3::new(0.0, 0.0, 10.0), glam::DVec3::Z);
+        let target_screen = View::new(&edge_on, rect, flat).world_to_screen(glam::DVec3::new(50.0, 30.0, 10.0));
+        let _ = View::new(&edge_on, rect, flat).to_mm(target_screen);
     }
 }

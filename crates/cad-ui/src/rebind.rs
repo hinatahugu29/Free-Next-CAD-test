@@ -81,6 +81,25 @@ impl FerroCadApp {
                 }
                 std::borrow::Cow::Owned(view)
             }
+            // Re-editing a sketch feature: show the model as it was before that feature
+            // (hide it and what follows; show the bodies it builds on).
+            None if self.sketch_mode && self.sketch_editing.is_some() => {
+                let editing = self.sketch_editing.unwrap_or(FeatureId(0));
+                let mut view = doc.clone();
+                for id in doc.downstream_of(editing).into_iter().chain([editing]) {
+                    if let Some(f) = view.features.get_mut(&id) {
+                        f.visible = false;
+                    }
+                }
+                if let Some(feat) = doc.features.get(&editing) {
+                    for input in feat.all_dependencies() {
+                        if let Some(f) = view.features.get_mut(&input) {
+                            f.visible = true;
+                        }
+                    }
+                }
+                std::borrow::Cow::Owned(view)
+            }
             // Rolled back: bodies that were hidden because a later feature replaced them
             // are the current result again, so show them (all their users are set aside).
             None if doc.rollback.is_some() => {

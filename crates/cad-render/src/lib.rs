@@ -201,6 +201,23 @@ impl Camera {
         }
     }
 
+    /// Looks straight at a plane: the eye moves onto the plane's normal side, centred on
+    /// `point`, keeping the current distance.
+    pub fn look_at_plane(&mut self, point: Vec3, normal: Vec3) {
+        let n = normal.normalize_or_zero();
+        if n == Vec3::ZERO {
+            return;
+        }
+        let limit = std::f32::consts::FRAC_PI_2 - 0.025;
+        self.target = point;
+        self.pitch_rad = n.z.clamp(-1.0, 1.0).asin().clamp(-limit, limit);
+        if n.x.abs() + n.y.abs() > 1e-6 {
+            self.yaw_rad = n.y.atan2(n.x);
+        } else {
+            self.yaw_rad = -std::f32::consts::FRAC_PI_2;
+        }
+    }
+
     /// Toggles between Perspective and Orthographic projection.
     pub fn toggle_projection(&mut self) {
         self.projection = match self.projection {
