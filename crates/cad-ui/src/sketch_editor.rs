@@ -979,6 +979,9 @@ impl FerroCadApp {
                             };
                             format!("「{}」の面から {}", self.feature_name(*feature), distance)
                         }
+                        SketchPlane::MidFace { first_feature, second_feature, .. } => {
+                            format!("「{}」と「{}」の中間面", self.feature_name(*first_feature), self.feature_name(*second_feature))
+                        }
                     };
                     let editing = self
                         .sketch_editing

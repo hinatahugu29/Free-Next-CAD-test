@@ -185,12 +185,20 @@ pub enum SketchPlane {
         face: SemanticReference,
         offset: ScalarParam,
     },
+    /// Plane halfway between two parallel referenced faces.
+    MidFace {
+        first_feature: FeatureId,
+        first: SemanticReference,
+        second_feature: FeatureId,
+        second: SemanticReference,
+    },
 }
 
 impl SketchPlane {
     fn feature(&self) -> Option<FeatureId> {
         match self {
             Self::Face { feature, .. } | Self::OffsetFace { feature, .. } => Some(*feature),
+            Self::MidFace { first_feature, .. } => Some(*first_feature),
             _ => None,
         }
     }
@@ -808,6 +816,11 @@ impl FeatureKind {
                 } else {
                     vec![*input, *feature]
                 }
+            }
+            Self::Mirror { input, plane: SketchPlane::MidFace { first_feature, second_feature, .. }, .. } => {
+                let mut deps = vec![*input];
+                for id in [*first_feature, *second_feature] { if !deps.contains(&id) { deps.push(id); } }
+                deps
             }
             Self::SketchExtrude { plane, mode, .. } | Self::SketchRevolve { plane, mode, .. } => {
                 let mut deps = Vec::new();
@@ -1764,6 +1777,17 @@ impl Document {
                     resolved.centroid + resolved.normal * offset,
                     resolved.normal,
                 ))
+            }
+            SketchPlane::MidFace { first_feature, first, second_feature, second } => {
+                let resolve = |feature: &FeatureId, reference: &SemanticReference| -> Result<_, CoreError> {
+                    let shape = self.features.get(feature).and_then(|f| f.cached_shape).ok_or(CoreError::FeatureNotFound(*feature))?;
+                    reference.resolve_face(store, shape).map_err(|reason| CoreError::SemanticReferenceLost { feature: *feature, reason })
+                };
+                let (a, b) = (resolve(first_feature, first)?, resolve(second_feature, second)?);
+                if a.normal.dot(b.normal).abs() < 0.999 {
+                    return Err(CoreError::Geometry(GeometryError::InvalidParameter { name: "MidPlane".to_string(), reason: "中間平面には平行な2面を選んでください".to_string() }));
+                }
+                Ok(PlaneFrame::from_point_normal((a.centroid + b.centroid) * 0.5, a.normal))
             }
         }
     }
