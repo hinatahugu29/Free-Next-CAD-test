@@ -531,4 +531,14 @@ mod tests {
         assert!(drafted.is_valid().expect("draft validity"));
         assert!(drafted.volume().expect("draft volume") > 0.0);
     }
+
+    #[test]
+    fn loft_two_closed_profiles_makes_a_valid_solid() {
+        // Four connected line segments: kind=0, x0, y0, x1, y1.
+        let lower = [0.0, -10.0, -8.0, 10.0, -8.0, 0.0, 10.0, -8.0, 10.0, 8.0, 0.0, 10.0, 8.0, -10.0, 8.0, 0.0, -10.0, 8.0, -10.0, -8.0];
+        let upper = [0.0, -5.0, -4.0, 5.0, -4.0, 0.0, 5.0, -4.0, 5.0, 4.0, 0.0, 5.0, 4.0, -5.0, 4.0, 0.0, -5.0, 4.0, -5.0, -4.0];
+        let loft = OcctShape::loft_profiles(&lower, &upper, 20.0).expect("loft");
+        assert!(loft.is_valid().expect("loft valid"));
+        assert!(loft.volume().expect("loft volume") > 0.0);
+    }
 }
