@@ -801,6 +801,12 @@ impl ShapeStore {
         Ok(self.get(id)?.is_valid()?)
     }
 
+    /// Runs OCCT Shape Healing on a copy of a stored shape.
+    pub fn heal_shape(&mut self, id: ShapeId) -> Result<ShapeId, GeometryError> {
+        let healed = self.get(id)?.heal()?;
+        self.insert(healed)
+    }
+
     /// Inspects the full topological structure and face/edge geometric signatures of `id`.
     pub fn inspect_shape(&self, id: ShapeId) -> Result<Shape, GeometryError> {
         let s = self.get(id)?;

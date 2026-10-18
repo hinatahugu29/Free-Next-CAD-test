@@ -47,6 +47,7 @@
 #include <Bnd_Box.hxx>
 #include <BRepBndLib.hxx>
 #include <BRepCheck_Analyzer.hxx>
+#include <ShapeFix_Shape.hxx>
 
 #include <BRepMesh_IncrementalMesh.hxx>
 #include <BRep_Tool.hxx>
@@ -725,6 +726,16 @@ bool check_shape_valid(const OcctShapeHandle& handle) {
     } catch (const Standard_Failure& e) {
         rethrow_occt_exception(e);
     }
+}
+
+std::unique_ptr<OcctShapeHandle> heal_shape(const OcctShapeHandle& handle) {
+    try {
+        ShapeFix_Shape fixer(handle.shape());
+        fixer.Perform();
+        TopoDS_Shape healed = fixer.Shape();
+        if (healed.IsNull()) throw std::runtime_error("Shape healing returned an empty shape");
+        return std::make_unique<OcctShapeHandle>(healed);
+    } catch (const Standard_Failure& e) { rethrow_occt_exception(e); }
 }
 
 RawTopoCounts get_topology_counts(const OcctShapeHandle& handle) {
