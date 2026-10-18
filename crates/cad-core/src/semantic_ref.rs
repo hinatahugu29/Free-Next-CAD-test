@@ -105,6 +105,16 @@ impl SemanticReference {
         })
     }
 
+    /// Retargets the reference if its target_feature matches `old`.
+    pub fn retarget(&mut self, old: FeatureId, new: FeatureId) -> bool {
+        if self.target_feature == old {
+            self.target_feature = new;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Resolves this semantic reference against a newly recomputed `shape_id`, returning the matched [`Face`].
     pub fn resolve_face(
         &self,

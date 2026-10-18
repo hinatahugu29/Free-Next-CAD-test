@@ -202,6 +202,29 @@ mod ffi {
         fn refine_shape(handle: &OcctShapeHandle) -> Result<UniquePtr<OcctShapeHandle>>;
         fn solid_from_shell(handle: &OcctShapeHandle) -> Result<UniquePtr<OcctShapeHandle>>;
         fn sew_shape(handle: &OcctShapeHandle, tolerance: f64) -> Result<UniquePtr<OcctShapeHandle>>;
+        fn sew_multiple_shapes(shape_ptrs: &[usize], tolerance: f64) -> Result<UniquePtr<OcctShapeHandle>>;
+        fn split_by_plane(
+            input: &OcctShapeHandle,
+            ox: f64,
+            oy: f64,
+            oz: f64,
+            nx: f64,
+            ny: f64,
+            nz: f64,
+        ) -> Result<UniquePtr<OcctShapeHandle>>;
+        fn offset_surface(
+            handle: &OcctShapeHandle,
+            face_index: u32,
+            offset_distance: f64,
+        ) -> Result<UniquePtr<OcctShapeHandle>>;
+        fn trim_surface(
+            handle: &OcctShapeHandle,
+            face_index: u32,
+            u_min: f64,
+            u_max: f64,
+            v_min: f64,
+            v_max: f64,
+        ) -> Result<UniquePtr<OcctShapeHandle>>;
         fn get_topology_counts(handle: &OcctShapeHandle) -> Result<RawTopoCounts>;
         fn inspect_faces(handle: &OcctShapeHandle) -> Result<Vec<RawFaceInfo>>;
         fn inspect_edges(handle: &OcctShapeHandle) -> Result<Vec<RawEdgeInfo>>;
@@ -530,6 +553,41 @@ impl OcctShape {
         Self::from_ptr(ffi::sew_shape(self.as_ref()?, tolerance)?)
     }
 
+    /// Stitches multiple shapes together within `tolerance` millimeters.
+    pub fn sew_multiple(shapes: &[&OcctShape], tolerance: f64) -> Result<Self, OcctError> {
+        let mut ptrs = Vec::with_capacity(shapes.len());
+        for s in shapes {
+            ptrs.push(s.as_ref()? as *const ffi::OcctShapeHandle as usize);
+        }
+        Self::from_ptr(ffi::sew_multiple_shapes(&ptrs, tolerance)?)
+    }
+
+    /// Splits `self` by an infinite cutting plane passing through `origin` with `normal`.
+    pub fn split_by_plane(&self, origin: [f64; 3], normal: [f64; 3]) -> Result<Self, OcctError> {
+        Self::from_ptr(ffi::split_by_plane(
+            self.as_ref()?,
+            origin[0], origin[1], origin[2],
+            normal[0], normal[1], normal[2],
+        )?)
+    }
+
+    /// Offsets selected face by `offset_distance` along its normal.
+    pub fn offset_surface(&self, face_index: u32, offset_distance: f64) -> Result<Self, OcctError> {
+        Self::from_ptr(ffi::offset_surface(self.as_ref()?, face_index, offset_distance)?)
+    }
+
+    /// Trims selected face to parameter bounds `[u_min, u_max]` and `[v_min, v_max]`.
+    pub fn trim_surface(
+        &self,
+        face_index: u32,
+        u_min: f64,
+        u_max: f64,
+        v_min: f64,
+        v_max: f64,
+    ) -> Result<Self, OcctError> {
+        Self::from_ptr(ffi::trim_surface(self.as_ref()?, face_index, u_min, u_max, v_min, v_max)?)
+    }
+
     /// Returns counts of solids, faces, edges, and vertices in the shape.
     pub fn topology_counts(&self) -> Result<RawTopoCounts, OcctError> {
         Ok(ffi::get_topology_counts(self.as_ref()?)?)
@@ -767,6 +825,41 @@ mod tests {
         // Find tangent edges on the box (edges meet at 90 deg, so none are tangent within 5 deg)
         let tangents = b.find_tangent_edges(edges[0].index, 0.087).expect("tangents");
         assert_eq!(tangents.len(), 1); // Only the seed edge itself
+    }
+
+    #[test]
+    fn m11_surface_offset_trim_split_by_plane_and_sew_multiple() {
+        let b = OcctShape::make_box(30.0, 30.0, 30.0).expect("box");
+        let faces = b.inspect_faces().expect("faces");
+        assert_eq!(faces.len(), 6);
+
+        // 1. Surface offset of face 0 by 5mm
+        let off_surf = b.offset_surface(faces[0].index, 5.0).expect("offset surface");
+        assert!(off_surf.is_valid().expect("offset valid"));
+        let off_area = off_surf.surface_area().expect("offset area");
+        assert!((off_area - 900.0).abs() < 1e-2);
+
+        // 2. Trim surface
+        let trimmed = b.trim_surface(faces[0].index, 0.0, 10.0, 0.0, 15.0).expect("trim surface");
+        assert!(trimmed.is_valid().expect("trim valid"));
+        let trim_area = trimmed.surface_area().expect("trim area");
+        assert!((trim_area - 150.0).abs() < 1e-2);
+
+        // 3. Split by plane: cut the box in half at Z = 15.0 with normal (0, 0, 1)
+        let split_res = b.split_by_plane([0.0, 0.0, 15.0], [0.0, 0.0, 1.0]).expect("split by plane");
+        assert!(split_res.is_valid().expect("split valid"));
+        let split_counts = split_res.topology_counts().expect("counts");
+        assert_eq!(split_counts.solids, 2);
+        let total_vol = split_res.volume().expect("volume");
+        assert!((total_vol - 27000.0).abs() < 1e-2);
+
+        // 4. Sew multiple shapes
+        let s1 = b.trim_surface(faces[0].index, 0.0, 10.0, 0.0, 30.0).expect("s1");
+        let s2 = b.trim_surface(faces[0].index, 10.0, 30.0, 0.0, 30.0).expect("s2");
+        let sewn = OcctShape::sew_multiple(&[&s1, &s2], 0.1).expect("sew multiple");
+        assert!(sewn.is_valid().expect("sewn valid"));
+        let sewn_area = sewn.surface_area().expect("sewn area");
+        assert!((sewn_area - 900.0).abs() < 1e-2);
     }
 }
 

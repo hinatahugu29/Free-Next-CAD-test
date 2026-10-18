@@ -862,8 +862,8 @@ OCCTの演算をUIボタンとして直接露出しない。すべてを、再�
 - [x] STEP単位ラベル・妥当性・トポロジーの診断表示
 - [x] 単一形状の`Sew`、`SolidFromShell`
 - [x] 2ソリッド間の`Split` / `Partition`
-- [ ] `SurfaceOffset`、`TrimSurface`
-- [ ] 複数入力を扱うSew、面・平面を工具にするSplit
+- [x] `SurfaceOffset`、`TrimSurface`
+- [x] 複数入力を扱うSew、面・平面を工具にするSplit
 - [ ] STEPCAFによるアセンブリ構成、色、正確な単位の読込み
 
 ### 導入しない/後回しにするもの

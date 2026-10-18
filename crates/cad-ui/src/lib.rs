@@ -181,6 +181,13 @@ fn feature_parameter_slots(kind: &FeatureKind) -> Vec<(&'static str, &ScalarPara
             PatternReferenceLayout::Circular { total_angle_deg, .. } => vec![("全体の角度", total_angle_deg)],
             PatternReferenceLayout::Linear { spacing, .. } => vec![("間隔", spacing)],
         },
+        FeatureKind::SurfaceOffset { distance, .. } => vec![("オフセット距離", distance)],
+        FeatureKind::TrimSurface { u_min, u_max, v_min, v_max, .. } => vec![
+            ("U 最小", u_min),
+            ("U 最大", u_max),
+            ("V 最小", v_min),
+            ("V 最大", v_max),
+        ],
         FeatureKind::Sweep { .. }
         | FeatureKind::Mirror { .. }
         | FeatureKind::Boolean { .. }
@@ -319,6 +326,8 @@ pub enum ToolKind {
     PlanePattern,
     Hole,
     PatternOnReference,
+    SurfaceOffset,
+    TrimSurface,
 }
 
 /// What the sketch being started will become.
@@ -389,8 +398,29 @@ pub enum ToolPanel {
     Countersink { input: FeatureId, center: [f64; 2], hole_radius: f64, sink_radius: f64, sink_depth: f64, depth: f64 },
     Refine { input: FeatureId },
     SolidFromShell { input: FeatureId },
-    Sew { input: FeatureId, tolerance: f64 },
-    Split { input: FeatureId, tool: Option<FeatureId> },
+    Sew {
+        input: FeatureId,
+        extra_inputs: Vec<FeatureId>,
+        tolerance: f64,
+    },
+    Split {
+        input: FeatureId,
+        tool: Option<FeatureId>,
+        plane: Option<SketchPlane>,
+    },
+    SurfaceOffset {
+        input: FeatureId,
+        face: SemanticReference,
+        distance: f64,
+    },
+    TrimSurface {
+        input: FeatureId,
+        face: SemanticReference,
+        u_min: f64,
+        u_max: f64,
+        v_min: f64,
+        v_max: f64,
+    },
     MidPlane { first_feature: FeatureId, first: SemanticReference, second_feature: FeatureId, second: SemanticReference },
     PlanePattern { input: FeatureId, base_face: SemanticReference, spacing: f64, count: u32 },
     Hole {
@@ -1047,8 +1077,14 @@ impl FerroCadApp {
                     if ribbon_button(ui, "⌁", "Sew", feature_selected, "隣接する面・シェルの境界を縫合します") {
                         self.open_tool_panel(ToolKind::Sew);
                     }
-                    if ribbon_button(ui, "✂", "分割", feature_selected, "別のソリッドで選択形状を分割します") {
+                    if ribbon_button(ui, "✂", "分割", feature_selected, "別のソリッドまたは平面で選択形状を分割します") {
                         self.open_tool_panel(ToolKind::Split);
+                    }
+                    if ribbon_button(ui, "⇪", "面オフセット", face_selected, "選択面を法線方向へオフセットした曲面を作成します") {
+                        self.open_tool_panel(ToolKind::SurfaceOffset);
+                    }
+                    if ribbon_button(ui, "✂", "面トリム", face_selected, "選択面のUVパラメータ範囲をトリミングします") {
+                        self.open_tool_panel(ToolKind::TrimSurface);
                     }
                     if ribbon_button(ui, "⌁", "ロフト", feature_selected, "2つのXYスケッチ断面の間に遷移形状を作ります") {
                         self.open_tool_panel(ToolKind::Loft);

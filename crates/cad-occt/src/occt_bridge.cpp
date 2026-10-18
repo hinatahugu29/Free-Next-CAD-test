@@ -75,6 +75,11 @@
 #include <gp_Cylinder.hxx>
 #include <gp_Cone.hxx>
 #include <gp_Trsf.hxx>
+#include <gp_Pln.hxx>
+#include <Geom_Surface.hxx>
+#include <Geom_OffsetSurface.hxx>
+#include <BRepTools.hxx>
+#include <Precision.hxx>
 
 namespace ferrocad {
 
@@ -1032,6 +1037,129 @@ std::unique_ptr<OcctShapeHandle> sew_shape(const OcctShapeHandle& handle, double
         TopoDS_Shape sewn = sewing.SewedShape();
         if (sewn.IsNull()) throw std::runtime_error("Sew failed: no sewable shell was produced");
         return std::make_unique<OcctShapeHandle>(sewn);
+    } catch (const Standard_Failure& e) { rethrow_occt_exception(e); }
+}
+
+std::unique_ptr<OcctShapeHandle> sew_multiple_shapes(rust::Slice<const size_t> shape_ptrs, double tolerance) {
+    ensure_valid_positive(tolerance, "sewing tolerance");
+    if (shape_ptrs.empty()) {
+        throw std::invalid_argument("No shapes provided for sewing");
+    }
+    try {
+        BRepBuilderAPI_Sewing sewing(tolerance);
+        for (size_t ptr_val : shape_ptrs) {
+            const auto* h = reinterpret_cast<const OcctShapeHandle*>(ptr_val);
+            if (h && !h->shape().IsNull()) {
+                sewing.Add(h->shape());
+            }
+        }
+        sewing.Perform();
+        TopoDS_Shape sewn = sewing.SewedShape();
+        if (sewn.IsNull()) throw std::runtime_error("Sew failed: no sewable shell was produced");
+        return std::make_unique<OcctShapeHandle>(sewn);
+    } catch (const Standard_Failure& e) { rethrow_occt_exception(e); }
+}
+
+std::unique_ptr<OcctShapeHandle> split_by_plane(
+    const OcctShapeHandle& input,
+    double ox, double oy, double oz,
+    double nx, double ny, double nz
+) {
+    try {
+        gp_Pnt origin(ox, oy, oz);
+        gp_Vec normal_vec(nx, ny, nz);
+        if (normal_vec.Magnitude() < 1e-7) {
+            throw std::invalid_argument("Plane normal must be non-zero");
+        }
+        gp_Dir normal(normal_vec);
+        gp_Pln pln(origin, normal);
+
+        Bnd_Box bnd;
+        BRepBndLib::Add(input.shape(), bnd);
+        if (bnd.IsVoid()) {
+            throw std::runtime_error("Cannot split void shape");
+        }
+        Standard_Real xmin, ymin, zmin, xmax, ymax, zmax;
+        bnd.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+        double diag = std::sqrt((xmax - xmin) * (xmax - xmin) + (ymax - ymin) * (ymax - ymin) + (zmax - zmin) * (zmax - zmin));
+        double size = (diag + 50.0) * 2.0;
+
+        BRepBuilderAPI_MakeFace face_maker(pln, -size, size, -size, size);
+        if (!face_maker.IsDone()) {
+            throw std::runtime_error("Failed to build cutting plane face");
+        }
+
+        TopTools_ListOfShape arguments, tools;
+        arguments.Append(input.shape());
+        tools.Append(face_maker.Face());
+        BOPAlgo_Splitter splitter;
+        splitter.SetArguments(arguments);
+        splitter.SetTools(tools);
+        splitter.Perform();
+        if (splitter.HasErrors()) throw std::runtime_error("Split by plane failed");
+        TopoDS_Shape result = splitter.Shape();
+        if (result.IsNull()) throw std::runtime_error("Split returned an empty result");
+        return std::make_unique<OcctShapeHandle>(result);
+    } catch (const Standard_Failure& e) { rethrow_occt_exception(e); }
+}
+
+std::unique_ptr<OcctShapeHandle> offset_surface(
+    const OcctShapeHandle& handle,
+    uint32_t face_index,
+    double offset_distance
+) {
+    try {
+        TopTools_IndexedMapOfShape face_map;
+        TopExp::MapShapes(handle.shape(), TopAbs_FACE, face_map);
+        int one_based = static_cast<int>(face_index) + 1;
+        if (one_based < 1 || one_based > face_map.Extent()) {
+            throw std::out_of_range("Face index out of range for surface offset");
+        }
+        TopoDS_Face face = TopoDS::Face(face_map(one_based));
+        TopLoc_Location loc;
+        Handle(Geom_Surface) surf = BRep_Tool::Surface(face, loc);
+        if (surf.IsNull()) {
+            throw std::runtime_error("Face has no underlying geometric surface");
+        }
+        Handle(Geom_OffsetSurface) offset_surf = new Geom_OffsetSurface(surf, offset_distance);
+        Standard_Real umin, umax, vmin, vmax;
+        BRepTools::UVBounds(face, umin, umax, vmin, vmax);
+        BRepBuilderAPI_MakeFace maker(offset_surf, umin, umax, vmin, vmax, Precision::Confusion());
+        if (!maker.IsDone()) {
+            throw std::runtime_error("Failed to construct offset surface face");
+        }
+        TopoDS_Face result_face = maker.Face();
+        result_face.Move(loc);
+        return std::make_unique<OcctShapeHandle>(result_face);
+    } catch (const Standard_Failure& e) { rethrow_occt_exception(e); }
+}
+
+std::unique_ptr<OcctShapeHandle> trim_surface(
+    const OcctShapeHandle& handle,
+    uint32_t face_index,
+    double u_min, double u_max,
+    double v_min, double v_max
+) {
+    try {
+        TopTools_IndexedMapOfShape face_map;
+        TopExp::MapShapes(handle.shape(), TopAbs_FACE, face_map);
+        int one_based = static_cast<int>(face_index) + 1;
+        if (one_based < 1 || one_based > face_map.Extent()) {
+            throw std::out_of_range("Face index out of range for trim surface");
+        }
+        TopoDS_Face face = TopoDS::Face(face_map(one_based));
+        TopLoc_Location loc;
+        Handle(Geom_Surface) surf = BRep_Tool::Surface(face, loc);
+        if (surf.IsNull()) {
+            throw std::runtime_error("Face has no underlying geometric surface");
+        }
+        BRepBuilderAPI_MakeFace maker(surf, u_min, u_max, v_min, v_max, Precision::Confusion());
+        if (!maker.IsDone()) {
+            throw std::runtime_error("Failed to trim surface face");
+        }
+        TopoDS_Face result_face = maker.Face();
+        result_face.Move(loc);
+        return std::make_unique<OcctShapeHandle>(result_face);
     } catch (const Standard_Failure& e) { rethrow_occt_exception(e); }
 }
 

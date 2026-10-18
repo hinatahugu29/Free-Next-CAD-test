@@ -619,6 +619,48 @@ impl ShapeStore {
         self.insert(self.get(id)?.sew(tolerance_mm)?)
     }
 
+    /// Stitches coincident boundaries of multiple shapes within `tolerance_mm`.
+    pub fn sew_multiple_shapes(&mut self, ids: &[ShapeId], tolerance_mm: f64) -> Result<ShapeId, GeometryError> {
+        if ids.is_empty() {
+            return Err(GeometryError::InvalidParameter {
+                name: "Sew".to_string(),
+                reason: "縫合する形状を1つ以上指定してください".to_string(),
+            });
+        }
+        let mut shapes = Vec::with_capacity(ids.len());
+        for &id in ids {
+            shapes.push(self.get(id)?);
+        }
+        let sewn = OcctShape::sew_multiple(&shapes, tolerance_mm)?;
+        self.insert(sewn)
+    }
+
+    /// Splits a shape by an infinite cutting plane passing through `origin` with `normal`.
+    pub fn split_by_plane(&mut self, id: ShapeId, origin: DVec3, normal: DVec3) -> Result<ShapeId, GeometryError> {
+        let res = self.get(id)?.split_by_plane(origin.to_array(), normal.to_array())?;
+        self.insert(res)
+    }
+
+    /// Offsets a selected face by `distance_mm` along its normal.
+    pub fn offset_surface(&mut self, id: ShapeId, face_index: u32, distance_mm: f64) -> Result<ShapeId, GeometryError> {
+        let res = self.get(id)?.offset_surface(face_index, distance_mm)?;
+        self.insert(res)
+    }
+
+    /// Trims a selected face to parameter bounds `[u_min, u_max]` and `[v_min, v_max]`.
+    pub fn trim_surface(
+        &mut self,
+        id: ShapeId,
+        face_index: u32,
+        u_min: f64,
+        u_max: f64,
+        v_min: f64,
+        v_max: f64,
+    ) -> Result<ShapeId, GeometryError> {
+        let res = self.get(id)?.trim_surface(face_index, u_min, u_max, v_min, v_max)?;
+        self.insert(res)
+    }
+
     pub fn revolve_polygon(
         &mut self,
         points_xz: &[[f64; 2]],

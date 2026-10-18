@@ -169,6 +169,23 @@ std::unique_ptr<OcctShapeHandle> heal_shape(const OcctShapeHandle& handle);
 std::unique_ptr<OcctShapeHandle> refine_shape(const OcctShapeHandle& handle);
 std::unique_ptr<OcctShapeHandle> solid_from_shell(const OcctShapeHandle& handle);
 std::unique_ptr<OcctShapeHandle> sew_shape(const OcctShapeHandle& handle, double tolerance);
+std::unique_ptr<OcctShapeHandle> sew_multiple_shapes(rust::Slice<const size_t> shape_ptrs, double tolerance);
+std::unique_ptr<OcctShapeHandle> split_by_plane(
+    const OcctShapeHandle& input,
+    double ox, double oy, double oz,
+    double nx, double ny, double nz
+);
+std::unique_ptr<OcctShapeHandle> offset_surface(
+    const OcctShapeHandle& handle,
+    uint32_t face_index,
+    double offset_distance
+);
+std::unique_ptr<OcctShapeHandle> trim_surface(
+    const OcctShapeHandle& handle,
+    uint32_t face_index,
+    double u_min, double u_max,
+    double v_min, double v_max
+);
 RawTopoCounts get_topology_counts(const OcctShapeHandle& handle);
 rust::Vec<RawFaceInfo> inspect_faces(const OcctShapeHandle& handle);
 rust::Vec<RawEdgeInfo> inspect_edges(const OcctShapeHandle& handle);

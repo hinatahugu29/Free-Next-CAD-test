@@ -131,8 +131,8 @@ impl FerroCadApp {
             ToolKind::Countersink => ToolPanel::Countersink { input, center: [0.0, 0.0], hole_radius: 3.0, sink_radius: 6.0, sink_depth: 3.0, depth: 20.0 },
             ToolKind::Refine => ToolPanel::Refine { input },
             ToolKind::SolidFromShell => ToolPanel::SolidFromShell { input },
-            ToolKind::Sew => ToolPanel::Sew { input, tolerance: 0.001 },
-            ToolKind::Split => ToolPanel::Split { input, tool: None },
+            ToolKind::Sew => ToolPanel::Sew { input, extra_inputs: Vec::new(), tolerance: 0.001 },
+            ToolKind::Split => ToolPanel::Split { input, tool: None, plane: Some(SketchPlane::XY) },
             ToolKind::MidPlane => {
                 let selected: Vec<_> = self.render_config.selected_faces.iter().copied().take(2).collect();
                 if selected.len() != 2 { return; }
@@ -224,6 +224,18 @@ impl FerroCadApp {
                     tool_only: is_tool,
                 }
             }
+            ToolKind::SurfaceOffset => {
+                let Some((fid, index)) = self.render_config.selected_face else { return; };
+                let Some(shape) = self.controller.document.features.get(&fid).and_then(|f| f.cached_shape) else { return; };
+                let Ok(face) = SemanticReference::from_face(fid, &self.store, shape, index) else { return; };
+                ToolPanel::SurfaceOffset { input: fid, face, distance: 2.0 }
+            }
+            ToolKind::TrimSurface => {
+                let Some((fid, index)) = self.render_config.selected_face else { return; };
+                let Some(shape) = self.controller.document.features.get(&fid).and_then(|f| f.cached_shape) else { return; };
+                let Ok(face) = SemanticReference::from_face(fid, &self.store, shape, index) else { return; };
+                ToolPanel::TrimSurface { input: fid, face, u_min: 0.0, u_max: 1.0, v_min: 0.0, v_max: 1.0 }
+            }
         });
     }
 
@@ -268,6 +280,8 @@ impl FerroCadApp {
             ToolPanel::PlanePattern { .. } => "▤ 基準平面配列（Plane Pattern）",
             ToolPanel::Hole { .. } => "◎ 穴仕様（Hole）",
             ToolPanel::PatternOnReference { .. } => "☍ 参照軸配列（PatternOnReference）",
+            ToolPanel::SurfaceOffset { .. } => "⇪ 面オフセット（Surface Offset）",
+            ToolPanel::TrimSurface { .. } => "✂ 面トリム（Trim Surface）",
         };
         let mut confirm = false;
         let mut cancel = false;
@@ -548,17 +562,81 @@ impl FerroCadApp {
                         ui.label(format!("対象: 「{}」", self.feature_name(*input)));
                         ui.small("閉じたシェルだけをソリッドへ変換します。開いたシェルはSewで閉じてから実行してください。");
                     }
-                    ToolPanel::Sew { input, tolerance } => {
-                        ui.label(format!("対象: 「{}」", self.feature_name(*input)));
+                    ToolPanel::Sew { input, extra_inputs, tolerance } => {
+                        ui.label(format!("対象（主形状）: 「{}」", self.feature_name(*input)));
                         ui.horizontal(|ui| { ui.label("許容差:"); ui.add(egui::DragValue::new(tolerance).range(0.000_001..=1.0).speed(0.0001).suffix(" mm")); });
-                        ui.small("許容差内で一致する面境界を縫合します。必要に応じてソリッド化を続けてください。");
+                        ui.label("追加で縫合する形状:");
+                        for (id, name) in &names {
+                            if *id != *input {
+                                let mut checked = extra_inputs.contains(id);
+                                if ui.checkbox(&mut checked, name).changed() {
+                                    if checked {
+                                        extra_inputs.push(*id);
+                                    } else {
+                                        extra_inputs.retain(|&x| x != *id);
+                                    }
+                                }
+                            }
+                        }
+                        ui.small("許容差内で一致する面境界を複数形状間で一括縫合します。");
                     }
-                    ToolPanel::Split { input, tool } => {
+                    ToolPanel::Split { input, tool, plane } => {
                         ui.label(format!("分割される形状: 「{}」", self.feature_name(*input)));
-                        egui::ComboBox::from_id_salt("split_tool").selected_text(tool.map(|id| self.feature_name(id)).unwrap_or_else(|| "（分割用ボディを選択）".to_string())).show_ui(ui, |ui| {
-                            for (id, name) in &names { if *id != *input { ui.selectable_value(tool, Some(*id), name); } }
+                        ui.horizontal(|ui| {
+                            let use_plane = plane.is_some();
+                            if ui.radio(!use_plane, "工具ボディ").clicked() {
+                                *plane = None;
+                            }
+                            if ui.radio(use_plane, "無限平面").clicked() {
+                                *tool = None;
+                                *plane = Some(SketchPlane::XY);
+                            }
                         });
-                        ui.small("二つの形状が交差している必要があります。分割線を保持した結果を作成します。");
+                        if let Some(p) = plane {
+                            ui.horizontal(|ui| {
+                                ui.label("基準平面:");
+                                let mut sel = match p {
+                                    SketchPlane::XY => 0,
+                                    SketchPlane::XZ => 1,
+                                    SketchPlane::YZ => 2,
+                                    _ => 0,
+                                };
+                                egui::ComboBox::from_id_salt("split_plane_combo")
+                                    .selected_text(match sel { 0 => "XY平面", 1 => "XZ平面", 2 => "YZ平面", _ => "カスタム" })
+                                    .show_ui(ui, |ui| {
+                                        if ui.selectable_value(&mut sel, 0, "XY平面").clicked() { *p = SketchPlane::XY; }
+                                        if ui.selectable_value(&mut sel, 1, "XZ平面").clicked() { *p = SketchPlane::XZ; }
+                                        if ui.selectable_value(&mut sel, 2, "YZ平面").clicked() { *p = SketchPlane::YZ; }
+                                    });
+                            });
+                        } else {
+                            egui::ComboBox::from_id_salt("split_tool").selected_text(tool.map(|id| self.feature_name(id)).unwrap_or_else(|| "（分割用ボディを選択）".to_string())).show_ui(ui, |ui| {
+                                for (id, name) in &names { if *id != *input { ui.selectable_value(tool, Some(*id), name); } }
+                            });
+                        }
+                        ui.small("工具ボディまたは基準平面で対象形状を分割します。");
+                    }
+                    ToolPanel::SurfaceOffset { input, distance, .. } => {
+                        ui.label(format!("対象: 「{}」の選択面", self.feature_name(*input)));
+                        ui.horizontal(|ui| {
+                            ui.label("オフセット距離:");
+                            ui.add(egui::DragValue::new(distance).speed(0.1).suffix(" mm"));
+                        });
+                        ui.small("面の法線方向に沿ってオフセット曲面を生成します。");
+                    }
+                    ToolPanel::TrimSurface { input, u_min, u_max, v_min, v_max, .. } => {
+                        ui.label(format!("対象: 「{}」の選択面", self.feature_name(*input)));
+                        ui.horizontal(|ui| {
+                            ui.label("U範囲:");
+                            ui.add(egui::DragValue::new(u_min).range(0.0..=*u_max).speed(0.01).prefix("min: "));
+                            ui.add(egui::DragValue::new(u_max).range(*u_min..=1.0).speed(0.01).prefix("max: "));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("V範囲:");
+                            ui.add(egui::DragValue::new(v_min).range(0.0..=*v_max).speed(0.01).prefix("min: "));
+                            ui.add(egui::DragValue::new(v_max).range(*v_min..=1.0).speed(0.01).prefix("max: "));
+                        });
+                        ui.small("選択面のUVパラメータ境界をトリミングしたサーフェスを生成します。");
                     }
                     ToolPanel::MidPlane { first_feature, second_feature, .. } => {
                         ui.label(format!("面1: 「{}」", self.feature_name(*first_feature)));
@@ -711,7 +789,7 @@ impl FerroCadApp {
                     ToolPanel::Boolean { b, .. } => b.is_some(),
                     ToolPanel::Shell { input, .. } => !self.open_faces_on(*input).is_empty(),
                     ToolPanel::Loft { upper, .. } => upper.is_some(),
-                    ToolPanel::Split { tool, .. } => tool.is_some(),
+                    ToolPanel::Split { tool, plane, .. } => tool.is_some() || plane.is_some(),
                     _ => true,
                 };
                 ui.horizontal(|ui| {
@@ -962,13 +1040,52 @@ impl FerroCadApp {
             ToolPanel::SolidFromShell { input } => self.add_replacing(
                 format!("SolidFromShell_{n}"), FeatureKind::SolidFromShell { input }, input, &[input],
             ),
-            ToolPanel::Sew { input, tolerance } => self.add_replacing(
-                format!("Sew_{n}"), FeatureKind::Sew { input, tolerance: ScalarParam::Literal(tolerance) }, input, &[input],
+            ToolPanel::Sew { input, extra_inputs, tolerance } => {
+                let mut hides = vec![input];
+                hides.extend_from_slice(&extra_inputs);
+                self.add_replacing(
+                    format!("Sew_{n}"),
+                    FeatureKind::Sew { input, extra_inputs, tolerance: ScalarParam::Literal(tolerance) },
+                    input,
+                    &hides,
+                )
+            }
+            ToolPanel::Split { input, tool, plane } => {
+                if let Some(t) = tool {
+                    self.add_replacing(
+                        format!("Split_{n}"),
+                        FeatureKind::Split { input, tool: Some(t), plane: None },
+                        input,
+                        &[input, t],
+                    )
+                } else if let Some(p) = plane {
+                    self.add_replacing(
+                        format!("Split_{n}"),
+                        FeatureKind::Split { input, tool: None, plane: Some(p) },
+                        input,
+                        &[input],
+                    )
+                }
+            }
+            ToolPanel::SurfaceOffset { input, face, distance } => self.add_replacing(
+                format!("SurfaceOffset_{n}"),
+                FeatureKind::SurfaceOffset { input, face, distance: ScalarParam::Literal(distance) },
+                input,
+                &[input],
             ),
-            ToolPanel::Split { input, tool: Some(tool) } => self.add_replacing(
-                format!("Split_{n}"), FeatureKind::Split { input, tool }, input, &[input, tool],
+            ToolPanel::TrimSurface { input, face, u_min, u_max, v_min, v_max } => self.add_replacing(
+                format!("TrimSurface_{n}"),
+                FeatureKind::TrimSurface {
+                    input,
+                    face,
+                    u_min: ScalarParam::Literal(u_min),
+                    u_max: ScalarParam::Literal(u_max),
+                    v_min: ScalarParam::Literal(v_min),
+                    v_max: ScalarParam::Literal(v_max),
+                },
+                input,
+                &[input],
             ),
-            ToolPanel::Split { tool: None, .. } => {}
             ToolPanel::MidPlane { first_feature, first, second_feature, second } => {
                 self.start_sketch_with(SketchStart::Extrude);
                 self.begin_sketch(SketchPlane::MidFace { first_feature, first, second_feature, second }, None);

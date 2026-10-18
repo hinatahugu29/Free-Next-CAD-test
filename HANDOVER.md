@@ -4,28 +4,34 @@
 
 ## 今回までに完了した範囲
 
-M7〜M9の主要フィーチャーを実装・テストし、Document履歴・Undo/Redo・再計算・UIツールパネルへ統合した。
+M7〜M11の主要フィーチャーを実装・テストし、Document履歴・Undo/Redo・再計算・UIツールパネルへ統合した。
 
 - 基準面（M7）: `OffsetPlane`、`MidPlane`、`PlanePattern`（間隔・個数による基準平面配列）
 - 面編集（M8）: 単一平面のPush-Pull、`Draft`、`FaceMove`（任意ベクトル面移動。法線方向限定を解除、TopAbs_REVERSED対応）
 - 断面作成（M9）: 2断面Loft、直線円形Sweep、汎用`Sweep`（任意スケッチプロファイル×3D折れ線パス）、`Rib`（スケッチ・平面・厚み・深さからリブ作成・主ボディ結合）、`Thicken`（`thick_solid`による開口面指定と内向き中空化）
-- 実務形状（M10初期）: 座ぐり・皿穴、平面Face基準のMirror
-- 修復・相互運用（M11初期）: Shape Healing、Refine、STEP診断、Sew、SolidFromShell、2ソリッドのSplit
+- 実務形状（M10）:
+  - `Hole`: 単純/座ぐり/皿穴/ねじ下穴、面基準の配置・貫通/止まり・先端角指定、パターン複製対応
+  - `PatternOnReference`: 直線エッジ・円筒面軸・平面法線を基準とする直線および円形配列、ツール複製（穴や突起の繰り返し）
+  - `EdgeBlend`: 可変半径フィレット（始点〜終点可変R）および接線連続エッジの自動探索・連鎖
+- 修復・相互運用（M11）:
+  - `SurfaceOffset`: 選択面を法線方向にオフセットした曲面作成
+  - `TrimSurface`: 選択面のUVパラメータ境界をトリミングしたサーフェス作成
+  - 複数入力`Sew`: 複数形状（フェイス・シェル）の一括縫合
+  - 面・平面`Split`: 無限基準平面（XY/XZ/YZやカスタム平面）および工具ボディによるロバスト分割
+  - Shape Healing、Refine、STEP診断、SolidFromShell
 
 詳細な完了・未完のチェックリストは [roadmap.md](/E:/CODE/Claude/Free-Next-CAD/roadmap.md) の M7〜M11 に記載した。
 
 ## 次に着手する順番
 
-1. **M10の実務性:** 面基準の穴位置、穴仕様（貫通/止まり等）、`PatternOnReference`、接線連鎖/可変半径のブレンド。
-2. **M11の相互運用:** `SurfaceOffset`、`TrimSurface`、複数入力Sew、面/平面によるSplit、STEPCAFでのアセンブリ・色・単位。
-3. **M8/M9の高度化:** 曲面・複数面へのPush-Pull/FaceMove、曲線パス対応Sweep。
+1. **STEPCAFの導入（M11残り）:** アセンブリ構成、部品名、色、正確な単位の読込み・階層表示。
+2. **M8/M9の高度化:** 曲面・複数面へのPush-Pull/FaceMove、B-Spline曲線パス対応Sweep。
+3. **UIの磨き込み:** テーマ、アイコン、操作フィードバックの向上。
 
 ## 現在の制約と注意点
 
 - Push-Pull / FaceMoveは単一の平面Faceが対象。曲面・複数面は未対応。
 - Loftは2断面の初期版。
-- Holeはボディ座標系のXY位置で指定する。選択面に追従する位置指定、ねじ下穴、貫通/止まりの仕様化は後続のM10で拡張。
-- Sewは単一入力形状、Splitは2ソリッドを工具にするケースが対象。
 - 未追跡の `roadmap.autosave.md` は作業中のユーザーファイルとして保持しており、コミットには含めない。
 
 ## 主な実装場所
@@ -38,7 +44,7 @@ M7〜M9の主要フィーチャーを実装・テストし、Document履歴・Un
 
 ## 検証状況
 
-- `cargo test --workspace` は全48件（cad-core 17件, cad-geometry 2件, cad-occt 11件, cad-render 1件, cad-ui 17件）が完全成功。
+- `cargo test --workspace` は全56件（cad-core 20件, cad-geometry 2件, cad-occt 14件, cad-render 1件, cad-ui 19件）が完全成功。
 - `cargo build --release -p cad-ui` によるリリースビルドも確認可能。
 
 ## 直近コミット

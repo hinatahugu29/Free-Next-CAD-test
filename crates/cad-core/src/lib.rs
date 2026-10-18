@@ -893,10 +893,36 @@ pub enum FeatureKind {
     Refine { input: FeatureId },
     /// Converts a single closed shell to a solid after import or sewing.
     SolidFromShell { input: FeatureId },
-    /// Stitches coincident shell boundaries before solidification.
-    Sew { input: FeatureId, tolerance: ScalarParam },
-    /// Partitions `input` with `tool`, retaining the split topology.
-    Split { input: FeatureId, tool: FeatureId },
+    /// Stitches coincident shell boundaries before solidification. Supports multiple inputs (M11).
+    Sew {
+        input: FeatureId,
+        #[serde(default)]
+        extra_inputs: Vec<FeatureId>,
+        tolerance: ScalarParam,
+    },
+    /// Partitions `input` with `tool` or `plane`, retaining the split topology (M11).
+    Split {
+        input: FeatureId,
+        #[serde(default)]
+        tool: Option<FeatureId>,
+        #[serde(default)]
+        plane: Option<SketchPlane>,
+    },
+    /// Offsets a selected face along its normal (M11).
+    SurfaceOffset {
+        input: FeatureId,
+        face: SemanticReference,
+        distance: ScalarParam,
+    },
+    /// Trims a selected face to UV parameter bounds (M11).
+    TrimSurface {
+        input: FeatureId,
+        face: SemanticReference,
+        u_min: ScalarParam,
+        u_max: ScalarParam,
+        v_min: ScalarParam,
+        v_max: ScalarParam,
+    },
     /// Direct planar-face offset, retaining a semantic face reference.
     PushPull { input: FeatureId, face: SemanticReference, distance: ScalarParam },
     /// Moves a planar face along an arbitrary displacement vector.
@@ -1006,13 +1032,23 @@ impl FeatureKind {
             | Self::Heal { input }
             | Self::Refine { input }
             | Self::SolidFromShell { input }
-            | Self::Sew { input, .. }
             | Self::PushPull { input, .. }
             | Self::FaceMove { input, .. }
             | Self::PlanePattern { input, .. }
             | Self::Counterbore { input, .. }
             | Self::Countersink { input, .. }
+            | Self::SurfaceOffset { input, .. }
+            | Self::TrimSurface { input, .. }
             | Self::LinearPattern { input, .. } => vec![*input],
+            Self::Sew { input, extra_inputs, .. } => {
+                let mut deps = vec![*input];
+                for &extra in extra_inputs {
+                    if !deps.contains(&extra) {
+                        deps.push(extra);
+                    }
+                }
+                deps
+            }
             Self::Rib { input, plane, .. } | Self::Hole { input, plane, .. } => {
                 let mut deps = vec![*input];
                 for id in plane.features() {
@@ -1031,7 +1067,22 @@ impl FeatureKind {
                 }
                 deps
             }
-            Self::Split { input, tool } => if input == tool { vec![*input] } else { vec![*input, *tool] },
+            Self::Split { input, tool, plane } => {
+                let mut deps = vec![*input];
+                if let Some(t) = tool {
+                    if !deps.contains(t) {
+                        deps.push(*t);
+                    }
+                }
+                if let Some(p) = plane {
+                    for id in p.features() {
+                        if !deps.contains(&id) {
+                            deps.push(id);
+                        }
+                    }
+                }
+                deps
+            }
         }
     }
 
@@ -1052,7 +1103,6 @@ impl FeatureKind {
             | Self::Heal { input }
             | Self::Refine { input }
             | Self::SolidFromShell { input }
-            | Self::Sew { input, .. }
             | Self::PushPull { input, .. }
             | Self::FaceMove { input, .. }
             | Self::PlanePattern { input, .. }
@@ -1061,6 +1111,16 @@ impl FeatureKind {
             | Self::LinearPattern { input, .. }
             | Self::Pattern { input, .. }
             | Self::Shell { input, .. } => swap(input),
+            Self::Sew { input, extra_inputs, .. } => {
+                swap(input);
+                for extra in extra_inputs {
+                    swap(extra);
+                }
+            }
+            Self::SurfaceOffset { input, face, .. } | Self::TrimSurface { input, face, .. } => {
+                swap(input);
+                face.retarget(old, new);
+            }
             Self::Hole { input, plane, .. } | Self::Rib { input, plane, .. } => {
                 swap(input);
                 match plane {
@@ -1086,7 +1146,22 @@ impl FeatureKind {
                     }
                 }
             }
-            Self::Split { input, tool } => { swap(input); swap(tool); }
+            Self::Split { input, tool, plane } => {
+                swap(input);
+                if let Some(t) = tool {
+                    swap(t);
+                }
+                if let Some(p) = plane {
+                    match p {
+                        SketchPlane::Face { feature, .. } | SketchPlane::OffsetFace { feature, .. } => swap(feature),
+                        SketchPlane::MidFace { first_feature, second_feature, .. } => {
+                            swap(first_feature);
+                            swap(second_feature);
+                        }
+                        _ => {}
+                    }
+                }
+            }
             Self::Mirror { input, plane, .. } => {
                 swap(input);
                 match plane {
@@ -1154,6 +1229,19 @@ impl FeatureKind {
             Self::PushPull { input, face, .. } => out.push(RefSlot { role: RefRole::PushPullFace, upstream: *input, reference: face.clone() }),
             Self::FaceMove { input, face, .. } => out.push(RefSlot { role: RefRole::FaceMoveFace, upstream: *input, reference: face.clone() }),
             Self::PlanePattern { input, base_face, .. } => out.push(RefSlot { role: RefRole::PlanePatternFace, upstream: *input, reference: base_face.clone() }),
+            Self::SurfaceOffset { input, face, .. } | Self::TrimSurface { input, face, .. } => out.push(RefSlot { role: RefRole::Plane, upstream: *input, reference: face.clone() }),
+            Self::Split { plane: Some(plane), .. } => {
+                match plane {
+                    SketchPlane::Face { feature, face } | SketchPlane::OffsetFace { feature, face, .. } => {
+                        out.push(RefSlot { role: RefRole::Plane, upstream: *feature, reference: face.clone() });
+                    }
+                    SketchPlane::MidFace { first_feature, first, second_feature, second } => {
+                        out.push(RefSlot { role: RefRole::MidPlaneFirst, upstream: *first_feature, reference: first.clone() });
+                        out.push(RefSlot { role: RefRole::MidPlaneSecond, upstream: *second_feature, reference: second.clone() });
+                    }
+                    _ => {}
+                }
+            }
             Self::Hole { plane, .. } | Self::Rib { plane, .. } => {
                 match plane {
                     SketchPlane::Face { feature, face } | SketchPlane::OffsetFace { feature, face, .. } => {
@@ -1244,6 +1332,7 @@ impl FeatureKind {
             (Self::PushPull { face, .. }, RefRole::PushPullFace) => { *face = reference; true },
             (Self::FaceMove { face, .. }, RefRole::FaceMoveFace) => { *face = reference; true },
             (Self::PlanePattern { base_face, .. }, RefRole::PlanePatternFace) => { *base_face = reference; true },
+            (Self::SurfaceOffset { face, .. } | Self::TrimSurface { face, .. }, RefRole::Plane) => { *face = reference; true },
             (Self::PatternOnReference { reference: ref_axis, .. }, RefRole::PatternAxisRef) => match ref_axis {
                 ReferenceAxis::Edge { edge, .. } => { *edge = reference; true }
                 ReferenceAxis::Face { face, .. } => { *face = reference; true }
@@ -1255,6 +1344,7 @@ impl FeatureKind {
                 | Self::Rib { plane, .. }
                 | Self::Hole { plane, .. }
                 | Self::PatternOnReference { reference: ReferenceAxis::Plane(plane), .. }
+                | Self::Split { plane: Some(plane), .. }
                 | Self::Mirror { plane, .. },
                 RefRole::Plane,
             ) => match plane {
@@ -1405,6 +1495,10 @@ impl FeatureKind {
             Self::SolidFromShell { .. } => {}
             Self::Sew { tolerance, .. } => add(tolerance),
             Self::Split { .. } => {}
+            Self::SurfaceOffset { distance, .. } => add(distance),
+            Self::TrimSurface { u_min, u_max, v_min, v_max, .. } => {
+                add(u_min); add(u_max); add(v_min); add(v_max);
+            }
             Self::PushPull { distance, .. } => add(distance),
             Self::FaceMove { dx, dy, dz, .. } => { add(dx); add(dy); add(dz); }
             Self::PlanePattern { spacing, .. } => add(spacing),
@@ -3151,8 +3245,49 @@ impl Document {
             FeatureKind::Heal { input } => Ok(store.heal_shape(lookup_shape(*input)?)?),
             FeatureKind::Refine { input } => Ok(store.refine_shape(lookup_shape(*input)?)?),
             FeatureKind::SolidFromShell { input } => Ok(store.solid_from_shell(lookup_shape(*input)?)?),
-            FeatureKind::Sew { input, tolerance } => Ok(store.sew_shape(lookup_shape(*input)?, tolerance.evaluate(params)?)?),
-            FeatureKind::Split { input, tool } => Ok(store.split(lookup_shape(*input)?, lookup_shape(*tool)?)?),
+            FeatureKind::Sew { input, extra_inputs, tolerance } => {
+                let tol = tolerance.evaluate(params)?;
+                if extra_inputs.is_empty() {
+                    Ok(store.sew_shape(lookup_shape(*input)?, tol)?)
+                } else {
+                    let mut shape_ids = vec![lookup_shape(*input)?];
+                    for extra in extra_inputs {
+                        shape_ids.push(lookup_shape(*extra)?);
+                    }
+                    Ok(store.sew_multiple_shapes(&shape_ids, tol)?)
+                }
+            }
+            FeatureKind::Split { input, tool, plane } => {
+                let src = lookup_shape(*input)?;
+                if let Some(tool_id) = tool {
+                    Ok(store.split(src, lookup_shape(*tool_id)?)?)
+                } else if let Some(p) = plane {
+                    let frame = self.sketch_plane_frame(p, store)?;
+                    Ok(store.split_by_plane(src, frame.origin, frame.normal)?)
+                } else {
+                    Err(CoreError::Geometry(GeometryError::InvalidParameter {
+                        name: "Split".to_string(),
+                        reason: "分割には工具形状または平面が必要です".to_string(),
+                    }))
+                }
+            }
+            FeatureKind::SurfaceOffset { input, face, distance } => {
+                let src = lookup_shape(*input)?;
+                let resolved = face.resolve_face(store, src).map_err(|reason| CoreError::SemanticReferenceLost { feature: *input, reason })?;
+                Ok(store.offset_surface(src, resolved.index, distance.evaluate(params)?)?)
+            }
+            FeatureKind::TrimSurface { input, face, u_min, u_max, v_min, v_max } => {
+                let src = lookup_shape(*input)?;
+                let resolved = face.resolve_face(store, src).map_err(|reason| CoreError::SemanticReferenceLost { feature: *input, reason })?;
+                Ok(store.trim_surface(
+                    src,
+                    resolved.index,
+                    u_min.evaluate(params)?,
+                    u_max.evaluate(params)?,
+                    v_min.evaluate(params)?,
+                    v_max.evaluate(params)?,
+                )?)
+            }
             FeatureKind::PushPull { input, face, distance } => {
                 let src = lookup_shape(*input)?;
                 let resolved = face.resolve_face(store, src).map_err(|reason| CoreError::SemanticReferenceLost { feature: *input, reason })?;
@@ -4981,7 +5116,7 @@ mod tests {
         let mut doc = Document::new("Split");
         let input = doc.add_feature("Input", FeatureKind::Box { width: ScalarParam::mm(20.0), height: ScalarParam::mm(20.0), depth: ScalarParam::mm(20.0) }, true, [1.0; 4]).unwrap();
         let tool = doc.add_feature("Tool", FeatureKind::Box { width: ScalarParam::mm(10.0), height: ScalarParam::mm(30.0), depth: ScalarParam::mm(30.0) }, true, [1.0; 4]).unwrap();
-        let split = doc.add_feature("Split", FeatureKind::Split { input, tool }, true, [1.0; 4]).unwrap();
+        let split = doc.add_feature("Split", FeatureKind::Split { input, tool: Some(tool), plane: None }, true, [1.0; 4]).unwrap();
         assert!(doc.recompute(&mut store, TessellationOptions::default()).unwrap().is_all_clean());
         assert!(doc.features[&split].cached_summary.unwrap().solids >= 1);
     }
@@ -5267,5 +5402,95 @@ mod tests {
         let circ_vol = store.volume(circ_shape).unwrap();
         // 6 pins of r=2, h=10: 6 * pi * 4 * 10 ~= 753.98 mm3
         assert!((circ_vol - 753.98).abs() < 5.0, "circ_vol was {circ_vol}");
+    }
+
+    #[test]
+    fn test_m11_surface_interop() {
+        let mut doc = Document::default();
+        let mut store = ShapeStore::default();
+
+        // 1. Box split by XY plane
+        let box_raw = doc.add_feature("RawBox", FeatureKind::Box {
+            width: ScalarParam::mm(20.0),
+            height: ScalarParam::mm(20.0),
+            depth: ScalarParam::mm(40.0),
+        }, true, [1.0; 4]).unwrap();
+
+        // Shift so Z extends from -20 to +20
+        let box_centered = doc.add_feature("BoxCentered", FeatureKind::Transform {
+            input: box_raw,
+            dx: ScalarParam::mm(0.0),
+            dy: ScalarParam::mm(0.0),
+            dz: ScalarParam::mm(-20.0),
+            rot_origin: [0.0; 3],
+            rot_axis: [0.0, 0.0, 1.0],
+            rot_angle_deg: ScalarParam::Literal(0.0),
+        }, true, [1.0; 4]).unwrap();
+
+        let split_box = doc.add_feature("SplitBox", FeatureKind::Split {
+            input: box_centered,
+            tool: None,
+            plane: Some(SketchPlane::XY),
+        }, true, [1.0; 4]).unwrap();
+
+        assert!(doc.recompute(&mut store, TessellationOptions::default()).unwrap().is_all_clean());
+        let split_shape = doc.features[&split_box].cached_shape.unwrap();
+        let split_faces = store.inspect_shape(split_shape).unwrap().faces;
+        // Splitting 20x20x40 box at Z=0 introduces split sections; total faces >= 8
+        assert!(split_faces.len() >= 8, "Expected split box to have >= 8 faces, got {}", split_faces.len());
+
+        // 2. SurfaceOffset: offset the top face (+Z) by 5.0 mm
+        let top_face = split_faces.iter().find(|f| f.normal.z > 0.9).expect("top face");
+        let top_ref = SemanticReference::from_face(split_box, &store, split_shape, top_face.index).expect("top ref");
+        let offset_feat = doc.add_feature("OffsetTop", FeatureKind::SurfaceOffset {
+            input: split_box,
+            face: top_ref.clone(),
+            distance: ScalarParam::mm(5.0),
+        }, true, [1.0; 4]).unwrap();
+
+        assert!(doc.recompute(&mut store, TessellationOptions::default()).unwrap().is_all_clean());
+        let offset_shape = doc.features[&offset_feat].cached_shape.unwrap();
+        let offset_faces = store.inspect_shape(offset_shape).unwrap().faces;
+        assert_eq!(offset_faces.len(), 1);
+        assert!((offset_faces[0].area_mm2 - 400.0).abs() < 1.0);
+        assert!((offset_faces[0].centroid.z - 5.0).abs() < 1.0);
+
+        // 3. TrimSurface: trim the offset face in UV from [0.25..0.75] x [0.25..0.75]
+        let offset_face_ref = SemanticReference::from_face(offset_feat, &store, offset_shape, offset_faces[0].index).expect("offset ref");
+        let trim_feat = doc.add_feature("TrimmedTop", FeatureKind::TrimSurface {
+            input: offset_feat,
+            face: offset_face_ref,
+            u_min: ScalarParam::Literal(0.0),
+            u_max: ScalarParam::Literal(10.0),
+            v_min: ScalarParam::Literal(0.0),
+            v_max: ScalarParam::Literal(10.0),
+        }, true, [1.0; 4]).unwrap();
+
+        assert!(doc.recompute(&mut store, TessellationOptions::default()).unwrap().is_all_clean());
+        let trim_shape = doc.features[&trim_feat].cached_shape.unwrap();
+        let trim_faces = store.inspect_shape(trim_shape).unwrap().faces;
+        assert_eq!(trim_faces.len(), 1);
+        // Half width x half height => area should be ~100 mm2 (1/4 of 400)
+        assert!((trim_faces[0].area_mm2 - 100.0).abs() < 1.0, "trim area was {}", trim_faces[0].area_mm2);
+
+        // 4. Sew multiple shapes: Sew the trimmed surface with another face/shape
+        let side_face = split_faces.iter().find(|f| f.normal.x > 0.9).expect("side face");
+        let side_ref = SemanticReference::from_face(split_box, &store, split_shape, side_face.index).expect("side ref");
+        let side_offset = doc.add_feature("OffsetSide", FeatureKind::SurfaceOffset {
+            input: split_box,
+            face: side_ref,
+            distance: ScalarParam::mm(0.0), // exact face surface
+        }, true, [1.0; 4]).unwrap();
+
+        let multi_sew = doc.add_feature("MultiSew", FeatureKind::Sew {
+            input: offset_feat,
+            extra_inputs: vec![side_offset],
+            tolerance: ScalarParam::mm(10.0), // large tolerance to sew adjacent boundary
+        }, true, [1.0; 4]).unwrap();
+
+        assert!(doc.recompute(&mut store, TessellationOptions::default()).unwrap().is_all_clean());
+        let sew_shape = doc.features[&multi_sew].cached_shape.unwrap();
+        let sew_faces = store.inspect_shape(sew_shape).unwrap().faces;
+        assert_eq!(sew_faces.len(), 2, "Expected 2 sewn faces in compound shell, got {}", sew_faces.len());
     }
 }
