@@ -130,6 +130,7 @@ impl FerroCadApp {
             ToolKind::Counterbore => ToolPanel::Counterbore { input, center: [0.0, 0.0], hole_radius: 3.0, bore_radius: 6.0, bore_depth: 4.0, depth: 20.0 },
             ToolKind::Countersink => ToolPanel::Countersink { input, center: [0.0, 0.0], hole_radius: 3.0, sink_radius: 6.0, sink_depth: 3.0, depth: 20.0 },
             ToolKind::Refine => ToolPanel::Refine { input },
+            ToolKind::SolidFromShell => ToolPanel::SolidFromShell { input },
             ToolKind::MidPlane => {
                 let selected: Vec<_> = self.render_config.selected_faces.iter().copied().take(2).collect();
                 if selected.len() != 2 { return; }
@@ -176,6 +177,7 @@ impl FerroCadApp {
             ToolPanel::Counterbore { .. } => "⊙ 座ぐり穴",
             ToolPanel::Countersink { .. } => "▽ 皿穴",
             ToolPanel::Refine { .. } => "◇ 分割を整理",
+            ToolPanel::SolidFromShell { .. } => "⬡ 閉じたシェルをソリッド化",
             ToolPanel::MidPlane { .. } => "≡ 中間面からスケッチ",
         };
         let mut confirm = false;
@@ -429,6 +431,10 @@ impl FerroCadApp {
                     ToolPanel::Refine { input } => {
                         ui.label(format!("対象: 「{}」", self.feature_name(*input)));
                         ui.small("同一平面・同一曲面に分かれた不要な面・辺を統合します。");
+                    }
+                    ToolPanel::SolidFromShell { input } => {
+                        ui.label(format!("対象: 「{}」", self.feature_name(*input)));
+                        ui.small("閉じたシェルだけをソリッドへ変換します。開いたシェルはSewで閉じてから実行してください。");
                     }
                     ToolPanel::MidPlane { first_feature, second_feature, .. } => {
                         ui.label(format!("面1: 「{}」", self.feature_name(*first_feature)));
@@ -688,6 +694,9 @@ impl FerroCadApp {
             ),
             ToolPanel::Refine { input } => self.add_replacing(
                 format!("Refine_{n}"), FeatureKind::Refine { input }, input, &[input],
+            ),
+            ToolPanel::SolidFromShell { input } => self.add_replacing(
+                format!("SolidFromShell_{n}"), FeatureKind::SolidFromShell { input }, input, &[input],
             ),
             ToolPanel::MidPlane { first_feature, first, second_feature, second } => {
                 self.start_sketch_with(SketchStart::Extrude);

@@ -264,6 +264,7 @@ pub enum ToolKind {
     Counterbore,
     Countersink,
     Refine,
+    SolidFromShell,
     MidPlane,
 }
 
@@ -333,6 +334,7 @@ pub enum ToolPanel {
     Counterbore { input: FeatureId, center: [f64; 2], hole_radius: f64, bore_radius: f64, bore_depth: f64, depth: f64 },
     Countersink { input: FeatureId, center: [f64; 2], hole_radius: f64, sink_radius: f64, sink_depth: f64, depth: f64 },
     Refine { input: FeatureId },
+    SolidFromShell { input: FeatureId },
     MidPlane { first_feature: FeatureId, first: SemanticReference, second_feature: FeatureId, second: SemanticReference },
 }
 
@@ -952,6 +954,9 @@ impl FerroCadApp {
                     }
                     if ribbon_button(ui, "◇", "分割を整理", feature_selected, "不要な面・辺の分割線を整理します") {
                         self.open_tool_panel(ToolKind::Refine);
+                    }
+                    if ribbon_button(ui, "⬡", "ソリッド化", feature_selected, "閉じたシェルをソリッドへ変換します") {
+                        self.open_tool_panel(ToolKind::SolidFromShell);
                     }
                     if ribbon_button(ui, "⌁", "ロフト", feature_selected, "2つのXYスケッチ断面の間に遷移形状を作ります") {
                         self.open_tool_panel(ToolKind::Loft);
