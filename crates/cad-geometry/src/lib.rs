@@ -651,6 +651,12 @@ impl ShapeStore {
         self.insert(res)
     }
 
+    /// Partitions `input` by `tool`, retaining the split topology instead of removing either side.
+    pub fn split(&mut self, input: ShapeId, tool: ShapeId) -> Result<ShapeId, GeometryError> {
+        let result = self.get(input)?.split(self.get(tool)?)?;
+        self.insert(result)
+    }
+
     /// Boolean intersection (`Common`) of two shapes.
     pub fn common(&mut self, a: ShapeId, b: ShapeId) -> Result<ShapeId, GeometryError> {
         let sa = self.get(a)?;

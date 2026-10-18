@@ -132,6 +132,7 @@ impl FerroCadApp {
             ToolKind::Refine => ToolPanel::Refine { input },
             ToolKind::SolidFromShell => ToolPanel::SolidFromShell { input },
             ToolKind::Sew => ToolPanel::Sew { input, tolerance: 0.001 },
+            ToolKind::Split => ToolPanel::Split { input, tool: None },
             ToolKind::MidPlane => {
                 let selected: Vec<_> = self.render_config.selected_faces.iter().copied().take(2).collect();
                 if selected.len() != 2 { return; }
@@ -180,6 +181,7 @@ impl FerroCadApp {
             ToolPanel::Refine { .. } => "◇ 分割を整理",
             ToolPanel::SolidFromShell { .. } => "⬡ 閉じたシェルをソリッド化",
             ToolPanel::Sew { .. } => "⌁ Sew（面・シェルを縫合）",
+            ToolPanel::Split { .. } => "✂ 分割（Partition）",
             ToolPanel::MidPlane { .. } => "≡ 中間面からスケッチ",
         };
         let mut confirm = false;
@@ -443,6 +445,13 @@ impl FerroCadApp {
                         ui.horizontal(|ui| { ui.label("許容差:"); ui.add(egui::DragValue::new(tolerance).range(0.000_001..=1.0).speed(0.0001).suffix(" mm")); });
                         ui.small("許容差内で一致する面境界を縫合します。必要に応じてソリッド化を続けてください。");
                     }
+                    ToolPanel::Split { input, tool } => {
+                        ui.label(format!("分割される形状: 「{}」", self.feature_name(*input)));
+                        egui::ComboBox::from_id_salt("split_tool").selected_text(tool.map(|id| self.feature_name(id)).unwrap_or_else(|| "（分割用ボディを選択）".to_string())).show_ui(ui, |ui| {
+                            for (id, name) in &names { if *id != *input { ui.selectable_value(tool, Some(*id), name); } }
+                        });
+                        ui.small("二つの形状が交差している必要があります。分割線を保持した結果を作成します。");
+                    }
                     ToolPanel::MidPlane { first_feature, second_feature, .. } => {
                         ui.label(format!("面1: 「{}」", self.feature_name(*first_feature)));
                         ui.label(format!("面2: 「{}」", self.feature_name(*second_feature)));
@@ -455,6 +464,7 @@ impl FerroCadApp {
                     ToolPanel::Boolean { b, .. } => b.is_some(),
                     ToolPanel::Shell { input, .. } => !self.open_faces_on(*input).is_empty(),
                     ToolPanel::Loft { upper, .. } => upper.is_some(),
+                    ToolPanel::Split { tool, .. } => tool.is_some(),
                     _ => true,
                 };
                 ui.horizontal(|ui| {
@@ -708,6 +718,10 @@ impl FerroCadApp {
             ToolPanel::Sew { input, tolerance } => self.add_replacing(
                 format!("Sew_{n}"), FeatureKind::Sew { input, tolerance: ScalarParam::Literal(tolerance) }, input, &[input],
             ),
+            ToolPanel::Split { input, tool: Some(tool) } => self.add_replacing(
+                format!("Split_{n}"), FeatureKind::Split { input, tool }, input, &[input, tool],
+            ),
+            ToolPanel::Split { tool: None, .. } => {}
             ToolPanel::MidPlane { first_feature, first, second_feature, second } => {
                 self.start_sketch_with(SketchStart::Extrude);
                 self.begin_sketch(SketchPlane::MidFace { first_feature, first, second_feature, second }, None);

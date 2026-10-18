@@ -798,6 +798,8 @@ pub enum FeatureKind {
     SolidFromShell { input: FeatureId },
     /// Stitches coincident shell boundaries before solidification.
     Sew { input: FeatureId, tolerance: ScalarParam },
+    /// Partitions `input` with `tool`, retaining the split topology.
+    Split { input: FeatureId, tool: FeatureId },
     /// Direct planar-face offset, retaining a semantic face reference.
     PushPull { input: FeatureId, face: SemanticReference, distance: ScalarParam },
     LinearPattern {
@@ -873,6 +875,7 @@ impl FeatureKind {
             | Self::Counterbore { input, .. }
             | Self::Countersink { input, .. }
             | Self::LinearPattern { input, .. } => vec![*input],
+            Self::Split { input, tool } => if input == tool { vec![*input] } else { vec![*input, *tool] },
         }
     }
 
@@ -900,6 +903,7 @@ impl FeatureKind {
             | Self::LinearPattern { input, .. }
             | Self::Pattern { input, .. }
             | Self::Shell { input, .. } => swap(input),
+            Self::Split { input, tool } => { swap(input); swap(tool); }
             Self::Mirror { input, plane, .. } => {
                 swap(input);
                 match plane {
@@ -1071,6 +1075,7 @@ impl FeatureKind {
             | Self::Counterbore { input, .. }
             | Self::Countersink { input, .. }
             | Self::LinearPattern { input, .. } => Some(*input),
+            Self::Split { input, .. } => Some(*input),
             Self::Boolean { primary, .. } => Some(*primary),
             Self::SketchExtrude { mode, .. } | Self::SketchRevolve { mode, .. } => mode.target(),
             Self::Pattern { input, .. } | Self::Mirror { input, .. } | Self::Shell { input, .. } => {
@@ -1162,6 +1167,7 @@ impl FeatureKind {
             Self::Refine { .. } => {}
             Self::SolidFromShell { .. } => {}
             Self::Sew { tolerance, .. } => add(tolerance),
+            Self::Split { .. } => {}
             Self::PushPull { distance, .. } => add(distance),
             Self::LinearPattern {
                 spacing_x,
@@ -2581,6 +2587,7 @@ impl Document {
             FeatureKind::Refine { input } => Ok(store.refine_shape(lookup_shape(*input)?)?),
             FeatureKind::SolidFromShell { input } => Ok(store.solid_from_shell(lookup_shape(*input)?)?),
             FeatureKind::Sew { input, tolerance } => Ok(store.sew_shape(lookup_shape(*input)?, tolerance.evaluate(params)?)?),
+            FeatureKind::Split { input, tool } => Ok(store.split(lookup_shape(*input)?, lookup_shape(*tool)?)?),
             FeatureKind::PushPull { input, face, distance } => {
                 let src = lookup_shape(*input)?;
                 let resolved = face.resolve_face(store, src).map_err(|reason| CoreError::SemanticReferenceLost { feature: *input, reason })?;
@@ -4318,5 +4325,16 @@ mod tests {
         assert!(doc.recompute(&mut store, TessellationOptions::default()).unwrap().is_all_clean());
         let shape = store.inspect_shape(doc.features[&hole].cached_shape.unwrap()).unwrap();
         assert!(shape.faces.iter().any(|face| (face.centroid.x - 35.0).abs() < 1e-3 && (face.centroid.y - 20.0).abs() < 1e-3));
+    }
+
+    #[test]
+    fn split_feature_partitions_intersecting_bodies() {
+        let mut store = ShapeStore::new();
+        let mut doc = Document::new("Split");
+        let input = doc.add_feature("Input", FeatureKind::Box { width: ScalarParam::mm(20.0), height: ScalarParam::mm(20.0), depth: ScalarParam::mm(20.0) }, true, [1.0; 4]).unwrap();
+        let tool = doc.add_feature("Tool", FeatureKind::Box { width: ScalarParam::mm(10.0), height: ScalarParam::mm(30.0), depth: ScalarParam::mm(30.0) }, true, [1.0; 4]).unwrap();
+        let split = doc.add_feature("Split", FeatureKind::Split { input, tool }, true, [1.0; 4]).unwrap();
+        assert!(doc.recompute(&mut store, TessellationOptions::default()).unwrap().is_all_clean());
+        assert!(doc.features[&split].cached_summary.unwrap().solids >= 1);
     }
 }
