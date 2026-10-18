@@ -322,6 +322,32 @@ fn point_in_polygon(p: [f64; 2], poly: &[[f64; 2]]) -> bool {
     inside
 }
 
+/// Which reference of a feature a [`RefSlot`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefRole {
+    /// The i-th filleted / chamfered edge.
+    Edge(usize),
+    /// The i-th open face of a shell.
+    OpenFace(usize),
+    /// The face a sketch is drawn on, or a mirror plane face.
+    Plane,
+}
+
+/// One face/edge reference held by a feature.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RefSlot {
+    pub role: RefRole,
+    /// The feature whose shape the reference points into.
+    pub upstream: FeatureId,
+    pub reference: SemanticReference,
+}
+
+impl RefSlot {
+    pub fn is_edge(&self) -> bool {
+        matches!(self.role, RefRole::Edge(_))
+    }
+}
+
 /// Revolve axis in sketch coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SketchAxis {
@@ -574,18 +600,24 @@ pub enum FeatureKind {
         angle_deg: ScalarParam,
         mode: ExtrudeMode,
     },
-    /// Repeats a feature. A sketch Join/Cut feature has its tool repeated on its target
-    /// (e.g. a ring of holes); any other feature has its body repeated and fused.
+    /// Repeats a feature. With `tool_only` and a sketch Join/Cut input, the input's tool
+    /// is repeated on its target (e.g. a ring of holes); otherwise the input's body is
+    /// repeated and fused. The choice is stored, not inferred, so re-wiring the input
+    /// (e.g. when inserting a feature mid-history) never changes the meaning.
     Pattern {
         input: FeatureId,
         layout: PatternLayout,
+        #[serde(default)]
+        tool_only: bool,
     },
-    /// Mirrors a feature across a plane. A sketch Join/Cut feature gets its tool mirrored
-    /// onto its target; a body is mirrored, and with `merge` fused with the original.
+    /// Mirrors a feature across a plane: its tool onto its target (`tool_only`), or its
+    /// body, fused with the original when `merge` is set.
     Mirror {
         input: FeatureId,
         plane: SketchPlane,
         merge: bool,
+        #[serde(default)]
+        tool_only: bool,
     },
     /// Hollows a body inward to a wall thickness, opening the given faces.
     Shell {
@@ -690,6 +722,133 @@ impl FeatureKind {
             | Self::Fillet { input, .. }
             | Self::Chamfer { input, .. }
             | Self::LinearPattern { input, .. } => vec![*input],
+        }
+    }
+
+    /// Replaces every reference to feature `old` with `new`. Returns true if anything changed.
+    pub fn retarget(&mut self, old: FeatureId, new: FeatureId) -> bool {
+        let mut changed = false;
+        let mut swap = |id: &mut FeatureId| {
+            if *id == old {
+                *id = new;
+                changed = true;
+            }
+        };
+        match self {
+            Self::Transform { input, .. }
+            | Self::Fillet { input, .. }
+            | Self::Chamfer { input, .. }
+            | Self::LinearPattern { input, .. }
+            | Self::Pattern { input, .. }
+            | Self::Shell { input, .. } => swap(input),
+            Self::Mirror { input, plane, .. } => {
+                swap(input);
+                if let SketchPlane::Face { feature, .. } = plane {
+                    swap(feature);
+                }
+            }
+            Self::Boolean {
+                primary, secondary, ..
+            } => {
+                swap(primary);
+                swap(secondary);
+            }
+            Self::SketchExtrude { plane, mode, .. } | Self::SketchRevolve { plane, mode, .. } => {
+                if let SketchPlane::Face { feature, .. } = plane {
+                    swap(feature);
+                }
+                if let ExtrudeMode::Join { target } | ExtrudeMode::Cut { target } = mode {
+                    swap(target);
+                }
+            }
+            _ => {}
+        }
+        changed
+    }
+
+    /// The face/edge references this feature holds, each tied to the feature whose
+    /// shape it points into.
+    pub fn reference_slots(&self) -> Vec<RefSlot> {
+        let mut out = Vec::new();
+        match self {
+            Self::Fillet {
+                input,
+                semantic_refs,
+                ..
+            }
+            | Self::Chamfer {
+                input,
+                semantic_refs,
+                ..
+            } => {
+                for (i, r) in semantic_refs.iter().enumerate() {
+                    out.push(RefSlot {
+                        role: RefRole::Edge(i),
+                        upstream: *input,
+                        reference: r.clone(),
+                    });
+                }
+            }
+            Self::Shell {
+                input, open_faces, ..
+            } => {
+                for (i, r) in open_faces.iter().enumerate() {
+                    out.push(RefSlot {
+                        role: RefRole::OpenFace(i),
+                        upstream: *input,
+                        reference: r.clone(),
+                    });
+                }
+            }
+            Self::SketchExtrude { plane, .. }
+            | Self::SketchRevolve { plane, .. }
+            | Self::Mirror { plane, .. } => {
+                if let SketchPlane::Face { feature, face } = plane {
+                    out.push(RefSlot {
+                        role: RefRole::Plane,
+                        upstream: *feature,
+                        reference: face.clone(),
+                    });
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
+    /// Replaces the reference in `role` (re-binding it to a newly picked face/edge).
+    pub fn replace_reference(&mut self, role: RefRole, reference: SemanticReference) -> bool {
+        match (self, role) {
+            (
+                Self::Fillet { semantic_refs, .. } | Self::Chamfer { semantic_refs, .. },
+                RefRole::Edge(i),
+            ) => match semantic_refs.get_mut(i) {
+                Some(slot) => {
+                    *slot = reference;
+                    true
+                }
+                None => false,
+            },
+            (Self::Shell { open_faces, .. }, RefRole::OpenFace(i)) => match open_faces.get_mut(i) {
+                Some(slot) => {
+                    *slot = reference;
+                    true
+                }
+                None => false,
+            },
+            (
+                Self::SketchExtrude { plane, .. }
+                | Self::SketchRevolve { plane, .. }
+                | Self::Mirror { plane, .. },
+                RefRole::Plane,
+            ) => match plane {
+                SketchPlane::Face { face, .. } => {
+                    *face = reference;
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
         }
     }
 
@@ -846,6 +1005,9 @@ pub struct Feature {
     pub last_valid_mesh: Option<TriMesh>,
     #[serde(skip)]
     pub last_valid_summary: Option<ShapeSummary>,
+    /// Structured reason for the last `Failed` state, for user-facing explanations.
+    #[serde(skip)]
+    pub failure: Option<CoreError>,
 }
 
 fn default_dirty_state() -> FeatureState {
@@ -897,6 +1059,9 @@ pub enum CadCommand {
         id: FeatureId,
         suppressed: bool,
     },
+    SetRollback {
+        marker: Option<FeatureId>,
+    },
     AddDependency {
         upstream: FeatureId,
         downstream: FeatureId,
@@ -930,6 +1095,10 @@ pub struct DocumentSnapshot {
     pub parameters: BTreeMap<String, Parameter>,
     pub features: BTreeMap<FeatureId, Feature>,
     pub operation_history: Vec<CadCommand>,
+    #[serde(default)]
+    pub order: Vec<FeatureId>,
+    #[serde(default)]
+    pub rollback: Option<FeatureId>,
 }
 
 /// Core parametric CAD Document (Phase 2.1).
@@ -944,6 +1113,12 @@ pub struct Document {
     pub parameters: BTreeMap<String, Parameter>,
     pub features: BTreeMap<FeatureId, Feature>,
     pub operation_history: Vec<CadCommand>,
+    /// Timeline order of features (creation order, plus features inserted while rolled
+    /// back). Features missing from it are appended by id.
+    pub order: Vec<FeatureId>,
+    /// Rollback marker: features after it in the timeline are temporarily not evaluated,
+    /// and new features are inserted right after it. `None` = at the end.
+    pub rollback: Option<FeatureId>,
 }
 
 impl Default for Document {
@@ -962,7 +1137,55 @@ impl Document {
             parameters: BTreeMap::new(),
             features: BTreeMap::new(),
             operation_history: Vec::new(),
+            order: Vec::new(),
+            rollback: None,
         }
+    }
+
+    /// Features in timeline order.
+    pub fn timeline(&self) -> Vec<FeatureId> {
+        let mut out: Vec<FeatureId> = self
+            .order
+            .iter()
+            .copied()
+            .filter(|id| self.features.contains_key(id))
+            .collect();
+        for &id in self.features.keys() {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        out
+    }
+
+    /// True if `id` sits after the rollback marker (temporarily not evaluated).
+    pub fn is_rolled_back(&self, id: FeatureId) -> bool {
+        let Some(marker) = self.rollback else {
+            return false;
+        };
+        let tl = self.timeline();
+        match (tl.iter().position(|&f| f == marker), tl.iter().position(|&f| f == id)) {
+            (Some(m), Some(i)) => i > m,
+            _ => false,
+        }
+    }
+
+    /// Moves the rollback marker (`None` = roll forward to the end).
+    pub fn set_rollback(&mut self, marker: Option<FeatureId>) -> Result<(), CoreError> {
+        if let Some(m) = marker
+            && !self.features.contains_key(&m)
+        {
+            return Err(CoreError::FeatureNotFound(m));
+        }
+        // Rolling to the last feature is the same as no rollback.
+        let marker = marker.filter(|m| self.timeline().last() != Some(m));
+        if self.rollback == marker {
+            return Ok(());
+        }
+        self.rollback = marker;
+        self.revision += 1;
+        self.operation_history.push(CadCommand::SetRollback { marker });
+        Ok(())
     }
 
     /// Sets or updates a named parameter and marks dependent features `Dirty`.
@@ -1135,8 +1358,40 @@ impl Document {
             cached_mesh: None,
             last_valid_mesh: None,
             last_valid_summary: None,
+            failure: None,
         };
+        let modified = kind.primary_input();
         self.features.insert(id, feature);
+        let mut tl = self.timeline();
+        match self.rollback {
+            Some(marker) => {
+                // Insert right after the marker, then move the marker onto the new
+                // feature. Later features that built on the body this feature modifies
+                // now build on the modified result instead.
+                tl.retain(|&f| f != id);
+                let pos = tl.iter().position(|&f| f == marker).map_or(tl.len(), |p| p + 1);
+                let later: Vec<FeatureId> = tl[pos..].to_vec();
+                tl.insert(pos, id);
+                self.rollback = Some(id);
+                if let Some(old) = modified {
+                    for f in later {
+                        let changed = self
+                            .features
+                            .get_mut(&f)
+                            .is_some_and(|feat| feat.kind.retarget(old, id));
+                        if changed {
+                            self.mark_dirty(f);
+                        }
+                    }
+                }
+            }
+            None => {
+                if !tl.contains(&id) {
+                    tl.push(id);
+                }
+            }
+        }
+        self.order = tl;
         self.revision += 1;
         self.operation_history.push(CadCommand::AddFeature {
             name: name_str,
@@ -1265,6 +1520,36 @@ impl Document {
         Ok(())
     }
 
+    /// Checks whether a reference still resolves against its upstream shape right now.
+    pub fn check_reference(&self, slot: &RefSlot, store: &ShapeStore) -> Result<(), ResolutionFailureReason> {
+        let shape = self
+            .features
+            .get(&slot.upstream)
+            .and_then(|f| f.cached_shape)
+            .ok_or_else(|| {
+                ResolutionFailureReason::MissingTargetShape(format!("feature {:?} has no shape", slot.upstream))
+            })?;
+        if slot.is_edge() {
+            slot.reference.resolve_edge(store, shape).map(|_| ())
+        } else {
+            slot.reference.resolve_face(store, shape).map(|_| ())
+        }
+    }
+
+    /// All features downstream of `id` (transitively), in timeline order.
+    pub fn downstream_of(&self, id: FeatureId) -> Vec<FeatureId> {
+        let mut found: HashSet<FeatureId> = HashSet::new();
+        let mut queue = VecDeque::from([id]);
+        while let Some(cur) = queue.pop_front() {
+            for d in self.direct_dependents(cur) {
+                if found.insert(d) {
+                    queue.push_back(d);
+                }
+            }
+        }
+        self.timeline().into_iter().filter(|f| found.contains(f)).collect()
+    }
+
     /// Features that directly depend on `id`.
     pub fn direct_dependents(&self, id: FeatureId) -> Vec<FeatureId> {
         self.features
@@ -1321,6 +1606,12 @@ impl Document {
             return Err(CoreError::FeatureInUse { id, dependents });
         }
 
+        if self.rollback == Some(id) {
+            let tl = self.timeline();
+            let pos = tl.iter().position(|&f| f == id).unwrap_or(0);
+            self.rollback = pos.checked_sub(1).map(|p| tl[p]);
+        }
+        self.order.retain(|&f| f != id);
         let removed = self.features.remove(&id).unwrap();
         if let (Some(shape_store), Some(shape_id)) = (store, removed.cached_shape) {
             let _ = shape_store.remove(shape_id);
@@ -1418,8 +1709,34 @@ impl Document {
             ..RecomputeReport::default()
         };
 
+        let rolled_back: HashSet<FeatureId> = match self.rollback {
+            Some(marker) => {
+                let tl = self.timeline();
+                let pos = tl.iter().position(|&f| f == marker).unwrap_or(tl.len());
+                tl[pos + 1..].iter().copied().collect()
+            }
+            None => HashSet::new(),
+        };
+
         for &fid in &order {
             let feat_snapshot = self.features.get(&fid).cloned().unwrap();
+
+            // Past the rollback marker: not evaluated and not shown until rolled forward.
+            if rolled_back.contains(&fid) {
+                let feat = self.features.get_mut(&fid).unwrap();
+                if let Some(old_id) = feat.cached_shape.take() {
+                    let _ = store.remove(old_id);
+                }
+                feat.cached_mesh = None;
+                feat.cached_summary = None;
+                // The renderer falls back to the last valid mesh (meant for failures);
+                // rolled-back features must not be drawn at all.
+                feat.last_valid_mesh = None;
+                feat.last_valid_summary = None;
+                feat.failure = None;
+                feat.state = FeatureState::Dirty;
+                continue;
+            }
 
             // Check if any upstream dependency failed or is blocked
             let mut blocked_by: Option<FeatureId> = None;
@@ -1504,6 +1821,7 @@ impl Document {
                             feat.cached_mesh = Some(mesh.clone());
                             feat.last_valid_summary = Some(summary);
                             feat.last_valid_mesh = Some(mesh);
+                            feat.failure = None;
                             feat.state = FeatureState::Clean;
                             report.recomputed_features.push(fid);
                         }
@@ -1511,6 +1829,7 @@ impl Document {
                             let _ = store.remove(new_shape_id);
                             let msg = err.to_string();
                             let feat = self.features.get_mut(&fid).unwrap();
+                            feat.failure = Some(CoreError::Geometry(err));
                             if let Some(old_id) = feat.cached_shape.take() {
                                 let _ = store.remove(old_id);
                             }
@@ -1524,6 +1843,7 @@ impl Document {
                 Err(err) => {
                     let msg = err.to_string();
                     let feat = self.features.get_mut(&fid).unwrap();
+                    feat.failure = Some(err);
                     if let Some(old_id) = feat.cached_shape.take() {
                         let _ = store.remove(old_id);
                     }
@@ -1727,18 +2047,19 @@ impl Document {
         }
     }
 
-    /// Applies `instances` of a feature. For a sketch Join/Cut feature the tool is
-    /// placed at every instance on the feature's target; otherwise the feature's body is
-    /// placed at every instance and the copies are fused.
+    /// Applies `instances` of a feature. With `use_tool` (a sketch Join/Cut input) the
+    /// tool is placed at every instance on the input's target; otherwise the input's body
+    /// is placed at every instance and the copies are fused.
     fn replicate(
         &self,
         input: FeatureId,
         instances: &[Instance],
+        use_tool: bool,
         params: &BTreeMap<String, f64>,
         store: &mut ShapeStore,
     ) -> Result<ShapeId, CoreError> {
         let feat = self.features.get(&input).ok_or(CoreError::FeatureNotFound(input))?;
-        if self.is_sketch_tool_feature(input) {
+        if use_tool {
             let mode = match &feat.kind {
                 FeatureKind::SketchExtrude { mode, .. } | FeatureKind::SketchRevolve { mode, .. } => *mode,
                 _ => unreachable!(),
@@ -1843,22 +2164,33 @@ impl Document {
                 let tool = self.sketch_tool(kind, params, store)?;
                 self.combine_with_target(tool, *mode, store)
             }
-            FeatureKind::Pattern { input, layout } => {
+            FeatureKind::Pattern {
+                input,
+                layout,
+                tool_only,
+            } => {
                 let instances = layout.instances(params)?;
-                self.replicate(*input, &instances, params, store)
+                let tool = *tool_only && self.is_sketch_tool_feature(*input);
+                self.replicate(*input, &instances, tool, params, store)
             }
-            FeatureKind::Mirror { input, plane, merge } => {
+            FeatureKind::Mirror {
+                input,
+                plane,
+                merge,
+                tool_only,
+            } => {
                 let frame = self.sketch_plane_frame(plane, store)?;
                 let mirror = Instance::Mirror {
                     origin: frame.origin,
                     normal: frame.normal,
                 };
-                let instances = if *merge || self.is_sketch_tool_feature(*input) {
+                let tool = *tool_only && self.is_sketch_tool_feature(*input);
+                let instances = if *merge || tool {
                     vec![Instance::Identity, mirror]
                 } else {
                     vec![mirror]
                 };
-                self.replicate(*input, &instances, params, store)
+                self.replicate(*input, &instances, tool, params, store)
             }
             FeatureKind::Shell {
                 input,
@@ -2047,6 +2379,8 @@ impl Document {
             parameters: self.parameters.clone(),
             features: self.features.clone(),
             operation_history: self.operation_history.clone(),
+            order: self.order.clone(),
+            rollback: self.rollback,
         }
     }
 
@@ -2072,6 +2406,8 @@ impl Document {
             parameters: snapshot.parameters,
             features,
             operation_history: snapshot.operation_history,
+            order: snapshot.order,
+            rollback: snapshot.rollback,
         };
         // Validate parameter & feature graph integrity on load
         doc.resolve_all_parameters()?;
@@ -2197,6 +2533,10 @@ impl DocumentController {
             CadCommand::SetSuppressed { id, suppressed } => {
                 self.document.set_suppressed(id, suppressed)?;
                 Ok(Some(id))
+            }
+            CadCommand::SetRollback { marker } => {
+                self.document.set_rollback(marker)?;
+                Ok(None)
             }
             CadCommand::AddDependency {
                 upstream,
@@ -3011,6 +3351,7 @@ mod tests {
                         count: 6,
                         total_angle_deg: ScalarParam::mm(360.0),
                     },
+                    tool_only: true,
                 },
                 true,
                 [1.0; 4],
@@ -3042,6 +3383,7 @@ mod tests {
                     input: block,
                     plane: SketchPlane::YZ,
                     merge: true,
+                    tool_only: false,
                 },
                 true,
                 [1.0; 4],
@@ -3123,6 +3465,128 @@ mod tests {
         assert_eq!(report.failed_features.len(), 1);
         assert_eq!(report.failed_features[0].0, bad_id);
         assert!(report.failed_features[0].1.contains("crosses the revolve axis"));
+    }
+
+    /// M5: a lost reference is reported with a structured reason and can be re-bound;
+    /// rolling back, inserting a hole mid-history and rolling forward makes the later
+    /// mirror build on the drilled plate.
+    #[test]
+    fn m5_rebind_and_rollback_insert() {
+        let tess = TessellationOptions::default();
+        let mut store = ShapeStore::new();
+        let mut doc = Document::new("M5");
+        let plate = doc
+            .add_feature(
+                "Plate",
+                FeatureKind::Box {
+                    width: ScalarParam::mm(100.0),
+                    height: ScalarParam::mm(60.0),
+                    depth: ScalarParam::mm(10.0),
+                },
+                true,
+                [1.0; 4],
+            )
+            .unwrap();
+        let mirror = doc
+            .add_feature(
+                "Mirror",
+                FeatureKind::Mirror {
+                    input: plate,
+                    plane: SketchPlane::YZ,
+                    merge: true,
+                    tool_only: false,
+                },
+                true,
+                [1.0; 4],
+            )
+            .unwrap();
+        doc.recompute(&mut store, tess).unwrap();
+        let vol = |doc: &Document, id: FeatureId| doc.features[&id].cached_summary.unwrap().volume_mm3;
+        assert!((vol(&doc, mirror) - 120_000.0).abs() < 1e-3);
+
+        // Roll back to the plate: the mirror is set aside.
+        doc.set_rollback(Some(plate)).unwrap();
+        doc.recompute(&mut store, tess).unwrap();
+        assert!(doc.is_rolled_back(mirror));
+        assert!(doc.features[&mirror].cached_mesh.is_none());
+        assert!(doc.features[&mirror].last_valid_mesh.is_none(), "rolled-back features are not drawn");
+
+        // Insert a through hole on the plate's top face while rolled back.
+        let shape = doc.features[&plate].cached_shape.unwrap();
+        let top = store.resolve_face_by_signature(shape, DVec3::Z, None, 0.99).unwrap();
+        let top_ref = SemanticReference::from_face(plate, &store, shape, top.index).unwrap();
+        let mut circle = Sketch::new("Hole");
+        let c = circle.add_point(30.0, 20.0);
+        circle.add_circle(c, 5.0);
+        let cut = doc
+            .add_feature(
+                "Hole",
+                FeatureKind::SketchExtrude {
+                    sketch: circle,
+                    depth: ScalarParam::mm(1.0),
+                    plane: SketchPlane::Face {
+                        feature: plate,
+                        face: top_ref,
+                    },
+                    mode: ExtrudeMode::Cut { target: plate },
+                    reversed: true,
+                    symmetric: false,
+                    through_all: true,
+                },
+                true,
+                [1.0; 4],
+            )
+            .unwrap();
+        assert_eq!(doc.timeline(), vec![plate, cut, mirror]);
+        assert_eq!(doc.rollback, Some(cut), "the marker follows the inserted feature");
+        match &doc.features[&mirror].kind {
+            FeatureKind::Mirror { input, .. } => assert_eq!(*input, cut, "mirror now builds on the drilled plate"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(doc.downstream_of(plate), vec![cut, mirror]);
+
+        doc.set_rollback(None).unwrap();
+        let report = doc.recompute(&mut store, tess).unwrap();
+        assert!(report.is_all_clean(), "{:?}", report.failed_features);
+        let hole = 0.5 * 48.0 * 25.0 * (std::f64::consts::TAU / 48.0).sin();
+        assert!((vol(&doc, mirror) - 2.0 * (60_000.0 - hole * 10.0)).abs() < 1.0, "{}", vol(&doc, mirror));
+
+        // Break the hole's sketch-plane reference, then re-bind it to the top face.
+        let mut broken = doc.features[&cut].kind.clone();
+        let bogus = SemanticReference {
+            target_feature: plate,
+            kind: cad_geometry::SubshapeKind::Face,
+            expected_normal: Some(DVec3::new(1.0, 1.0, 1.0).normalize()),
+            normalized_bbox_centroid: None,
+            world_centroid_hint: None,
+            metric_hint: None,
+            normal_cos_threshold: 0.99,
+        };
+        assert!(broken.replace_reference(RefRole::Plane, bogus));
+        doc.update_feature(cut, None, Some(broken), None, None).unwrap();
+        doc.recompute(&mut store, tess).unwrap();
+        assert!(matches!(
+            doc.features[&cut].failure,
+            Some(CoreError::SemanticReferenceLost { .. })
+        ));
+        let slot = doc.features[&cut].kind.reference_slots().remove(0);
+        assert_eq!((slot.role, slot.upstream), (RefRole::Plane, plate));
+        assert!(doc.check_reference(&slot, &store).is_err());
+
+        let shape = doc.features[&plate].cached_shape.unwrap();
+        let fresh = SemanticReference::from_face(plate, &store, shape, top.index).unwrap();
+        let mut fixed = doc.features[&cut].kind.clone();
+        assert!(fixed.replace_reference(RefRole::Plane, fresh));
+        doc.update_feature(cut, None, Some(fixed), None, None).unwrap();
+        let report = doc.recompute(&mut store, tess).unwrap();
+        assert!(report.is_all_clean(), "{:?}", report.failed_features);
+        assert!(doc.features[&cut].failure.is_none());
+
+        // Order and rollback survive a save/load round trip.
+        doc.set_rollback(Some(plate)).unwrap();
+        let reloaded = Document::from_snapshot(doc.to_snapshot()).unwrap();
+        assert_eq!(reloaded.timeline(), vec![plate, cut, mirror]);
+        assert_eq!(reloaded.rollback, Some(plate));
     }
 
     #[test]

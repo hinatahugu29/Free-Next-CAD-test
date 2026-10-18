@@ -1,5 +1,7 @@
 //! Desktop CAD GUI for FerroCAD powered by `egui` / `eframe` and `cad-render` (Phase 3 & Phase 4).
 
+mod explain;
+mod rebind;
 mod sketch_editor;
 mod tools;
 
@@ -159,6 +161,8 @@ pub struct FerroCadApp {
     /// Open "select → adjust → confirm" panel for a modify tool.
     pub tool_panel: Option<ToolPanel>,
     pub sketch_start: SketchStart,
+    /// Re-picking a feature's face/edge reference in the viewport.
+    pub rebind: Option<rebind::RebindState>,
 }
 
 /// Which modify tool a ribbon button opens.
@@ -213,6 +217,8 @@ pub enum ToolPanel {
 
 /// Action chosen from a timeline chip's right-click menu.
 enum ChipAction {
+    Rebind(FeatureId),
+    RollbackTo(FeatureId),
     EditSketch(FeatureId),
     Rename(FeatureId),
     ToggleSuppress(FeatureId),
@@ -338,6 +344,7 @@ impl FerroCadApp {
             sketch_through_all: false,
             tool_panel: None,
             sketch_start: SketchStart::Extrude,
+            rebind: None,
         }
     }
 
@@ -802,8 +809,15 @@ impl FerroCadApp {
             Ok(report) => {
                 if !report.failed_features.is_empty() {
                     for (fid, msg) in &report.failed_features {
-                        self.status_logs
-                            .push(format!("フィーチャー {:?} 計算失敗: {}", fid, msg));
+                        let doc = &self.controller.document;
+                        let line = match doc.features.get(fid).and_then(|f| f.failure.as_ref()) {
+                            Some(err) => {
+                                let e = explain::explain(err, doc);
+                                format!("「{}」を計算できません: {} → {}", self.feature_name(*fid), e.summary, e.action)
+                            }
+                            None => format!("「{}」を計算できません: {msg}", self.feature_name(*fid)),
+                        };
+                        self.status_logs.push(line);
                     }
                 } else {
                     self.status_logs.push(format!(
@@ -1090,13 +1104,13 @@ impl FerroCadApp {
     /// history bar in Fusion-style CAD): one chip per feature in creation order, flat
     /// rather than a nested tree (UX concept B).
     fn render_bottom_timeline(&mut self, ui: &mut egui::Ui) {
-        let features_list: Vec<_> = self
-            .controller
-            .document
-            .features
-            .values()
-            .cloned()
+        let doc = &self.controller.document;
+        let features_list: Vec<_> = doc
+            .timeline()
+            .into_iter()
+            .filter_map(|id| doc.features.get(&id).cloned())
             .collect();
+        let rollback = doc.rollback;
         let mut visibility_toggle: Option<(FeatureId, bool)> = None;
         let mut chip_action: Option<ChipAction> = None;
 
@@ -1108,27 +1122,36 @@ impl FerroCadApp {
             .and_then(|sid| self.controller.document.features.get(&sid))
             .map(|f| f.kind.upstream_features().into_iter().collect())
             .unwrap_or_default();
+        // Everything downstream (transitively): what a change to the selection affects.
         let direct_downstream: std::collections::HashSet<FeatureId> = selected
-            .map(|sid| {
-                features_list
-                    .iter()
-                    .filter(|f| f.kind.upstream_features().contains(&sid))
-                    .map(|f| f.id)
-                    .collect()
-            })
+            .map(|sid| self.controller.document.downstream_of(sid).into_iter().collect())
             .unwrap_or_default();
 
+        let mut roll_forward = false;
         ui.horizontal(|ui| {
             ui.strong("🕒 タイムライン");
-            if selected.is_some() && (!direct_upstream.is_empty() || !direct_downstream.is_empty()) {
-                ui.small("  ← 青: 選択中が参照している元 / 橙: それを参照している先 →");
+            if rollback.is_some() {
+                ui.colored_label(
+                    Color32::from_rgb(240, 190, 80),
+                    "巻き戻し中：薄い部分は一時的に外れています。新しい操作は ▌ の位置に入ります",
+                );
+                if ui.button("▶ 最後まで進める").clicked() {
+                    roll_forward = true;
+                }
+            } else if selected.is_some() && (!direct_upstream.is_empty() || !direct_downstream.is_empty()) {
+                ui.small("  ← 青: 選択中が参照している元 / 橙: 変更すると影響を受ける先 →");
             }
         });
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
+                let mut past_marker = false;
                 for (i, feat) in features_list.iter().enumerate() {
                     if i > 0 {
                         ui.label(RichText::new("›").weak());
+                    }
+                    let rolled = past_marker;
+                    if rolled {
+                        ui.set_opacity(0.4);
                     }
                     let (badge, badge_color) = match &feat.state {
                         FeatureState::Clean => ("✓", Color32::from_rgb(80, 210, 120)),
@@ -1168,8 +1191,18 @@ impl FerroCadApp {
                                 };
                                 let is_sketch = matches!(feat.kind, FeatureKind::SketchExtrude { .. } | FeatureKind::SketchRevolve { .. });
                                 let resp = ui.selectable_label(is_selected, name);
-                                let resp = if let FeatureState::Failed(msg) = &feat.state {
-                                    resp.on_hover_text(msg)
+                                let resp = if rolled {
+                                    resp.on_hover_text("巻き戻し中（計算から一時的に外れています）")
+                                } else if let FeatureState::Failed(msg) = &feat.state {
+                                    let text = match &feat.failure {
+                                        Some(err) => {
+                                            let e = explain::explain(err, &self.controller.document);
+                                            format!("{}
+→ {}", e.summary, e.action)
+                                        }
+                                        None => msg.clone(),
+                                    };
+                                    resp.on_hover_text(text)
                                 } else if feat.suppressed {
                                     resp.on_hover_text("抑制中（形状から一時的に外れています）")
                                 } else if is_sketch {
@@ -1200,6 +1233,20 @@ impl FerroCadApp {
                                         chip_action = Some(ChipAction::ToggleSuppress(feat.id));
                                         ui.close_menu();
                                     }
+                                    if !feat.kind.reference_slots().is_empty()
+                                        && ui.button("🎯 参照を選び直す…").clicked()
+                                    {
+                                        chip_action = Some(ChipAction::Rebind(feat.id));
+                                        ui.close_menu();
+                                    }
+                                    if ui
+                                        .button("⏮ ここまで戻す")
+                                        .on_hover_text("これより後の操作を一時的に外し、ここに新しい操作を差し込めるようにします")
+                                        .clicked()
+                                    {
+                                        chip_action = Some(ChipAction::RollbackTo(feat.id));
+                                        ui.close_menu();
+                                    }
                                     ui.separator();
                                     if ui.button("🗑 削除").clicked() {
                                         chip_action = Some(ChipAction::Delete(feat.id));
@@ -1208,11 +1255,24 @@ impl FerroCadApp {
                                 });
                             });
                         });
+                    if rolled {
+                        ui.set_opacity(1.0);
+                    }
+                    if rollback == Some(feat.id) {
+                        ui.label(RichText::new("▌").size(20.0).color(Color32::from_rgb(240, 190, 80)))
+                            .on_hover_text("巻き戻し位置: 新しい操作はここに入ります");
+                        past_marker = true;
+                    }
                 }
             });
         });
 
+        if roll_forward {
+            self.set_rollback(None);
+        }
         match chip_action {
+            Some(ChipAction::Rebind(id)) => self.start_rebind(id, None),
+            Some(ChipAction::RollbackTo(id)) => self.set_rollback(Some(id)),
             Some(ChipAction::EditSketch(id)) => self.edit_sketch_feature(id),
             Some(ChipAction::Rename(id)) => {
                 self.rename_target = Some((id, self.feature_name(id)));
@@ -1257,12 +1317,26 @@ impl FerroCadApp {
                 ui.colored_label(Color32::from_rgb(80, 210, 120), "状態: Clean（正常）");
             }
             FeatureState::Failed(msg) => {
-                ui.colored_label(
-                    Color32::from_rgb(245, 90, 90),
-                    format!(
-                        "状態: 計算失敗 ({msg})\n※3Dビューには最後に正常だった形状を半透明表示中"
-                    ),
-                );
+                egui::Frame::group(ui.style())
+                    .fill(Color32::from_rgba_unmultiplied(80, 24, 24, 160))
+                    .show(ui, |ui| {
+                        ui.colored_label(Color32::from_rgb(245, 110, 110), "× 計算できませんでした");
+                        match &feat.failure {
+                            Some(err) => {
+                                let e = explain::explain(err, &self.controller.document);
+                                ui.label(&e.summary);
+                                if !e.action.is_empty() {
+                                    ui.label(RichText::new(format!("→ {}", e.action)).strong());
+                                }
+                                ui.collapsing("詳細（技術情報）", |ui| {
+                                    ui.small(msg);
+                                });
+                            }
+                            None => {
+                                ui.label(msg);
+                            }
+                        }
+                    });
             }
             FeatureState::Blocked { upstream_failed } => {
                 let upstream_name = self.feature_name(*upstream_failed);
@@ -1279,14 +1353,59 @@ impl FerroCadApp {
                 };
                 ui.colored_label(Color32::from_rgb(240, 150, 65), msg);
             }
+            _ if self.controller.document.is_rolled_back(feat.id) => {
+                ui.colored_label(
+                    Color32::from_rgb(240, 190, 80),
+                    "状態: 巻き戻し中（計算から一時的に外れています）",
+                );
+            }
             other => {
                 ui.label(format!("状態: {other:?}"));
             }
         }
 
+        let names = |ids: &[FeatureId]| {
+            ids.iter()
+                .map(|d| format!("「{}」", self.feature_name(*d)))
+                .collect::<Vec<_>>()
+                .join("、")
+        };
         let deps = feat.all_dependencies();
         if !deps.is_empty() {
-            ui.label(format!("依存元ノード: {deps:?}"));
+            ui.label(format!("元にしている: {}", names(&deps)));
+        }
+        let affected = self.controller.document.downstream_of(feat.id);
+        if !affected.is_empty() {
+            ui.label(format!("変更すると影響: {}（{}個）", names(&affected), affected.len()))
+                .on_hover_text("これらはタイムラインで橙色の枠になっています");
+        }
+
+        // Face/edge references this feature holds, with whether each still resolves.
+        let slots = feat.kind.reference_slots();
+        if !slots.is_empty() {
+            ui.separator();
+            ui.strong("参照（形状への結び付き）:");
+            let mut rebind_role = None;
+            for slot in &slots {
+                let status = self.controller.document.check_reference(slot, &self.store);
+                ui.horizontal(|ui| {
+                    let label = rebind::role_label(slot.role);
+                    match status {
+                        Ok(()) => ui.colored_label(Color32::from_rgb(80, 210, 120), format!("✓ {label}")),
+                        Err(_) => ui.colored_label(
+                            Color32::from_rgb(245, 110, 110),
+                            format!("× {label}（見つかりません）"),
+                        ),
+                    }
+                    .on_hover_text(format!("「{}」の上の参照", self.feature_name(slot.upstream)));
+                    if ui.small_button("選び直す").clicked() {
+                        rebind_role = Some(slot.role);
+                    }
+                });
+            }
+            if let Some(role) = rebind_role {
+                self.start_rebind(feat.id, Some(role));
+            }
         }
 
         ui.separator();
@@ -1475,9 +1594,10 @@ impl FerroCadApp {
         }
 
         if self.viewport_dirty {
+            let view_doc = self.view_document();
             if let Some(ref renderer) = self.renderer
                 && let Ok(rgba) = renderer.render_to_rgba(
-                    &self.controller.document,
+                    &view_doc,
                     &self.camera,
                     &self.render_config,
                     width,
@@ -1556,7 +1676,7 @@ impl FerroCadApp {
         if self.sketch_plane_picking {
             let hovered = response.hover_pos().and_then(|pos| {
                 let (u, v) = uv(pos);
-                pick_document(&self.controller.document, &self.camera, u, v, aspect)
+                pick_document(&self.view_document(), &self.camera, u, v, aspect)
                     .map(|hit| (hit.feature_id, hit.face_index))
             });
             if hovered != self.hover_face {
@@ -1576,17 +1696,32 @@ impl FerroCadApp {
             }
         }
 
+        // Re-binding a reference: a click on the shown body picks the new face/edge.
+        if self.rebind.is_some() {
+            if response.clicked()
+                && let Some(pos) = response.interact_pointer_pos()
+            {
+                let (u, v) = uv(pos);
+                let hit = pick_document(&self.view_document(), &self.camera, u, v, aspect);
+                if let Some(hit) = hit {
+                    self.apply_rebind_pick(hit.feature_id, hit.face_index, hit.nearest_edge_index);
+                }
+            }
+            self.render_rebind_banner(ui, rect);
+        }
+
         // 3D Raycast Picking: single-click selects, double-click also opens
         // a floating on-canvas property editor right at the clicked point
         // (no need to go hunting through a side panel).
         if !self.sketch_plane_picking
             && !self.sketch_mode
+            && self.rebind.is_none()
             && (response.clicked() || response.double_clicked())
             && let Some(pos) = response.interact_pointer_pos()
         {
             let (uv_x, uv_y) = uv(pos);
             if let Some(hit) =
-                pick_document(&self.controller.document, &self.camera, uv_x, uv_y, aspect)
+                pick_document(&self.view_document(), &self.camera, uv_x, uv_y, aspect)
             {
                 self.render_config.selected_feature = Some(hit.feature_id);
                 self.render_config.selected_face = Some((hit.feature_id, hit.face_index));
@@ -2187,6 +2322,37 @@ mod tests {
             app.fit_all();
             app.open_tool_panel(ToolKind::CircularPattern);
         });
+        // M5: a hole whose plane reference broke (explanation + red chip), the re-bind
+        // mode, and a rolled-back timeline.
+        let broken_hole = |app: &mut FerroCadApp| -> FeatureId {
+            let plate = FeatureId(5);
+            let shape = app.controller.document.features[&plate].cached_shape.unwrap();
+            let top = app.store.resolve_face_by_signature(shape, glam::DVec3::Z, None, 0.99).unwrap();
+            app.start_sketch_with(SketchStart::Hole);
+            app.begin_sketch_on_face(plate, top.index);
+            let c = app.sketch.add_point(50.0, 30.0);
+            app.sketch.add_circle(c, 5.0);
+            app.finish_sketch_extrude();
+            let hole = *app.controller.document.features.keys().next_back().unwrap();
+            let mut kind = app.controller.document.features[&hole].kind.clone();
+            let mut bogus = kind.reference_slots()[0].reference.clone();
+            bogus.expected_normal = Some(glam::DVec3::new(1.0, 1.0, 1.0).normalize());
+            kind.replace_reference(cad_core::RefRole::Plane, bogus);
+            app.execute_cmd(CadCommand::UpdateFeature { id: hole, name: None, kind: Some(kind), visible: None, color_rgba: None });
+            app.render_config.selected_feature = Some(hole);
+            hole
+        };
+        shoot("m5_failure.png", &|app| {
+            broken_hole(app);
+        });
+        shoot("m5_rebind.png", &|app| {
+            let hole = broken_hole(app);
+            app.start_rebind(hole, None);
+        });
+        shoot("m5_rollback.png", &|app| {
+            app.set_rollback(Some(FeatureId(3)));
+            app.render_config.selected_feature = Some(FeatureId(1));
+        });
         shoot("m4_revolve_sketch.png", &|app| {
             app.start_sketch_with(SketchStart::Revolve);
             app.begin_sketch(SketchPlane::XZ, None);
@@ -2260,6 +2426,76 @@ mod tests {
         assert!((vol(&app, ring) - (flange_vol - 6.0 * hole_area * 8.0)).abs() < 1.0, "{}", vol(&app, ring));
         assert!(!app.controller.document.features[&hole].visible);
         assert!(app.controller.document.features[&ring].visible);
+    }
+
+    /// M5 flow: a hole whose sketch-plane reference is lost shows a plain explanation
+    /// and is repaired by re-binding (clicking the top face again); then rolling back to
+    /// the plate, inserting a second hole and rolling forward keeps the timeline order.
+    #[test]
+    fn m5_explain_rebind_and_rollback() {
+        use cad_core::RefRole;
+
+        let mut app = FerroCadApp::new_with_mvp_demo();
+        let plate = FeatureId(5);
+        let shape = app.controller.document.features[&plate].cached_shape.unwrap();
+        let top = app
+            .store
+            .resolve_face_by_signature(shape, glam::DVec3::Z, None, 0.99)
+            .unwrap();
+        app.start_sketch_with(SketchStart::Hole);
+        app.begin_sketch_on_face(plate, top.index);
+        let c = app.sketch.add_point(50.0, 30.0);
+        app.sketch.add_circle(c, 5.0);
+        app.finish_sketch_extrude();
+        let hole = *app.controller.document.features.keys().next_back().unwrap();
+        assert_eq!(app.controller.document.features[&hole].state, FeatureState::Clean);
+
+        // Break the plane reference (as an upstream edit could) and recompute.
+        let mut kind = app.controller.document.features[&hole].kind.clone();
+        let mut bogus = kind.reference_slots()[0].reference.clone();
+        bogus.expected_normal = Some(glam::DVec3::new(1.0, 1.0, 1.0).normalize());
+        bogus.normal_cos_threshold = 0.99;
+        assert!(kind.replace_reference(RefRole::Plane, bogus));
+        app.execute_cmd(CadCommand::UpdateFeature { id: hole, name: None, kind: Some(kind), visible: None, color_rgba: None });
+        let feat = &app.controller.document.features[&hole];
+        let e = explain::explain(feat.failure.as_ref().expect("structured failure"), &app.controller.document);
+        assert!(e.summary.contains("見つからなく"), "{}", e.summary);
+        assert!(e.action.contains("選び直す"), "{}", e.action);
+        assert!(app.status_logs.last().unwrap().contains("計算できません"));
+
+        // Re-bind: the viewport shows only the plate; clicking its top face repairs it.
+        app.start_rebind(hole, None);
+        let state = app.rebind.expect("rebind active");
+        assert_eq!((state.role, state.upstream), (RefRole::Plane, plate));
+        let view = app.view_document();
+        assert!(view.features.values().all(|f| f.visible == (f.id == plate)));
+        drop(view);
+        app.apply_rebind_pick(plate, top.index, None);
+        assert!(app.rebind.is_none());
+        assert_eq!(app.controller.document.features[&hole].state, FeatureState::Clean);
+        assert!(app.status_logs.last().unwrap().contains("選び直しました"));
+
+        // Roll back to the plate, insert a second hole there, roll forward.
+        app.set_rollback(Some(plate));
+        assert!(app.controller.document.is_rolled_back(hole));
+        assert!(app.controller.document.features[&hole].cached_mesh.is_none());
+        app.start_sketch_with(SketchStart::Hole);
+        app.begin_sketch_on_face(plate, top.index);
+        let c = app.sketch.add_point(70.0, 30.0);
+        app.sketch.add_circle(c, 5.0);
+        app.finish_sketch_extrude();
+        let inserted = app.controller.document.rollback.expect("marker on inserted feature");
+        let tl = app.controller.document.timeline();
+        let pos = |id| tl.iter().position(|&f| f == id).unwrap();
+        assert!(pos(plate) < pos(inserted) && pos(inserted) < pos(hole));
+        app.set_rollback(None);
+        let doc = &app.controller.document;
+        assert_eq!(doc.features[&hole].state, FeatureState::Clean);
+        // The later hole was re-wired onto the inserted one, so it carries both holes.
+        let area = 0.5 * 48.0 * 25.0 * (std::f64::consts::TAU / 48.0).sin();
+        let plate_vol = doc.features[&plate].cached_summary.unwrap().volume_mm3;
+        let vol = doc.features[&hole].cached_summary.unwrap().volume_mm3;
+        assert!((vol - (plate_vol - 2.0 * area * 10.0)).abs() < 1.0, "{vol} vs {plate_vol}");
     }
 
     /// M3 flow: draw a rectangle with a circle inside, constrain it fully with
