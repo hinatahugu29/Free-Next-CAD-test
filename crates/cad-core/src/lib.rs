@@ -738,6 +738,8 @@ pub enum FeatureKind {
         #[serde(default)]
         reversed: bool,
     },
+    /// OCCT Shape Healing applied as a non-destructive history feature.
+    Heal { input: FeatureId },
     LinearPattern {
         input: FeatureId,
         spacing_x: ScalarParam,
@@ -796,6 +798,7 @@ impl FeatureKind {
             | Self::Fillet { input, .. }
             | Self::Chamfer { input, .. }
             | Self::Draft { input, .. }
+            | Self::Heal { input }
             | Self::LinearPattern { input, .. } => vec![*input],
         }
     }
@@ -814,6 +817,7 @@ impl FeatureKind {
             | Self::Fillet { input, .. }
             | Self::Chamfer { input, .. }
             | Self::Draft { input, .. }
+            | Self::Heal { input }
             | Self::LinearPattern { input, .. }
             | Self::Pattern { input, .. }
             | Self::Shell { input, .. } => swap(input),
@@ -947,6 +951,7 @@ impl FeatureKind {
             | Self::Fillet { input, .. }
             | Self::Chamfer { input, .. }
             | Self::Draft { input, .. }
+            | Self::Heal { input }
             | Self::LinearPattern { input, .. } => Some(*input),
             Self::Boolean { primary, .. } => Some(*primary),
             Self::SketchExtrude { mode, .. } | Self::SketchRevolve { mode, .. } => mode.target(),
@@ -1035,6 +1040,7 @@ impl FeatureKind {
                 add(distance);
             }
             Self::Draft { angle_deg, .. } => add(angle_deg),
+            Self::Heal { .. } => {}
             Self::LinearPattern {
                 spacing_x,
                 spacing_y,
@@ -2379,6 +2385,7 @@ impl Document {
                 })?;
                 Ok(store.draft_faces(src, &indices, neutral.index, angle_deg.evaluate(params)?, *reversed)?)
             }
+            FeatureKind::Heal { input } => Ok(store.heal_shape(lookup_shape(*input)?)?),
             FeatureKind::ExtrudeCircle { radius, depth } => {
                 let r = radius.evaluate(params)?;
                 let d = depth.evaluate(params)?;

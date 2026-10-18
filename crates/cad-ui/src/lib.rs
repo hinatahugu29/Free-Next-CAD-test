@@ -142,6 +142,7 @@ fn feature_parameter_slots(kind: &FeatureKind) -> Vec<(&'static str, &ScalarPara
         FeatureKind::Shell { thickness, .. } => vec![("壁の厚さ", thickness)],
         FeatureKind::Mirror { .. }
         | FeatureKind::Boolean { .. }
+        | FeatureKind::Heal { .. }
         | FeatureKind::ImportedBody { .. } => Vec::new(),
     }
 }
