@@ -260,6 +260,7 @@ pub enum ToolKind {
     PushPull,
     SweepCircle,
     Counterbore,
+    Countersink,
 }
 
 /// What the sketch being started will become.
@@ -326,6 +327,7 @@ pub enum ToolPanel {
     PushPull { input: FeatureId, face: SemanticReference, distance: f64 },
     SweepCircle { radius: f64, path: [f64; 3] },
     Counterbore { input: FeatureId, hole_radius: f64, bore_radius: f64, bore_depth: f64, depth: f64 },
+    Countersink { input: FeatureId, hole_radius: f64, sink_radius: f64, sink_depth: f64, depth: f64 },
 }
 
 /// Action chosen from a timeline chip's right-click menu.
@@ -953,6 +955,9 @@ impl FerroCadApp {
                     }
                     if ribbon_button(ui, "⊙", "座ぐり穴", feature_selected, "原点位置に座ぐり穴を作ります") {
                         self.open_tool_panel(ToolKind::Counterbore);
+                    }
+                    if ribbon_button(ui, "▽", "皿穴", feature_selected, "原点位置に皿穴を作ります") {
+                        self.open_tool_panel(ToolKind::Countersink);
                     }
                 });
                 ribbon_group(ui, "パターン・組み合わせ", |ui| {

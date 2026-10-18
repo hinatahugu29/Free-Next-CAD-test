@@ -128,6 +128,7 @@ impl FerroCadApp {
             }
             ToolKind::SweepCircle => ToolPanel::SweepCircle { radius: 5.0, path: [0.0, 0.0, 50.0] },
             ToolKind::Counterbore => ToolPanel::Counterbore { input, hole_radius: 3.0, bore_radius: 6.0, bore_depth: 4.0, depth: 20.0 },
+            ToolKind::Countersink => ToolPanel::Countersink { input, hole_radius: 3.0, sink_radius: 6.0, sink_depth: 3.0, depth: 20.0 },
         });
     }
 
@@ -162,6 +163,7 @@ impl FerroCadApp {
             ToolPanel::PushPull { .. } => "↕ 面を押出し・引込み",
             ToolPanel::SweepCircle { .. } => "⌒ Sweep（円形・直線）",
             ToolPanel::Counterbore { .. } => "⊙ 座ぐり穴",
+            ToolPanel::Countersink { .. } => "▽ 皿穴",
         };
         let mut confirm = false;
         let mut cancel = false;
@@ -384,6 +386,13 @@ impl FerroCadApp {
                         ui.horizontal(|ui| { ui.label("穴半径:"); ui.add(egui::DragValue::new(hole_radius).range(0.01..=1000.0).suffix(" mm")); });
                         ui.horizontal(|ui| { ui.label("座ぐり半径:"); ui.add(egui::DragValue::new(bore_radius).range(0.01..=1000.0).suffix(" mm")); });
                         ui.horizontal(|ui| { ui.label("座ぐり深さ:"); ui.add(egui::DragValue::new(bore_depth).range(0.01..=1000.0).suffix(" mm")); ui.label("全深さ:"); ui.add(egui::DragValue::new(depth).range(0.01..=1000.0).suffix(" mm")); });
+                        ui.small("初期版は対象ボディ座標の原点から +Z へ穴を作ります。");
+                    }
+                    ToolPanel::Countersink { input, hole_radius, sink_radius, sink_depth, depth } => {
+                        ui.label(format!("対象: 「{}」", self.feature_name(*input)));
+                        ui.horizontal(|ui| { ui.label("穴半径:"); ui.add(egui::DragValue::new(hole_radius).range(0.01..=1000.0).suffix(" mm")); });
+                        ui.horizontal(|ui| { ui.label("皿穴半径:"); ui.add(egui::DragValue::new(sink_radius).range(0.01..=1000.0).suffix(" mm")); });
+                        ui.horizontal(|ui| { ui.label("皿深さ:"); ui.add(egui::DragValue::new(sink_depth).range(0.01..=1000.0).suffix(" mm")); ui.label("全深さ:"); ui.add(egui::DragValue::new(depth).range(0.01..=1000.0).suffix(" mm")); });
                         ui.small("初期版は対象ボディ座標の原点から +Z へ穴を作ります。");
                     }
                 }
@@ -633,6 +642,9 @@ impl FerroCadApp {
             }),
             ToolPanel::Counterbore { input, hole_radius, bore_radius, bore_depth, depth } => self.add_replacing(
                 format!("Counterbore_{n}"), FeatureKind::Counterbore { input, hole_radius: ScalarParam::Literal(hole_radius), bore_radius: ScalarParam::Literal(bore_radius), bore_depth: ScalarParam::Literal(bore_depth), depth: ScalarParam::Literal(depth) }, input, &[input],
+            ),
+            ToolPanel::Countersink { input, hole_radius, sink_radius, sink_depth, depth } => self.add_replacing(
+                format!("Countersink_{n}"), FeatureKind::Countersink { input, hole_radius: ScalarParam::Literal(hole_radius), sink_radius: ScalarParam::Literal(sink_radius), sink_depth: ScalarParam::Literal(sink_depth), depth: ScalarParam::Literal(depth) }, input, &[input],
             ),
         }
     }
