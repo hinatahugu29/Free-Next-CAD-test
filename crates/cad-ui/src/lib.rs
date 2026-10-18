@@ -126,6 +126,7 @@ fn feature_parameter_slots(kind: &FeatureKind) -> Vec<(&'static str, &ScalarPara
         FeatureKind::PushPull { distance, .. } => vec![("移動距離", distance)],
         FeatureKind::SweepCircle { radius, dx, dy, dz } => vec![("半径", radius), ("パス X", dx), ("パス Y", dy), ("パス Z", dz)],
         FeatureKind::Counterbore { hole_radius, bore_radius, bore_depth, depth, .. } => vec![("穴半径", hole_radius), ("座ぐり半径", bore_radius), ("座ぐり深さ", bore_depth), ("全深さ", depth)],
+        FeatureKind::Countersink { hole_radius, sink_radius, sink_depth, depth, .. } => vec![("穴半径", hole_radius), ("皿穴半径", sink_radius), ("皿深さ", sink_depth), ("全深さ", depth)],
         FeatureKind::ExtrudeCircle { radius, depth } => vec![("半径", radius), ("押し出し量", depth)],
         FeatureKind::Transform { dx, dy, dz, rot_angle_deg, .. } => vec![
             ("移動 X", dx),

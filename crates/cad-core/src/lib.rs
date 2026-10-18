@@ -677,6 +677,14 @@ pub enum FeatureKind {
         bore_depth: ScalarParam,
         depth: ScalarParam,
     },
+    /// Countersunk hole cut along +Z from the body's XY origin.
+    Countersink {
+        input: FeatureId,
+        hole_radius: ScalarParam,
+        sink_radius: ScalarParam,
+        sink_depth: ScalarParam,
+        depth: ScalarParam,
+    },
     /// Repeats a feature. With `tool_only` and a sketch Join/Cut input, the input's tool
     /// is repeated on its target (e.g. a ring of holes); otherwise the input's body is
     /// repeated and fused. The choice is stored, not inferred, so re-wiring the input
@@ -824,6 +832,7 @@ impl FeatureKind {
             | Self::Heal { input }
             | Self::PushPull { input, .. }
             | Self::Counterbore { input, .. }
+            | Self::Countersink { input, .. }
             | Self::LinearPattern { input, .. } => vec![*input],
         }
     }
@@ -845,6 +854,7 @@ impl FeatureKind {
             | Self::Heal { input }
             | Self::PushPull { input, .. }
             | Self::Counterbore { input, .. }
+            | Self::Countersink { input, .. }
             | Self::LinearPattern { input, .. }
             | Self::Pattern { input, .. }
             | Self::Shell { input, .. } => swap(input),
@@ -983,6 +993,7 @@ impl FeatureKind {
             | Self::Heal { input }
             | Self::PushPull { input, .. }
             | Self::Counterbore { input, .. }
+            | Self::Countersink { input, .. }
             | Self::LinearPattern { input, .. } => Some(*input),
             Self::Boolean { primary, .. } => Some(*primary),
             Self::SketchExtrude { mode, .. } | Self::SketchRevolve { mode, .. } => mode.target(),
@@ -1087,6 +1098,7 @@ impl FeatureKind {
             Self::Loft { distance, .. } => add(distance),
             Self::SweepCircle { radius, dx, dy, dz } => { add(radius); add(dx); add(dy); add(dz); }
             Self::Counterbore { hole_radius, bore_radius, bore_depth, depth, .. } => { add(hole_radius); add(bore_radius); add(bore_depth); add(depth); }
+            Self::Countersink { hole_radius, sink_radius, sink_depth, depth, .. } => { add(hole_radius); add(sink_radius); add(sink_depth); add(depth); }
             Self::Pattern { layout, .. } => match layout {
                 PatternLayout::Circular { total_angle_deg, .. } => add(total_angle_deg),
                 PatternLayout::Linear { spacing, .. } => add(spacing),
@@ -2382,6 +2394,21 @@ impl Document {
                 let through = store.create_cylinder(Length::mm(hole_radius), Length::mm(depth))?;
                 let bore = store.create_cylinder(Length::mm(bore_radius), Length::mm(bore_depth))?;
                 let tool = store.fuse(through, bore)?;
+                Ok(store.cut(src, tool)?)
+            }
+            FeatureKind::Countersink { input, hole_radius, sink_radius, sink_depth, depth } => {
+                let src = lookup_shape(*input)?;
+                let hole_radius = hole_radius.evaluate(params)?;
+                let sink_radius = sink_radius.evaluate(params)?;
+                let sink_depth = sink_depth.evaluate(params)?;
+                let depth = depth.evaluate(params)?;
+                if sink_radius < hole_radius || sink_depth <= 0.0 || sink_depth > depth {
+                    return Err(CoreError::Geometry(GeometryError::InvalidParameter { name: "Countersink".to_string(), reason: "皿穴径は穴径以上、皿深さは全深さ以下にしてください".to_string() }));
+                }
+                let cone = store.create_cone(Length::mm(sink_radius), Length::mm(hole_radius), Length::mm(sink_depth))?;
+                let shaft = store.create_cylinder(Length::mm(hole_radius), Length::mm(depth - sink_depth))?;
+                let shaft = store.translate(shaft, 0.0, 0.0, sink_depth)?;
+                let tool = store.fuse(cone, shaft)?;
                 Ok(store.cut(src, tool)?)
             }
             FeatureKind::Pattern {
