@@ -794,6 +794,8 @@ pub enum FeatureKind {
     Heal { input: FeatureId },
     /// Removes same-domain splitter lines as a non-destructive history feature.
     Refine { input: FeatureId },
+    /// Converts a single closed shell to a solid after import or sewing.
+    SolidFromShell { input: FeatureId },
     /// Direct planar-face offset, retaining a semantic face reference.
     PushPull { input: FeatureId, face: SemanticReference, distance: ScalarParam },
     LinearPattern {
@@ -863,6 +865,7 @@ impl FeatureKind {
             | Self::Draft { input, .. }
             | Self::Heal { input }
             | Self::Refine { input }
+            | Self::SolidFromShell { input }
             | Self::PushPull { input, .. }
             | Self::Counterbore { input, .. }
             | Self::Countersink { input, .. }
@@ -886,6 +889,7 @@ impl FeatureKind {
             | Self::Draft { input, .. }
             | Self::Heal { input }
             | Self::Refine { input }
+            | Self::SolidFromShell { input }
             | Self::PushPull { input, .. }
             | Self::Counterbore { input, .. }
             | Self::Countersink { input, .. }
@@ -1057,6 +1061,7 @@ impl FeatureKind {
             | Self::Draft { input, .. }
             | Self::Heal { input }
             | Self::Refine { input }
+            | Self::SolidFromShell { input }
             | Self::PushPull { input, .. }
             | Self::Counterbore { input, .. }
             | Self::Countersink { input, .. }
@@ -1150,6 +1155,7 @@ impl FeatureKind {
             Self::Draft { angle_deg, .. } => add(angle_deg),
             Self::Heal { .. } => {}
             Self::Refine { .. } => {}
+            Self::SolidFromShell { .. } => {}
             Self::PushPull { distance, .. } => add(distance),
             Self::LinearPattern {
                 spacing_x,
@@ -2567,6 +2573,7 @@ impl Document {
             }
             FeatureKind::Heal { input } => Ok(store.heal_shape(lookup_shape(*input)?)?),
             FeatureKind::Refine { input } => Ok(store.refine_shape(lookup_shape(*input)?)?),
+            FeatureKind::SolidFromShell { input } => Ok(store.solid_from_shell(lookup_shape(*input)?)?),
             FeatureKind::PushPull { input, face, distance } => {
                 let src = lookup_shape(*input)?;
                 let resolved = face.resolve_face(store, src).map_err(|reason| CoreError::SemanticReferenceLost { feature: *input, reason })?;

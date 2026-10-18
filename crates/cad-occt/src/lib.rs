@@ -176,6 +176,7 @@ mod ffi {
         fn check_shape_valid(handle: &OcctShapeHandle) -> Result<bool>;
         fn heal_shape(handle: &OcctShapeHandle) -> Result<UniquePtr<OcctShapeHandle>>;
         fn refine_shape(handle: &OcctShapeHandle) -> Result<UniquePtr<OcctShapeHandle>>;
+        fn solid_from_shell(handle: &OcctShapeHandle) -> Result<UniquePtr<OcctShapeHandle>>;
         fn get_topology_counts(handle: &OcctShapeHandle) -> Result<RawTopoCounts>;
         fn inspect_faces(handle: &OcctShapeHandle) -> Result<Vec<RawFaceInfo>>;
         fn inspect_edges(handle: &OcctShapeHandle) -> Result<Vec<RawEdgeInfo>>;
@@ -449,6 +450,11 @@ impl OcctShape {
     /// Unifies same-domain faces and edges to remove unnecessary splitter lines.
     pub fn refine(&self) -> Result<Self, OcctError> {
         Self::from_ptr(ffi::refine_shape(self.as_ref()?)?)
+    }
+
+    /// Converts one closed shell into a solid.
+    pub fn solid_from_shell(&self) -> Result<Self, OcctError> {
+        Self::from_ptr(ffi::solid_from_shell(self.as_ref()?)?)
     }
 
     /// Returns counts of solids, faces, edges, and vertices in the shape.

@@ -607,6 +607,13 @@ impl ShapeStore {
         self.insert(OcctShape::loft_profiles(&first_flat, &second_flat, second_z)?)
     }
 
+    /// Converts one closed shell into a solid. This is useful after importing or sewing
+    /// surface data that has no solid topology yet.
+    pub fn solid_from_shell(&mut self, id: ShapeId) -> Result<ShapeId, GeometryError> {
+        let solid = self.get(id)?.solid_from_shell()?;
+        self.insert(solid)
+    }
+
     pub fn revolve_polygon(
         &mut self,
         points_xz: &[[f64; 2]],

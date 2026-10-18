@@ -149,6 +149,7 @@ fn feature_parameter_slots(kind: &FeatureKind) -> Vec<(&'static str, &ScalarPara
         | FeatureKind::Boolean { .. }
         | FeatureKind::Heal { .. }
         | FeatureKind::Refine { .. }
+        | FeatureKind::SolidFromShell { .. }
         | FeatureKind::ImportedBody { .. } => Vec::new(),
     }
 }

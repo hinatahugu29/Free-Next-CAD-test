@@ -29,6 +29,7 @@
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
+#include <BRepBuilderAPI_MakeSolid.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
 
 #include <BRepAlgoAPI_Fuse.hxx>
@@ -786,6 +787,17 @@ std::unique_ptr<OcctShapeHandle> refine_shape(const OcctShapeHandle& handle) {
         TopoDS_Shape refined = unifier.Shape();
         if (refined.IsNull()) throw std::runtime_error("Refine returned an empty shape");
         return std::make_unique<OcctShapeHandle>(refined);
+    } catch (const Standard_Failure& e) { rethrow_occt_exception(e); }
+}
+
+std::unique_ptr<OcctShapeHandle> solid_from_shell(const OcctShapeHandle& handle) {
+    try {
+        TopTools_IndexedMapOfShape shells;
+        TopExp::MapShapes(handle.shape(), TopAbs_SHELL, shells);
+        if (shells.Extent() != 1) throw std::runtime_error("SolidFromShell requires exactly one closed shell");
+        BRepBuilderAPI_MakeSolid maker(TopoDS::Shell(shells(1)));
+        if (!maker.IsDone()) throw std::runtime_error("SolidFromShell failed: the shell may be open or self-intersecting");
+        return std::make_unique<OcctShapeHandle>(maker.Solid());
     } catch (const Standard_Failure& e) { rethrow_occt_exception(e); }
 }
 
