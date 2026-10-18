@@ -124,7 +124,7 @@ fn feature_parameter_slots(kind: &FeatureKind) -> Vec<(&'static str, &ScalarPara
         }
         FeatureKind::Loft { distance, .. } => vec![("断面間距離", distance)],
         FeatureKind::PushPull { distance, .. } => vec![("移動距離", distance)],
-        FeatureKind::SweepCircle { radius, dx, dy, dz } => vec![("半径", radius), ("パス X", dx), ("パス Y", dy), ("パス Z", dz)],
+        FeatureKind::SweepCircle { radius, start_x, start_y, start_z, dx, dy, dz } => vec![("半径", radius), ("開始 X", start_x), ("開始 Y", start_y), ("開始 Z", start_z), ("パス X", dx), ("パス Y", dy), ("パス Z", dz)],
         FeatureKind::Counterbore { center_x, center_y, hole_radius, bore_radius, bore_depth, depth, .. } => vec![("中心 X", center_x), ("中心 Y", center_y), ("穴半径", hole_radius), ("座ぐり半径", bore_radius), ("座ぐり深さ", bore_depth), ("全深さ", depth)],
         FeatureKind::Countersink { center_x, center_y, hole_radius, sink_radius, sink_depth, depth, .. } => vec![("中心 X", center_x), ("中心 Y", center_y), ("穴半径", hole_radius), ("皿穴半径", sink_radius), ("皿深さ", sink_depth), ("全深さ", depth)],
         FeatureKind::ExtrudeCircle { radius, depth } => vec![("半径", radius), ("押し出し量", depth)],
@@ -342,7 +342,7 @@ pub enum ToolPanel {
     Heal { input: FeatureId },
     Loft { lower: FeatureId, upper: Option<FeatureId>, distance: f64 },
     PushPull { input: FeatureId, face: SemanticReference, distance: f64 },
-    SweepCircle { radius: f64, path: [f64; 3] },
+    SweepCircle { radius: f64, start: [f64; 3], path: [f64; 3] },
     Counterbore { input: FeatureId, center: [f64; 2], hole_radius: f64, bore_radius: f64, bore_depth: f64, depth: f64 },
     Countersink { input: FeatureId, center: [f64; 2], hole_radius: f64, sink_radius: f64, sink_depth: f64, depth: f64 },
     Refine { input: FeatureId },

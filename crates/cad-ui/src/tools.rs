@@ -126,7 +126,7 @@ impl FerroCadApp {
                 let Ok(face) = SemanticReference::from_face(fid, &self.store, shape, index) else { return; };
                 ToolPanel::PushPull { input: fid, face, distance: 5.0 }
             }
-            ToolKind::SweepCircle => ToolPanel::SweepCircle { radius: 5.0, path: [0.0, 0.0, 50.0] },
+            ToolKind::SweepCircle => ToolPanel::SweepCircle { radius: 5.0, start: [0.0; 3], path: [0.0, 0.0, 50.0] },
             ToolKind::Counterbore => ToolPanel::Counterbore { input, center: [0.0, 0.0], hole_radius: 3.0, bore_radius: 6.0, bore_depth: 4.0, depth: 20.0 },
             ToolKind::Countersink => ToolPanel::Countersink { input, center: [0.0, 0.0], hole_radius: 3.0, sink_radius: 6.0, sink_depth: 3.0, depth: 20.0 },
             ToolKind::Refine => ToolPanel::Refine { input },
@@ -408,8 +408,9 @@ impl FerroCadApp {
                         ui.horizontal(|ui| { ui.label("距離:"); ui.add(egui::DragValue::new(distance).speed(0.5).suffix(" mm")); });
                         ui.small("プラスは法線方向へ追加、マイナスは引き込みます。平面面のみ対応です。");
                     }
-                    ToolPanel::SweepCircle { radius, path } => {
+                    ToolPanel::SweepCircle { radius, start, path } => {
                         ui.horizontal(|ui| { ui.label("半径:"); ui.add(egui::DragValue::new(radius).range(0.01..=10000.0).suffix(" mm")); });
+                        ui.horizontal(|ui| { ui.label("開始 XYZ:"); for value in start { ui.add(egui::DragValue::new(value).speed(0.5).suffix(" mm")); } });
                         ui.horizontal(|ui| {
                             ui.label("パス XYZ:");
                             for value in path { ui.add(egui::DragValue::new(value).speed(0.5).suffix(" mm")); }
@@ -698,9 +699,9 @@ impl FerroCadApp {
             ToolPanel::PushPull { input, face, distance } => self.add_replacing(
                 format!("PushPull_{n}"), FeatureKind::PushPull { input, face, distance: ScalarParam::Literal(distance) }, input, &[input],
             ),
-            ToolPanel::SweepCircle { radius, path } => self.execute_cmd(CadCommand::AddFeature {
+            ToolPanel::SweepCircle { radius, start, path } => self.execute_cmd(CadCommand::AddFeature {
                 name: format!("Sweep_{n}"),
-                kind: FeatureKind::SweepCircle { radius: ScalarParam::Literal(radius), dx: ScalarParam::Literal(path[0]), dy: ScalarParam::Literal(path[1]), dz: ScalarParam::Literal(path[2]) },
+                kind: FeatureKind::SweepCircle { radius: ScalarParam::Literal(radius), start_x: ScalarParam::Literal(start[0]), start_y: ScalarParam::Literal(start[1]), start_z: ScalarParam::Literal(start[2]), dx: ScalarParam::Literal(path[0]), dy: ScalarParam::Literal(path[1]), dz: ScalarParam::Literal(path[2]) },
                 visible: true, color_rgba: [0.5, 0.75, 0.9, 1.0],
             }),
             ToolPanel::Counterbore { input, center, hole_radius, bore_radius, bore_depth, depth } => self.add_replacing(

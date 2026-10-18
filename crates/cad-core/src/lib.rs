@@ -685,7 +685,7 @@ pub enum FeatureKind {
         distance: ScalarParam,
     },
     /// Circular profile swept along one straight parametric path.
-    SweepCircle { radius: ScalarParam, dx: ScalarParam, dy: ScalarParam, dz: ScalarParam },
+    SweepCircle { radius: ScalarParam, #[serde(default = "zero_scalar")] start_x: ScalarParam, #[serde(default = "zero_scalar")] start_y: ScalarParam, #[serde(default = "zero_scalar")] start_z: ScalarParam, dx: ScalarParam, dy: ScalarParam, dz: ScalarParam },
     /// Counterbore hole cut along +Z from a parametric XY position.
     Counterbore {
         input: FeatureId,
@@ -1181,7 +1181,7 @@ impl FeatureKind {
             }
             Self::SketchRevolve { angle_deg, .. } => add(angle_deg),
             Self::Loft { distance, .. } => add(distance),
-            Self::SweepCircle { radius, dx, dy, dz } => { add(radius); add(dx); add(dy); add(dz); }
+            Self::SweepCircle { radius, start_x, start_y, start_z, dx, dy, dz } => { add(radius); add(start_x); add(start_y); add(start_z); add(dx); add(dy); add(dz); }
             Self::Counterbore { center_x, center_y, hole_radius, bore_radius, bore_depth, depth, .. } => { add(center_x); add(center_y); add(hole_radius); add(bore_radius); add(bore_depth); add(depth); }
             Self::Countersink { center_x, center_y, hole_radius, sink_radius, sink_depth, depth, .. } => { add(center_x); add(center_y); add(hole_radius); add(sink_radius); add(sink_depth); add(depth); }
             Self::Pattern { layout, .. } => match layout {
@@ -2474,10 +2474,10 @@ impl Document {
                     distance.evaluate(params)?,
                 )?)
             }
-            FeatureKind::SweepCircle { radius, dx, dy, dz } => Ok(store.sweep_circle(
-                Length::mm(radius.evaluate(params)?),
-                DVec3::new(dx.evaluate(params)?, dy.evaluate(params)?, dz.evaluate(params)?),
-            )?),
+            FeatureKind::SweepCircle { radius, start_x, start_y, start_z, dx, dy, dz } => {
+                let shape = store.sweep_circle(Length::mm(radius.evaluate(params)?), DVec3::new(dx.evaluate(params)?, dy.evaluate(params)?, dz.evaluate(params)?))?;
+                Ok(store.translate(shape, start_x.evaluate(params)?, start_y.evaluate(params)?, start_z.evaluate(params)?)?)
+            },
             FeatureKind::Counterbore { input, center_x, center_y, hole_radius, bore_radius, bore_depth, depth } => {
                 let src = lookup_shape(*input)?;
                 let center_x = center_x.evaluate(params)?;
