@@ -567,4 +567,11 @@ mod tests {
         assert!(healed.is_valid().expect("healed validity"));
         assert!((healed.volume().expect("healed volume") - 5184.0).abs() < 1e-3);
     }
+
+    #[test]
+    fn straight_circular_sweep_makes_a_valid_solid() {
+        let sweep = OcctShape::sweep_circle(4.0, [30.0, 0.0, 40.0]).expect("sweep");
+        assert!(sweep.is_valid().expect("sweep valid"));
+        assert!(sweep.volume().expect("sweep volume") > 0.0);
+    }
 }
