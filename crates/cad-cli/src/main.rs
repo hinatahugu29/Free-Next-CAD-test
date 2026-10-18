@@ -31,6 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match subcmd {
         "phase0-box" => run_phase0_box(&output_dir)?,
         "demo-plate" => run_milestone_m1_demo(&output_dir)?,
+        "demo-m2" => run_m2_demo(&output_dir)?,
         "verify-all" => {
             run_phase0_box(&output_dir)?;
             println!();
@@ -38,7 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         other => {
             eprintln!(
-                "Unknown command '{other}'. Available commands: phase0-box, demo-plate, verify-all"
+                "Unknown command '{other}'. Available commands: phase0-box, demo-plate, demo-m2, verify-all"
             );
             std::process::exit(1);
         }
@@ -81,6 +82,83 @@ fn run_phase0_box(output_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         "無効寸法でErrが返るべきです"
     );
     println!("5. C++例外境界テスト成功: 無効寸法時にプロセス終了せず安全にErrへ変換");
+    Ok(())
+}
+
+/// M2: sketch a circle on a plate's top face, cut a blind hole, then resize the plate
+/// and confirm the hole follows the moved top face. Renders both states to PNG.
+fn run_m2_demo(output_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    use cad_core::{ExtrudeMode, FeatureKind, ScalarParam, SemanticReference, Sketch, SketchPlane};
+
+    println!("=== [M2] 面の上にスケッチ → 切り取り → 寸法変更への追従 ===");
+    let tess = TessellationOptions::default();
+    let mut store = ShapeStore::new();
+    let mut doc = Document::new("M2 Demo");
+    let plate_kind = |w: f64, h: f64, d: f64| FeatureKind::Box {
+        width: ScalarParam::mm(w),
+        height: ScalarParam::mm(h),
+        depth: ScalarParam::mm(d),
+    };
+    let plate = doc.add_feature("Plate", plate_kind(100.0, 60.0, 10.0), false, [0.55, 0.72, 0.9, 1.0])?;
+    doc.recompute(&mut store, tess)?;
+
+    let plate_shape = doc.features[&plate].cached_shape.ok_or("plate shape")?;
+    let top = store.resolve_face_by_signature(plate_shape, glam::DVec3::Z, None, 0.99)?;
+    let face = SemanticReference::from_face(plate, &store, plate_shape, top.index)
+        .map_err(|e| format!("{e:?}"))?;
+
+    let mut sketch = Sketch::new("Hole");
+    let c = sketch.add_point(30.0, 20.0);
+    sketch.add_circle(c, 8.0);
+    let cut = doc.add_feature(
+        "HoleCut",
+        FeatureKind::SketchExtrude {
+            sketch,
+            depth: ScalarParam::mm(6.0),
+            plane: SketchPlane::Face { feature: plate, face },
+            mode: ExtrudeMode::Cut { target: plate },
+            reversed: true,
+            symmetric: false,
+        },
+        true,
+        [0.55, 0.72, 0.9, 1.0],
+    )?;
+    let report = doc.recompute(&mut store, tess)?;
+    assert!(report.is_all_clean(), "{:?}", report.failed_features);
+    println!(
+        "1. 上面に深さ6mmの穴: 体積 {:.2} mm³",
+        doc.features[&cut].cached_summary.ok_or("summary")?.volume_mm3
+    );
+
+    let renderer = CadRenderer::new_headless()?;
+    let render = |doc: &Document, name: &str| -> Result<(), Box<dyn std::error::Error>> {
+        let mut camera = Camera::default();
+        if let Some(bbox) = doc.visible_bounding_box() {
+            camera.fit_bounding_box(&bbox);
+        }
+        camera.set_standard_view(StandardView::Isometric);
+        let cfg = ViewportRenderConfig {
+            display_mode: DisplayMode::ShadedWithEdges,
+            show_grid: true,
+            selected_feature: None,
+            selected_face: None,
+            selected_edge: None,
+        };
+        let path = output_dir.join(name);
+        renderer.render_to_png(doc, &camera, &cfg, 960, 600, &path)?;
+        println!("   画像: {}", path.display());
+        Ok(())
+    };
+    render(&doc, "m2_hole_initial.png")?;
+
+    doc.update_feature(plate, None, Some(plate_kind(150.0, 80.0, 20.0)), None, None)?;
+    let report = doc.recompute(&mut store, tess)?;
+    assert!(report.is_all_clean(), "{:?}", report.failed_features);
+    println!(
+        "2. プレートを150×80×20mmに変更後: 体積 {:.2} mm³（穴は上面から6mmのまま）",
+        doc.features[&cut].cached_summary.ok_or("summary")?.volume_mm3
+    );
+    render(&doc, "m2_hole_resized.png")?;
     Ok(())
 }
 

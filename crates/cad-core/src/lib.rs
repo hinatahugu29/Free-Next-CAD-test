@@ -11,7 +11,7 @@ use cad_geometry::{
     Angle, BoundingBox, GeometryError, Length, ShapeId, ShapeStore, ShapeSummary,
     TessellationOptions, TriMesh,
 };
-use glam::DVec3;
+use glam::{DMat3, DQuat, DVec3};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -163,6 +163,120 @@ pub enum BooleanOp {
     Common,
 }
 
+/// The plane a sketch is drawn on.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub enum SketchPlane {
+    #[default]
+    XY,
+    XZ,
+    YZ,
+    /// A face of another feature's shape, held as a semantic reference so the plane
+    /// follows that face when upstream dimensions change.
+    Face {
+        feature: FeatureId,
+        face: SemanticReference,
+    },
+}
+
+impl SketchPlane {
+    fn feature(&self) -> Option<FeatureId> {
+        match self {
+            Self::Face { feature, .. } => Some(*feature),
+            _ => None,
+        }
+    }
+}
+
+/// A 2D coordinate frame in 3D space for a sketch plane.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlaneFrame {
+    pub origin: DVec3,
+    pub x_axis: DVec3,
+    pub y_axis: DVec3,
+    pub normal: DVec3,
+}
+
+impl PlaneFrame {
+    /// Frame for the plane through `point` with `normal`. The origin is the world
+    /// origin projected onto the plane and the X axis is world X projected onto it
+    /// (falling back to world Y), so sketch coordinates on a face parallel to a base
+    /// plane coincide with world coordinates and do not shift when the face's extent
+    /// changes — only when the plane itself moves.
+    pub fn from_point_normal(point: DVec3, normal: DVec3) -> Self {
+        let n = normal.normalize();
+        let origin = n * point.dot(n);
+        let x_axis = (DVec3::X - n * n.x)
+            .try_normalize()
+            .unwrap_or_else(|| (DVec3::Y - n * n.y).normalize());
+        let y_axis = n.cross(x_axis);
+        Self {
+            origin,
+            x_axis,
+            y_axis,
+            normal: n,
+        }
+    }
+
+    pub fn to_local(&self, p: DVec3) -> [f64; 2] {
+        let d = p - self.origin;
+        [d.dot(self.x_axis), d.dot(self.y_axis)]
+    }
+
+    pub fn to_world(&self, x: f64, y: f64) -> DVec3 {
+        self.origin + self.x_axis * x + self.y_axis * y
+    }
+}
+
+/// Moves a shape built in world XY (extruded along +Z) onto `frame`: first shifted by
+/// `z_shift` along Z, then rotated so X/Y/Z map to the frame axes, then translated to
+/// the frame origin. Intermediate shapes are released from the store.
+fn place_on_frame(
+    store: &mut ShapeStore,
+    shape: ShapeId,
+    frame: &PlaneFrame,
+    z_shift: f64,
+) -> Result<ShapeId, CoreError> {
+    let mut current = shape;
+    if z_shift.abs() > 1e-12 {
+        let moved = store.translate(current, 0.0, 0.0, z_shift)?;
+        let _ = store.remove(current);
+        current = moved;
+    }
+    let rotation = DQuat::from_mat3(&DMat3::from_cols(frame.x_axis, frame.y_axis, frame.normal));
+    let (axis, angle) = rotation.to_axis_angle();
+    if angle.abs() > 1e-12 {
+        let rotated = store.rotate(current, DVec3::ZERO, axis, Angle::rad(angle))?;
+        let _ = store.remove(current);
+        current = rotated;
+    }
+    if frame.origin.length_squared() > 1e-24 {
+        let moved = store.translate(current, frame.origin.x, frame.origin.y, frame.origin.z)?;
+        let _ = store.remove(current);
+        current = moved;
+    }
+    Ok(current)
+}
+
+/// How an extruded sketch profile is combined with existing geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ExtrudeMode {
+    #[default]
+    NewBody,
+    /// Fuse the extrusion into `target`.
+    Join { target: FeatureId },
+    /// Subtract the extrusion from `target`.
+    Cut { target: FeatureId },
+}
+
+impl ExtrudeMode {
+    fn target(&self) -> Option<FeatureId> {
+        match self {
+            Self::NewBody => None,
+            Self::Join { target } | Self::Cut { target } => Some(*target),
+        }
+    }
+}
+
 /// Parametric feature definition (Phase 2.2 & Phase 4.2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum FeatureKind {
@@ -190,6 +304,16 @@ pub enum FeatureKind {
     SketchExtrude {
         sketch: Sketch,
         depth: ScalarParam,
+        #[serde(default)]
+        plane: SketchPlane,
+        #[serde(default)]
+        mode: ExtrudeMode,
+        /// Extrude against the plane normal instead of along it.
+        #[serde(default)]
+        reversed: bool,
+        /// Extrude half the depth to each side of the plane (overrides `reversed`).
+        #[serde(default)]
+        symmetric: bool,
     },
     ExtrudeCircle {
         radius: ScalarParam,
@@ -250,9 +374,17 @@ impl FeatureKind {
             | Self::Sphere { .. }
             | Self::Cone { .. }
             | Self::ExtrudePolygon { .. }
-            | Self::SketchExtrude { .. }
             | Self::ExtrudeCircle { .. }
             | Self::RevolvePolygon { .. } => Vec::new(),
+            Self::SketchExtrude { plane, mode, .. } => {
+                let mut deps = Vec::new();
+                for id in [plane.feature(), mode.target()].into_iter().flatten() {
+                    if !deps.contains(&id) {
+                        deps.push(id);
+                    }
+                }
+                deps
+            }
             Self::Boolean {
                 primary, secondary, ..
             } => {
@@ -266,6 +398,20 @@ impl FeatureKind {
             | Self::Fillet { input, .. }
             | Self::Chamfer { input, .. }
             | Self::LinearPattern { input, .. } => vec![*input],
+        }
+    }
+
+    /// The body this feature modifies, if any. A suppressed feature passes this
+    /// input's shape through unchanged, as if the feature were not there.
+    pub fn primary_input(&self) -> Option<FeatureId> {
+        match self {
+            Self::Transform { input, .. }
+            | Self::Fillet { input, .. }
+            | Self::Chamfer { input, .. }
+            | Self::LinearPattern { input, .. } => Some(*input),
+            Self::Boolean { primary, .. } => Some(*primary),
+            Self::SketchExtrude { mode, .. } => mode.target(),
+            _ => None,
         }
     }
 
@@ -380,6 +526,10 @@ pub struct Feature {
     pub visible: bool,
     pub color_rgba: [f32; 4],
     pub extra_dependencies: Vec<FeatureId>,
+    /// Temporarily disabled: the feature passes its primary input through unchanged
+    /// (or produces nothing if it has none) without being deleted.
+    #[serde(default)]
+    pub suppressed: bool,
     #[serde(skip, default = "default_dirty_state")]
     pub state: FeatureState,
     #[serde(skip)]
@@ -440,6 +590,10 @@ pub enum CadCommand {
     },
     RemoveFeature {
         id: FeatureId,
+    },
+    SetSuppressed {
+        id: FeatureId,
+        suppressed: bool,
     },
     AddDependency {
         upstream: FeatureId,
@@ -672,6 +826,7 @@ impl Document {
             visible,
             color_rgba,
             extra_dependencies: Vec::new(),
+            suppressed: false,
             state: FeatureState::Dirty,
             cached_shape: None,
             cached_summary: None,
@@ -789,6 +944,59 @@ impl Document {
             downstream,
         });
         Ok(())
+    }
+
+    /// Suppresses or un-suppresses a feature and marks it and its dependents dirty.
+    pub fn set_suppressed(&mut self, id: FeatureId, suppressed: bool) -> Result<(), CoreError> {
+        let feat = self
+            .features
+            .get_mut(&id)
+            .ok_or(CoreError::FeatureNotFound(id))?;
+        if feat.suppressed == suppressed {
+            return Ok(());
+        }
+        feat.suppressed = suppressed;
+        self.mark_dirty(id);
+        self.revision += 1;
+        self.operation_history
+            .push(CadCommand::SetSuppressed { id, suppressed });
+        Ok(())
+    }
+
+    /// Features that directly depend on `id`.
+    pub fn direct_dependents(&self, id: FeatureId) -> Vec<FeatureId> {
+        self.features
+            .values()
+            .filter(|f| f.id != id && f.all_dependencies().contains(&id))
+            .map(|f| f.id)
+            .collect()
+    }
+
+    /// Resolves a sketch plane to a coordinate frame against the current geometry.
+    pub fn sketch_plane_frame(
+        &self,
+        plane: &SketchPlane,
+        store: &ShapeStore,
+    ) -> Result<PlaneFrame, CoreError> {
+        match plane {
+            SketchPlane::XY => Ok(PlaneFrame::from_point_normal(DVec3::ZERO, DVec3::Z)),
+            SketchPlane::XZ => Ok(PlaneFrame::from_point_normal(DVec3::ZERO, DVec3::NEG_Y)),
+            SketchPlane::YZ => Ok(PlaneFrame::from_point_normal(DVec3::ZERO, DVec3::X)),
+            SketchPlane::Face { feature, face } => {
+                let shape_id = self
+                    .features
+                    .get(feature)
+                    .and_then(|f| f.cached_shape)
+                    .ok_or(CoreError::FeatureNotFound(*feature))?;
+                let resolved = face.resolve_face(store, shape_id).map_err(|reason| {
+                    CoreError::SemanticReferenceLost {
+                        feature: *feature,
+                        reason,
+                    }
+                })?;
+                Ok(PlaneFrame::from_point_normal(resolved.centroid, resolved.normal))
+            }
+        }
     }
 
     /// Removes a feature if no downstream features depend on it.
@@ -924,6 +1132,10 @@ impl Document {
                             blocked_by = Some(upstream_failed);
                             break;
                         }
+                        _ if dep_feat.suppressed && dep_feat.cached_shape.is_none() => {
+                            blocked_by = Some(dep_id);
+                            break;
+                        }
                         _ => {}
                     }
                 }
@@ -954,8 +1166,28 @@ impl Document {
             // Transition to Computing
             self.features.get_mut(&fid).unwrap().state = FeatureState::Computing;
 
-            // Evaluate feature geometry
-            match self.evaluate_feature_kind(&feat_snapshot.kind, &resolved_params, store) {
+            // Evaluate feature geometry; a suppressed feature passes its input through.
+            let evaluated = if feat_snapshot.suppressed {
+                let Some(input) = feat_snapshot.kind.primary_input() else {
+                    let feat = self.features.get_mut(&fid).unwrap();
+                    if let Some(old_id) = feat.cached_shape.take() {
+                        let _ = store.remove(old_id);
+                    }
+                    feat.cached_mesh = None;
+                    feat.cached_summary = None;
+                    feat.state = FeatureState::Clean;
+                    report.recomputed_features.push(fid);
+                    continue;
+                };
+                self.features
+                    .get(&input)
+                    .and_then(|f| f.cached_shape)
+                    .ok_or(CoreError::FeatureNotFound(input))
+                    .and_then(|sid| Ok(store.clone_shape(sid)?))
+            } else {
+                self.evaluate_feature_kind(&feat_snapshot.kind, &resolved_params, store)
+            };
+            match evaluated {
                 Ok(new_shape_id) => {
                     match store
                         .inspect_shape(new_shape_id)
@@ -1087,7 +1319,14 @@ impl Document {
                 let d = depth.evaluate(params)?;
                 Ok(store.extrude_polygon(&pts, Length::mm(d))?)
             }
-            FeatureKind::SketchExtrude { sketch, depth } => {
+            FeatureKind::SketchExtrude {
+                sketch,
+                depth,
+                plane,
+                mode,
+                reversed,
+                symmetric,
+            } => {
                 let mut solved = sketch.clone();
                 let report = solved.solve(60, 1e-7);
                 if matches!(
@@ -1106,7 +1345,29 @@ impl Document {
                     })
                 })?;
                 let d = depth.evaluate(params)?;
-                Ok(store.extrude_polygon(&pts, Length::mm(d))?)
+                let frame = self.sketch_plane_frame(plane, store)?;
+                let prism = store.extrude_polygon(&pts, Length::mm(d))?;
+                let z_shift = if *symmetric {
+                    -d * 0.5
+                } else if *reversed {
+                    -d
+                } else {
+                    0.0
+                };
+                let tool = place_on_frame(store, prism, &frame, z_shift)?;
+                match mode {
+                    ExtrudeMode::NewBody => Ok(tool),
+                    ExtrudeMode::Join { target } | ExtrudeMode::Cut { target } => {
+                        let base = lookup_shape(*target)?;
+                        let combined = if matches!(mode, ExtrudeMode::Cut { .. }) {
+                            store.cut(base, tool)
+                        } else {
+                            store.fuse(base, tool)
+                        };
+                        let _ = store.remove(tool);
+                        Ok(combined?)
+                    }
+                }
             }
             FeatureKind::ExtrudeCircle { radius, depth } => {
                 let r = radius.evaluate(params)?;
@@ -1422,6 +1683,10 @@ impl DocumentController {
             CadCommand::RemoveFeature { id } => {
                 self.document.remove_feature(id, store)?;
                 Ok(None)
+            }
+            CadCommand::SetSuppressed { id, suppressed } => {
+                self.document.set_suppressed(id, suppressed)?;
+                Ok(Some(id))
             }
             CadCommand::AddDependency {
                 upstream,
@@ -1991,6 +2256,117 @@ mod tests {
         );
     }
 
+    /// M2: a circle sketched on a plate's top face cuts a hole; after the plate is
+    /// resized the sketch plane follows the (moved) top face and the hole keeps its
+    /// position. Also covers suppression pass-through, delete protection, and the
+    /// orientation of a base-plane (XZ) extrusion.
+    #[test]
+    fn m2_sketch_on_face_cut_follows_resize() {
+        let tess = TessellationOptions::default();
+        let mut store = ShapeStore::new();
+        let mut doc = Document::new("M2");
+
+        let box_kind = |w: f64, h: f64, d: f64| FeatureKind::Box {
+            width: ScalarParam::mm(w),
+            height: ScalarParam::mm(h),
+            depth: ScalarParam::mm(d),
+        };
+        let plate = doc
+            .add_feature("Plate", box_kind(100.0, 60.0, 10.0), true, [1.0; 4])
+            .unwrap();
+        doc.recompute(&mut store, tess).unwrap();
+
+        let plate_shape = doc.features[&plate].cached_shape.unwrap();
+        let top = store
+            .resolve_face_by_signature(plate_shape, DVec3::Z, None, 0.99)
+            .unwrap();
+        let top_ref = SemanticReference::from_face(plate, &store, plate_shape, top.index).unwrap();
+
+        let mut circle = Sketch::new("Hole");
+        let c = circle.add_point(30.0, 20.0);
+        circle.add_circle(c, 5.0);
+        let cut = doc
+            .add_feature(
+                "HoleCut",
+                FeatureKind::SketchExtrude {
+                    sketch: circle,
+                    depth: ScalarParam::mm(10.0),
+                    plane: SketchPlane::Face {
+                        feature: plate,
+                        face: top_ref,
+                    },
+                    mode: ExtrudeMode::Cut { target: plate },
+                    reversed: true,
+                    symmetric: false,
+                },
+                true,
+                [1.0; 4],
+            )
+            .unwrap();
+        let report = doc.recompute(&mut store, tess).unwrap();
+        assert!(report.is_all_clean(), "{:?}", report.failed_features);
+
+        // The profile is a 32-gon approximation of the circle.
+        let hole_area = 0.5 * 32.0 * 25.0 * (2.0 * std::f64::consts::PI / 32.0).sin();
+        let vol = doc.features[&cut].cached_summary.unwrap().volume_mm3;
+        assert!((vol - (60_000.0 - hole_area * 10.0)).abs() < 1.0, "vol={vol}");
+
+        // Thicker, larger plate: the top face moves to z=20. A 10mm blind hole from the
+        // top must now have its floor at z=10, still centred at (30, 20).
+        doc.update_feature(plate, None, Some(box_kind(150.0, 80.0, 20.0)), None, None)
+            .unwrap();
+        let report = doc.recompute(&mut store, tess).unwrap();
+        assert!(report.is_all_clean(), "{:?}", report.failed_features);
+        let vol = doc.features[&cut].cached_summary.unwrap().volume_mm3;
+        assert!((vol - (240_000.0 - hole_area * 10.0)).abs() < 1.0, "vol={vol}");
+        let cut_shape = store
+            .inspect_shape(doc.features[&cut].cached_shape.unwrap())
+            .unwrap();
+        assert!(
+            cut_shape.faces.iter().any(|f| f.normal.z > 0.99
+                && (f.centroid.z - 10.0).abs() < 1e-3
+                && (f.centroid.x - 30.0).abs() < 0.5
+                && (f.centroid.y - 20.0).abs() < 0.5),
+            "hole floor should sit at z=10 under (30, 20)"
+        );
+
+        // Suppressing the cut passes the plate through unchanged.
+        doc.set_suppressed(cut, true).unwrap();
+        doc.recompute(&mut store, tess).unwrap();
+        let vol = doc.features[&cut].cached_summary.unwrap().volume_mm3;
+        assert!((vol - 240_000.0).abs() < 1e-3);
+        doc.set_suppressed(cut, false).unwrap();
+
+        // The plate cannot be deleted while the cut depends on it.
+        match doc.remove_feature(plate, Some(&mut store)) {
+            Err(CoreError::FeatureInUse { dependents, .. }) => assert_eq!(dependents, vec![cut]),
+            other => panic!("expected FeatureInUse, got {other:?}"),
+        }
+
+        // A rectangle on the XZ plane extrudes along -Y (the plane normal).
+        let mut rect = Sketch::new("Side");
+        rect.add_rectangle(0.0, 0.0, 20.0, 30.0);
+        let side = doc
+            .add_feature(
+                "Side",
+                FeatureKind::SketchExtrude {
+                    sketch: rect,
+                    depth: ScalarParam::mm(5.0),
+                    plane: SketchPlane::XZ,
+                    mode: ExtrudeMode::NewBody,
+                    reversed: false,
+                    symmetric: false,
+                },
+                true,
+                [1.0; 4],
+            )
+            .unwrap();
+        doc.recompute(&mut store, tess).unwrap();
+        let b = doc.features[&side].cached_summary.unwrap().bounds;
+        assert!((b.min.y + 5.0).abs() < 1e-6 && b.max.y.abs() < 1e-6, "{b:?}");
+        assert!((b.max.x - 20.0).abs() < 1e-6 && (b.max.z - 30.0).abs() < 1e-6, "{b:?}");
+    }
+
     #[test]
     fn phase2_dag_incremental_recompute_and_blocked_state() {
         let mut store = ShapeStore::new();
@@ -2147,6 +2523,10 @@ mod tests {
                 FeatureKind::SketchExtrude {
                     sketch,
                     depth: ScalarParam::mm(12.0),
+                    plane: SketchPlane::XY,
+                    mode: ExtrudeMode::NewBody,
+                    reversed: false,
+                    symmetric: false,
                 },
                 true,
                 [0.3, 0.7, 0.9, 1.0],
