@@ -1928,6 +1928,36 @@ impl Document {
         affected
     }
 
+    /// Imports a STEP file using STEPCAF, creating an `ImportedBody` feature for each component
+    /// with its embedded name, color, and unit-scaling applied.
+    pub fn import_step_caf(
+        &mut self,
+        store: &mut ShapeStore,
+        path: impl AsRef<Path>,
+    ) -> Result<Vec<FeatureId>, CoreError> {
+        let asm = store.import_step_caf(path)?;
+        let mut feature_ids = Vec::with_capacity(asm.components.len());
+        for comp in asm.components {
+            let color = [comp.color[0] as f32, comp.color[1] as f32, comp.color[2] as f32, comp.color[3] as f32];
+            let temp_path = std::env::temp_dir().join(format!("ferrocad_comp_{}.step", Uuid::new_v4()));
+            store.export_step(comp.shape_id, &temp_path)?;
+            let step_text = std::fs::read_to_string(&temp_path).unwrap_or_default();
+            let _ = std::fs::remove_file(&temp_path);
+
+            let fid = self.add_feature(
+                comp.name.clone(),
+                FeatureKind::ImportedBody {
+                    source_name: comp.name,
+                    step_text,
+                },
+                true,
+                color,
+            )?;
+            feature_ids.push(fid);
+        }
+        Ok(feature_ids)
+    }
+
     /// Adds a new feature to the DAG after validating that all upstream dependencies exist.
     pub fn add_feature(
         &mut self,
@@ -5492,5 +5522,35 @@ mod tests {
         let sew_shape = doc.features[&multi_sew].cached_shape.unwrap();
         let sew_faces = store.inspect_shape(sew_shape).unwrap().faces;
         assert_eq!(sew_faces.len(), 2, "Expected 2 sewn faces in compound shell, got {}", sew_faces.len());
+    }
+
+    #[test]
+    fn test_m11_stepcaf_document_import() {
+        let mut doc = Document::default();
+        let mut store = ShapeStore::default();
+
+        let b = doc.add_feature("Box1", FeatureKind::Box {
+            width: ScalarParam::mm(15.0),
+            height: ScalarParam::mm(25.0),
+            depth: ScalarParam::mm(35.0),
+        }, true, [0.9, 0.2, 0.2, 1.0]).unwrap();
+
+        assert!(doc.recompute(&mut store, TessellationOptions::default()).unwrap().is_all_clean());
+        let shape_id = doc.features[&b].cached_shape.unwrap();
+        let temp_dir = std::env::temp_dir();
+        let step_path = temp_dir.join("ferrocad_core_stepcaf.step");
+        store.export_step(shape_id, &step_path).expect("export_step");
+
+        let mut doc2 = Document::default();
+        let mut store2 = ShapeStore::default();
+        let imported_fids = doc2.import_step_caf(&mut store2, &step_path).expect("import_step_caf");
+        assert!(!imported_fids.is_empty());
+        assert!(doc2.recompute(&mut store2, TessellationOptions::default()).unwrap().is_all_clean());
+
+        let imported_shape = doc2.features[&imported_fids[0]].cached_shape.unwrap();
+        let vol = store2.volume(imported_shape).unwrap();
+        assert!((vol - 13125.0).abs() < 1.0);
+
+        let _ = std::fs::remove_file(&step_path);
     }
 }

@@ -377,8 +377,22 @@ impl FerroCadApp {
         }
     }
 
-    /// Adds a STEP file as a fixed body (its text is stored in the document).
+    /// Adds a STEP file as a fixed body or multi-component assembly using STEPCAF.
     pub(crate) fn import_step_file(&mut self, path: &Path) -> bool {
+        let label = file_label(path);
+        // Try STEPCAF first to preserve multi-component assembly, embedded names, and colors
+        if let Ok(fids) = self.controller.document.import_step_caf(&mut self.store, path) {
+            if !fids.is_empty() {
+                self.recompute_and_refresh();
+                self.fit_all();
+                self.status_logs.push(format!(
+                    "「{label}」から{}個のコンポーネントを取り込みました（STEPCAF アセンブリ構成・色を適用）",
+                    fids.len()
+                ));
+                return true;
+            }
+        }
+
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
             Err(e) => {
@@ -387,7 +401,6 @@ impl FerroCadApp {
                 return false;
             }
         };
-        let label = file_label(path);
         let before = self.controller.document.features.len();
         self.execute_cmd(CadCommand::AddFeature {
             name: label.trim_end_matches(".step").trim_end_matches(".stp").to_string(),

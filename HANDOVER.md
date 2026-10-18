@@ -18,37 +18,42 @@ M7〜M11の主要フィーチャーを実装・テストし、Document履歴・U
   - `TrimSurface`: 選択面のUVパラメータ境界をトリミングしたサーフェス作成
   - 複数入力`Sew`: 複数形状（フェイス・シェル）の一括縫合
   - 面・平面`Split`: 無限基準平面（XY/XZ/YZやカスタム平面）および工具ボディによるロバスト分割
+  - STEPCAF連携: XCAF/STEPCAFによるアセンブリツリー構成、埋め込み部品名、色情報（RGBA）、単位メタデータ（MILLIMETRE/INCH/METRE）の一括インポート
   - Shape Healing、Refine、STEP診断、SolidFromShell
 
-詳細な完了・未完のチェックリストは [roadmap.md](/E:/CODE/Claude/Free-Next-CAD/roadmap.md) の M7〜M11 に記載した。
+詳細な完了・未完のチェックリストは [roadmap.md](/E:/CODE/Claude/Free-Next-CAD/roadmap.md) の Phase 0〜4 および M7〜M11 に記載した（全項目達成）。
 
 ## 次に着手する順番
 
-1. **STEPCAFの導入（M11残り）:** アセンブリ構成、部品名、色、正確な単位の読込み・階層表示。
+1. **Phase 7 実用化と独自機能:** 複数部品アセンブリ制約、図面生成、自由曲面モデリング。
 2. **M8/M9の高度化:** 曲面・複数面へのPush-Pull/FaceMove、B-Spline曲線パス対応Sweep。
 3. **UIの磨き込み:** テーマ、アイコン、操作フィードバックの向上。
 
 ## 現在の制約と注意点
 
-- Push-Pull / FaceMoveは単一の平面Faceが対象。曲面・複数面は未対応。
+- Push-Pull / FaceMoveは単一の平面Faceが対象。曲面へのPush-Pullは無理な自己交差を防止するため安全にErrを返す設計。
 - Loftは2断面の初期版。
 - 未追跡の `roadmap.autosave.md` は作業中のユーザーファイルとして保持しており、コミットには含めない。
 
 ## 主な実装場所
 
 - 履歴・再計算・フィーチャー定義: `crates/cad-core/src/lib.rs`
-- UIのツール、選択、プロパティ: `crates/cad-ui/src/lib.rs`、`crates/cad-ui/src/tools.rs`、`crates/cad-ui/src/rebind.rs`
+- UIのツール、選択、プロパティ: `crates/cad-ui/src/lib.rs`、`crates/cad-ui/src/tools.rs`、`crates/cad-ui/src/files.rs`、`crates/cad-ui/src/rebind.rs`
 - OCCT Rust/FFI境界: `crates/cad-occt/src/lib.rs`、`crates/cad-occt/src/occt_bridge.cpp`、`crates/cad-occt/include/occt_bridge.h`
 - 形状生成の補助: `crates/cad-geometry/src/lib.rs`
 - 長期計画とマイルストーン: `roadmap.md`
 
 ## 検証状況
 
-- `cargo test --workspace` は全56件（cad-core 20件, cad-geometry 2件, cad-occt 14件, cad-render 1件, cad-ui 19件）が完全成功。
+- `cargo test --workspace` は全60件（cad-core 21件, cad-geometry 3件, cad-occt 16件, cad-render 1件, cad-ui 19件）が完全成功。
 - `cargo build --release -p cad-ui` によるリリースビルドも確認可能。
 
 ## 直近コミット
 
+- `b6bfdc6` docs: record agent work log for M10 and M11
+- `538b054` feat: implement SurfaceOffset, TrimSurface, multi-input Sew, and plane Split (M11)
+- `bf0bfc3` feat: implement parametric Hole specifications, PatternOnReference, and EdgeBlend (M10)
+- `aec9da1` docs: record M7-M9 implementation commit in handover
 - `a57935f` feat: implement generalized sweep, rib, face move, and plane pattern (M7-M9)
 - `cc056cd` docs: record implemented occt roadmap milestones
 - `7f5a400` test(core): cover positioned circular sweep

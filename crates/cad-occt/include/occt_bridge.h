@@ -24,6 +24,8 @@ struct RawFaceInfo;
 struct RawEdgeInfo;
 struct RawAxisInfo;
 struct RawMeshResult;
+struct StepItemResult;
+struct StepAssemblyResult;
 
 std::unique_ptr<OcctShapeHandle> clone_shape(const OcctShapeHandle& handle);
 
@@ -194,6 +196,7 @@ RawAxisInfo inspect_edge_axis(const OcctShapeHandle& handle, uint32_t edge_index
 
 void write_step_file(const OcctShapeHandle& handle, rust::Str file_path);
 std::unique_ptr<OcctShapeHandle> read_step_file(rust::Str file_path);
+StepAssemblyResult read_step_caf(rust::Str file_path);
 
 RawMeshResult tessellate_shape(
     const OcctShapeHandle& handle,

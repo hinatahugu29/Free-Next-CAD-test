@@ -203,6 +203,22 @@ impl BoundingBox {
     }
 }
 
+/// An imported STEP component with its name, ShapeId, and RGBA color.
+#[derive(Debug, Clone)]
+pub struct ImportedStepComponent {
+    pub name: String,
+    pub shape_id: ShapeId,
+    pub color: [f64; 4],
+}
+
+/// An imported assembly result with unit metadata and components.
+#[derive(Debug, Clone)]
+pub struct ImportedStepAssembly {
+    pub unit_name: String,
+    pub unit_scale_to_mm: f64,
+    pub components: Vec<ImportedStepComponent>,
+}
+
 /// Spatial transformation in 3D space (translation + axis-angle rotation + scale).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Transform {
@@ -1033,6 +1049,28 @@ impl ShapeStore {
         self.insert(s)
     }
 
+    /// Imports a STEP file with its assembly hierarchy, names, and colors using STEPCAF.
+    pub fn import_step_caf(
+        &mut self,
+        path: impl AsRef<Path>,
+    ) -> Result<ImportedStepAssembly, GeometryError> {
+        let asm = OcctShape::read_step_caf(path)?;
+        let mut components = Vec::with_capacity(asm.components.len());
+        for c in asm.components {
+            let shape_id = self.insert(c.shape)?;
+            components.push(ImportedStepComponent {
+                name: c.name,
+                shape_id,
+                color: c.color,
+            });
+        }
+        Ok(ImportedStepAssembly {
+            unit_name: asm.unit_name,
+            unit_scale_to_mm: asm.unit_scale_to_mm,
+            components,
+        })
+    }
+
     /// Generates a [`TriMesh`] from `id` for 3D viewport rendering and picking.
     pub fn tessellate(
         &self,
@@ -1128,5 +1166,22 @@ mod tests {
             .expect("resolve +Z face");
         assert!((top_face.area_mm2 - 6000.0).abs() < 1e-2);
         assert!((top_face.centroid.z - 10.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn test_import_step_caf_assembly() {
+        let mut store = ShapeStore::new();
+        let box_id = store.create_box(Length::mm(20.0), Length::mm(30.0), Length::mm(40.0)).expect("box");
+        let temp_dir = std::env::temp_dir();
+        let step_path = temp_dir.join("ferrocad_geom_test_caf.step");
+        store.export_step(box_id, &step_path).expect("export_step");
+
+        let asm = store.import_step_caf(&step_path).expect("import_step_caf");
+        assert!(!asm.components.is_empty());
+        assert!(!asm.components[0].name.is_empty());
+        let vol = store.volume(asm.components[0].shape_id).expect("volume");
+        assert!((vol - 24000.0).abs() < 1e-2);
+
+        let _ = std::fs::remove_file(&step_path);
     }
 }

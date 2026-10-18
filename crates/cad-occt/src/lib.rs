@@ -72,6 +72,21 @@ mod ffi {
         pub edge_segment_ids: Vec<u32>,
     }
 
+    pub struct StepItemResult {
+        pub name: String,
+        pub shape: UniquePtr<OcctShapeHandle>,
+        pub r: f64,
+        pub g: f64,
+        pub b: f64,
+        pub a: f64,
+    }
+
+    pub struct StepAssemblyResult {
+        pub unit_name: String,
+        pub unit_scale_to_mm: f64,
+        pub items: Vec<StepItemResult>,
+    }
+
     unsafe extern "C++" {
         include!("cad-occt/include/occt_bridge.h");
 
@@ -233,6 +248,7 @@ mod ffi {
 
         fn write_step_file(handle: &OcctShapeHandle, file_path: &str) -> Result<()>;
         fn read_step_file(file_path: &str) -> Result<UniquePtr<OcctShapeHandle>>;
+        fn read_step_caf(file_path: &str) -> Result<StepAssemblyResult>;
 
         fn tessellate_shape(
             handle: &OcctShapeHandle,
@@ -242,7 +258,7 @@ mod ffi {
     }
 }
 
-pub use ffi::{RawAxisInfo, RawBBox, RawEdgeInfo, RawFaceInfo, RawMeshResult, RawTopoCounts};
+pub use ffi::{RawAxisInfo, RawBBox, RawEdgeInfo, RawFaceInfo, RawMeshResult, RawTopoCounts, StepAssemblyResult, StepItemResult};
 
 /// Error type returned by OCCT FFI operations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Error)]
@@ -259,6 +275,22 @@ impl From<cxx::Exception> for OcctError {
     fn from(err: cxx::Exception) -> Self {
         Self::KernelException(err.what().to_string())
     }
+}
+
+/// An imported component with its shape, name, and color read from STEPCAF.
+#[derive(Debug)]
+pub struct StepComponent {
+    pub name: String,
+    pub shape: OcctShape,
+    pub color: [f64; 4],
+}
+
+/// An imported assembly with metadata and components read from STEPCAF.
+#[derive(Debug)]
+pub struct StepAssembly {
+    pub unit_name: String,
+    pub unit_scale_to_mm: f64,
+    pub components: Vec<StepComponent>,
 }
 
 /// Safe opaque handle to an OCCT `TopoDS_Shape`.
@@ -632,6 +664,29 @@ impl OcctShape {
         Self::from_ptr(ffi::read_step_file(path_str)?)
     }
 
+    /// Reads assembly structure, names, and colors from a STEP file using XCAF/STEPCAF.
+    pub fn read_step_caf(path: impl AsRef<Path>) -> Result<StepAssembly, OcctError> {
+        let path_ref = path.as_ref();
+        let path_str = path_ref
+            .to_str()
+            .ok_or_else(|| OcctError::InvalidPath(path_ref.display().to_string()))?;
+        let raw = ffi::read_step_caf(path_str)?;
+        let mut components = Vec::with_capacity(raw.items.len());
+        for item in raw.items {
+            let shape = Self::from_ptr(item.shape)?;
+            components.push(StepComponent {
+                name: item.name,
+                shape,
+                color: [item.r, item.g, item.b, item.a],
+            });
+        }
+        Ok(StepAssembly {
+            unit_name: raw.unit_name,
+            unit_scale_to_mm: raw.unit_scale_to_mm,
+            components,
+        })
+    }
+
     /// Tessellates the B-Rep shape into triangles and boundary edges for 3D rendering and picking.
     pub fn tessellate(
         &self,
@@ -860,6 +915,30 @@ mod tests {
         assert!(sewn.is_valid().expect("sewn valid"));
         let sewn_area = sewn.surface_area().expect("sewn area");
         assert!((sewn_area - 900.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn test_step_caf_assembly_structure_and_colors() {
+        let b = OcctShape::make_box(10.0, 20.0, 30.0).expect("box");
+        let temp_dir = std::env::temp_dir();
+        let step_path = temp_dir.join("ferrocad_test_caf.step");
+        b.write_step(&step_path).expect("write_step");
+
+        let res = OcctShape::read_step_caf(&step_path).expect("read_step_caf");
+        assert!(!res.components.is_empty(), "Expected at least 1 item from STEPCAF");
+        assert!(!res.components[0].name.is_empty(), "Expected component name");
+        assert!(res.unit_scale_to_mm > 0.0, "Expected positive unit scale");
+
+        let _ = std::fs::remove_file(&step_path);
+    }
+
+    #[test]
+    fn test_push_pull_rejects_curved_cylindrical_face() {
+        let cyl = OcctShape::make_cylinder(10.0, 20.0).expect("cylinder");
+        let faces = cyl.inspect_faces().expect("inspect_faces");
+        let side = faces.iter().find(|f| f.nz.abs() < 1e-3).expect("cyl side");
+        let res = cyl.push_pull_face(side.index, 2.0);
+        assert!(res.is_err(), "Expected push_pull on curved face to return Err");
     }
 }
 

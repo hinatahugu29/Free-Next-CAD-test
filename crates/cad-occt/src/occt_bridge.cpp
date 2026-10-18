@@ -63,6 +63,17 @@
 
 #include <STEPControl_Writer.hxx>
 #include <STEPControl_Reader.hxx>
+#include <STEPCAFControl_Reader.hxx>
+#include <TDocStd_Document.hxx>
+#include <TDocStd_Application.hxx>
+#include <XCAFApp_Application.hxx>
+#include <XCAFDoc_DocumentTool.hxx>
+#include <XCAFDoc_ShapeTool.hxx>
+#include <XCAFDoc_ColorTool.hxx>
+#include <TDataStd_Name.hxx>
+#include <Quantity_ColorRGBA.hxx>
+#include <TDF_LabelSequence.hxx>
+#include <TDF_ChildIterator.hxx>
 #include <IFSelect_ReturnStatus.hxx>
 
 #include <gp_Pnt.hxx>
@@ -814,6 +825,9 @@ std::unique_ptr<OcctShapeHandle> push_pull_face(
         if (face_index >= static_cast<uint32_t>(faces.Extent())) throw std::out_of_range("Face index out of range");
         TopoDS_Face face = TopoDS::Face(faces(face_index + 1));
         BRepAdaptor_Surface surface(face);
+        if (surface.GetType() != GeomAbs_Plane) {
+            throw std::invalid_argument("Push/Pull is only supported for planar faces");
+        }
         gp_Dir normal = surface.Plane().Axis().Direction();
         if (face.Orientation() == TopAbs_REVERSED) {
             normal.Reverse();
@@ -1369,6 +1383,100 @@ std::unique_ptr<OcctShapeHandle> read_step_file(rust::Str file_path) {
             throw std::runtime_error("STEPControl_Reader produced null shape");
         }
         return std::make_unique<OcctShapeHandle>(shape);
+    } catch (const Standard_Failure& e) {
+        rethrow_occt_exception(e);
+    }
+}
+
+StepAssemblyResult read_step_caf(rust::Str file_path) {
+    std::string path_str(file_path.data(), file_path.size());
+    try {
+        Handle(TDocStd_Application) app = XCAFApp_Application::GetApplication();
+        Handle(TDocStd_Document) doc;
+        app->NewDocument("MDTV-XCAF", doc);
+
+        STEPCAFControl_Reader reader;
+        reader.SetColorMode(Standard_True);
+        reader.SetNameMode(Standard_True);
+        reader.SetLayerMode(Standard_True);
+        reader.SetPropsMode(Standard_True);
+
+        IFSelect_ReturnStatus stat = reader.ReadFile(path_str.c_str());
+        if (stat != IFSelect_RetDone) {
+            throw std::runtime_error("STEPCAFControl_Reader::ReadFile failed: " + path_str);
+        }
+
+        if (!reader.Transfer(doc)) {
+            throw std::runtime_error("STEPCAFControl_Reader::Transfer failed: " + path_str);
+        }
+
+        Handle(XCAFDoc_ShapeTool) shape_tool = XCAFDoc_DocumentTool::ShapeTool(doc->Main());
+        Handle(XCAFDoc_ColorTool) color_tool = XCAFDoc_DocumentTool::ColorTool(doc->Main());
+
+        TDF_LabelSequence free_shapes;
+        shape_tool->GetFreeShapes(free_shapes);
+
+        StepAssemblyResult result;
+        result.unit_name = "MILLIMETRE";
+        result.unit_scale_to_mm = 1.0;
+
+        Standard_Real unit_scale = 1.0;
+        if (XCAFDoc_DocumentTool::GetLengthUnit(doc, unit_scale)) {
+            result.unit_scale_to_mm = unit_scale * 1000.0;
+            if (std::abs(unit_scale - 0.001) < 1e-6) {
+                result.unit_name = "MILLIMETRE";
+                result.unit_scale_to_mm = 1.0;
+            } else if (std::abs(unit_scale - 1.0) < 1e-6) {
+                result.unit_name = "METRE";
+                result.unit_scale_to_mm = 1000.0;
+            } else if (std::abs(unit_scale - 0.0254) < 1e-5) {
+                result.unit_name = "INCH";
+                result.unit_scale_to_mm = 25.4;
+            }
+        }
+
+        for (Standard_Integer i = 1; i <= free_shapes.Length(); ++i) {
+            TDF_Label label = free_shapes.Value(i);
+            TopoDS_Shape shape = shape_tool->GetShape(label);
+            if (shape.IsNull()) continue;
+
+            StepItemResult item;
+            Handle(TDataStd_Name) name_attr;
+            if (label.FindAttribute(TDataStd_Name::GetID(), name_attr)) {
+                TCollection_AsciiString ascii_name(name_attr->Get());
+                item.name = ascii_name.ToCString();
+            } else {
+                item.name = "Component_" + std::to_string(i);
+            }
+
+            Quantity_ColorRGBA color_rgba(0.75f, 0.75f, 0.8f, 1.0f);
+            if (color_tool->GetColor(label, XCAFDoc_ColorGen, color_rgba) ||
+                color_tool->GetColor(label, XCAFDoc_ColorSurf, color_rgba) ||
+                color_tool->GetColor(label, XCAFDoc_ColorCurv, color_rgba)) {
+                item.r = color_rgba.GetRGB().Red();
+                item.g = color_rgba.GetRGB().Green();
+                item.b = color_rgba.GetRGB().Blue();
+                item.a = color_rgba.Alpha();
+            } else {
+                item.r = 0.75; item.g = 0.75; item.b = 0.8; item.a = 1.0;
+            }
+
+            item.shape = std::make_unique<OcctShapeHandle>(shape);
+            result.items.push_back(std::move(item));
+        }
+
+        if (result.items.empty()) {
+            TopoDS_Shape one = reader.Reader().OneShape();
+            if (!one.IsNull()) {
+                StepItemResult item;
+                item.name = "Root";
+                item.shape = std::make_unique<OcctShapeHandle>(one);
+                item.r = 0.75; item.g = 0.75; item.b = 0.8; item.a = 1.0;
+                result.items.push_back(std::move(item));
+            }
+        }
+
+        return result;
     } catch (const Standard_Failure& e) {
         rethrow_occt_exception(e);
     }
