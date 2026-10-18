@@ -74,7 +74,7 @@ impl FerroCadApp {
             },
             ToolKind::Mirror => ToolPanel::Mirror {
                 input,
-                plane: 2,
+                plane: SketchPlane::XY,
                 merge: true,
             },
             ToolKind::Boolean => ToolPanel::Boolean {
@@ -289,10 +289,26 @@ impl FerroCadApp {
                         ui.label(format!("対象: 「{}」", self.feature_name(*input)));
                         ui.horizontal(|ui| {
                             ui.label("鏡の面:");
-                            for (i, (label, _)) in PLANES.iter().enumerate() {
-                                ui.selectable_value(plane, i, *label);
+                            for (label, candidate) in PLANES.iter() {
+                                if ui.selectable_label(*plane == *candidate, *label).clicked() {
+                                    *plane = candidate.clone();
+                                }
+                            }
+                            if let Some((fid, face_index)) = self.render_config.selected_face
+                                && let Some(shape) = self.controller.document.features.get(&fid).and_then(|f| f.cached_shape)
+                                && let Ok(reference) = SemanticReference::from_face(fid, &self.store, shape, face_index)
+                            {
+                                let selected = matches!(plane, SketchPlane::Face { feature, .. } if *feature == fid);
+                                if ui.selectable_label(selected, "選択面").clicked() {
+                                    *plane = SketchPlane::Face { feature: fid, face: reference };
+                                }
                             }
                         });
+                        if matches!(plane, SketchPlane::Face { .. }) {
+                            ui.small("3Dビューで別の平面をクリックしてから「選択面」を押すと、鏡面を変更できます。");
+                        } else {
+                            ui.small("基準平面のほか、3Dビューで選んだ平面の面も鏡面にできます。");
+                        }
                         if self.tool_target(*input).is_some() {
                             ui.small("穴や突起は、反対側にも同じものが作られます");
                         } else {
@@ -575,7 +591,7 @@ impl FerroCadApp {
                     format!("Mirror_{n}"),
                     FeatureKind::Mirror {
                         input,
-                        plane: PLANES[plane].1.clone(),
+                        plane,
                         merge,
                         tool_only: self.tool_target(input).is_some(),
                     },

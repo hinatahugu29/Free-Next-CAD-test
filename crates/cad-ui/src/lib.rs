@@ -301,7 +301,7 @@ pub enum ToolPanel {
     },
     Mirror {
         input: FeatureId,
-        plane: usize,
+        plane: SketchPlane,
         merge: bool,
     },
     Boolean {
@@ -2925,6 +2925,29 @@ mod tests {
         assert!(matches!(app.sketch_plane, SketchPlane::MidFace { .. }));
         let expected_z = (top.centroid.z + bottom.centroid.z) * 0.5;
         assert!((app.sketch_frame.origin.z - expected_z).abs() < 1e-6);
+    }
+
+    #[test]
+    fn m10_mirror_can_use_a_selected_face_as_its_plane() {
+        let mut app = FerroCadApp::new_with_mvp_demo();
+        let plate = FeatureId(5);
+        let shape = app.controller.document.features[&plate].cached_shape.unwrap();
+        let side = app
+            .store
+            .resolve_face_by_signature(shape, glam::DVec3::X, Some(glam::DVec3::new(100.0, 30.0, 5.0)), 0.99)
+            .unwrap();
+        let face = SemanticReference::from_face(plate, &app.store, shape, side.index).unwrap();
+        let before = app.controller.document.features.len();
+        app.confirm_tool(ToolPanel::Mirror {
+            input: plate,
+            plane: SketchPlane::Face { feature: plate, face },
+            merge: true,
+        });
+
+        assert_eq!(app.controller.document.features.len(), before + 1);
+        let mirrored = app.controller.document.features.values().last().unwrap();
+        assert!(matches!(mirrored.kind, FeatureKind::Mirror { plane: SketchPlane::Face { feature, .. }, .. } if feature == plate));
+        assert_eq!(mirrored.kind.reference_slots().len(), 1);
     }
 
     /// Renders the real UI offscreen (egui_kittest + wgpu) to PNGs under
