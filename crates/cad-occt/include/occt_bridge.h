@@ -115,6 +115,13 @@ std::unique_ptr<OcctShapeHandle> chamfer_selected_edges(
     rust::Slice<const uint32_t> edge_indices,
     double distance
 );
+std::unique_ptr<OcctShapeHandle> draft_faces(
+    const OcctShapeHandle& handle,
+    rust::Slice<const uint32_t> face_indices,
+    uint32_t neutral_face_index,
+    double angle_deg,
+    bool reversed
+);
 
 double compute_volume(const OcctShapeHandle& handle);
 double compute_surface_area(const OcctShapeHandle& handle);

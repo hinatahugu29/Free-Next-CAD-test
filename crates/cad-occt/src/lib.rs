@@ -159,6 +159,13 @@ mod ffi {
             edge_indices: &[u32],
             distance: f64,
         ) -> Result<UniquePtr<OcctShapeHandle>>;
+        fn draft_faces(
+            handle: &OcctShapeHandle,
+            face_indices: &[u32],
+            neutral_face_index: u32,
+            angle_deg: f64,
+            reversed: bool,
+        ) -> Result<UniquePtr<OcctShapeHandle>>;
 
         fn compute_volume(handle: &OcctShapeHandle) -> Result<f64>;
         fn compute_surface_area(handle: &OcctShapeHandle) -> Result<f64>;
@@ -378,6 +385,19 @@ impl OcctShape {
             self.as_ref()?,
             edge_indices,
             distance,
+        )?)
+    }
+
+    /// Applies a draft angle to selected faces, keeping `neutral_face_index` fixed.
+    pub fn draft_faces(
+        &self,
+        face_indices: &[u32],
+        neutral_face_index: u32,
+        angle_deg: f64,
+        reversed: bool,
+    ) -> Result<Self, OcctError> {
+        Self::from_ptr(ffi::draft_faces(
+            self.as_ref()?, face_indices, neutral_face_index, angle_deg, reversed,
         )?)
     }
 

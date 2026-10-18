@@ -36,6 +36,7 @@
 #include <BRepAlgoAPI_Common.hxx>
 
 #include <BRepOffsetAPI_MakeThickSolid.hxx>
+#include <BRepOffsetAPI_DraftAngle.hxx>
 #include <TopTools_ListOfShape.hxx>
 #include <BRepFilletAPI_MakeFillet.hxx>
 #include <BRepFilletAPI_MakeChamfer.hxx>
@@ -620,6 +621,41 @@ std::unique_ptr<OcctShapeHandle> chamfer_selected_edges(
     } catch (const Standard_Failure& e) {
         rethrow_occt_exception(e);
     }
+}
+
+std::unique_ptr<OcctShapeHandle> draft_faces(
+    const OcctShapeHandle& handle,
+    rust::Slice<const uint32_t> face_indices,
+    uint32_t neutral_face_index,
+    double angle_deg,
+    bool reversed
+) {
+    if (face_indices.empty()) throw std::invalid_argument("No faces specified for draft");
+    if (!std::isfinite(angle_deg) || std::abs(angle_deg) < 1e-6 || std::abs(angle_deg) >= 89.0)
+        throw std::invalid_argument("Draft angle must be between 0 and 89 degrees");
+    try {
+        TopTools_IndexedMapOfShape faces;
+        TopExp::MapShapes(handle.shape(), TopAbs_FACE, faces);
+        if (neutral_face_index >= static_cast<uint32_t>(faces.Extent()))
+            throw std::out_of_range("Neutral face index out of range for draft");
+        TopoDS_Face neutral = TopoDS::Face(faces(neutral_face_index + 1));
+        BRepAdaptor_Surface neutral_surface(neutral);
+        if (neutral_surface.GetType() != GeomAbs_Plane)
+            throw std::invalid_argument("Draft neutral face must be planar");
+        const gp_Pln neutral_plane = neutral_surface.Plane();
+        BRepOffsetAPI_DraftAngle draft(handle.shape());
+        const double radians = (reversed ? -1.0 : 1.0) * angle_deg * kPi / 180.0;
+        for (uint32_t index : face_indices) {
+            if (index >= static_cast<uint32_t>(faces.Extent()))
+                throw std::out_of_range("Draft face index out of range");
+            TopoDS_Face face = TopoDS::Face(faces(index + 1));
+            if (face.IsSame(neutral)) throw std::invalid_argument("Draft face cannot also be the neutral face");
+            draft.Add(face, gp_Dir(0, 0, 1), radians, neutral_plane);
+        }
+        draft.Build();
+        if (!draft.IsDone()) throw std::runtime_error("BRepOffsetAPI_DraftAngle failed");
+        return std::make_unique<OcctShapeHandle>(draft.Shape());
+    } catch (const Standard_Failure& e) { rethrow_occt_exception(e); }
 }
 
 double compute_volume(const OcctShapeHandle& handle) {

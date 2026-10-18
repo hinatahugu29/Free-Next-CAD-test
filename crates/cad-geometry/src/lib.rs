@@ -748,6 +748,20 @@ impl ShapeStore {
         self.insert(res)
     }
 
+    /// Tilts selected planar faces while keeping another face fixed.
+    pub fn draft_faces(
+        &mut self,
+        id: ShapeId,
+        face_indices: &[u32],
+        neutral_face_index: u32,
+        angle_deg: f64,
+        reversed: bool,
+    ) -> Result<ShapeId, GeometryError> {
+        let s = self.get(id)?;
+        let res = s.draft_faces(face_indices, neutral_face_index, angle_deg, reversed)?;
+        self.insert(res)
+    }
+
     /// Returns the volume in $\text{mm}^3$.
     pub fn volume(&self, id: ShapeId) -> Result<f64, GeometryError> {
         Ok(self.get(id)?.volume()?)
