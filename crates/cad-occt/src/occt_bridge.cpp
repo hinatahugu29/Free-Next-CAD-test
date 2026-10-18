@@ -49,6 +49,7 @@
 #include <BRepBndLib.hxx>
 #include <BRepCheck_Analyzer.hxx>
 #include <ShapeFix_Shape.hxx>
+#include <ShapeUpgrade_UnifySameDomain.hxx>
 
 #include <BRepMesh_IncrementalMesh.hxx>
 #include <BRep_Tool.hxx>
@@ -775,6 +776,16 @@ std::unique_ptr<OcctShapeHandle> heal_shape(const OcctShapeHandle& handle) {
         TopoDS_Shape healed = fixer.Shape();
         if (healed.IsNull()) throw std::runtime_error("Shape healing returned an empty shape");
         return std::make_unique<OcctShapeHandle>(healed);
+    } catch (const Standard_Failure& e) { rethrow_occt_exception(e); }
+}
+
+std::unique_ptr<OcctShapeHandle> refine_shape(const OcctShapeHandle& handle) {
+    try {
+        ShapeUpgrade_UnifySameDomain unifier(handle.shape(), Standard_True, Standard_True, Standard_False);
+        unifier.Build();
+        TopoDS_Shape refined = unifier.Shape();
+        if (refined.IsNull()) throw std::runtime_error("Refine returned an empty shape");
+        return std::make_unique<OcctShapeHandle>(refined);
     } catch (const Standard_Failure& e) { rethrow_occt_exception(e); }
 }
 

@@ -139,6 +139,7 @@ double compute_surface_area(const OcctShapeHandle& handle);
 RawBBox compute_bounding_box(const OcctShapeHandle& handle);
 bool check_shape_valid(const OcctShapeHandle& handle);
 std::unique_ptr<OcctShapeHandle> heal_shape(const OcctShapeHandle& handle);
+std::unique_ptr<OcctShapeHandle> refine_shape(const OcctShapeHandle& handle);
 RawTopoCounts get_topology_counts(const OcctShapeHandle& handle);
 rust::Vec<RawFaceInfo> inspect_faces(const OcctShapeHandle& handle);
 rust::Vec<RawEdgeInfo> inspect_edges(const OcctShapeHandle& handle);

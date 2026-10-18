@@ -175,6 +175,7 @@ mod ffi {
         fn compute_bounding_box(handle: &OcctShapeHandle) -> Result<RawBBox>;
         fn check_shape_valid(handle: &OcctShapeHandle) -> Result<bool>;
         fn heal_shape(handle: &OcctShapeHandle) -> Result<UniquePtr<OcctShapeHandle>>;
+        fn refine_shape(handle: &OcctShapeHandle) -> Result<UniquePtr<OcctShapeHandle>>;
         fn get_topology_counts(handle: &OcctShapeHandle) -> Result<RawTopoCounts>;
         fn inspect_faces(handle: &OcctShapeHandle) -> Result<Vec<RawFaceInfo>>;
         fn inspect_edges(handle: &OcctShapeHandle) -> Result<Vec<RawEdgeInfo>>;
@@ -443,6 +444,11 @@ impl OcctShape {
     /// Applies OCCT Shape Healing and returns the healed copy.
     pub fn heal(&self) -> Result<Self, OcctError> {
         Self::from_ptr(ffi::heal_shape(self.as_ref()?)?)
+    }
+
+    /// Unifies same-domain faces and edges to remove unnecessary splitter lines.
+    pub fn refine(&self) -> Result<Self, OcctError> {
+        Self::from_ptr(ffi::refine_shape(self.as_ref()?)?)
     }
 
     /// Returns counts of solids, faces, edges, and vertices in the shape.
