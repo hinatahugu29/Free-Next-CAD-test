@@ -127,6 +127,7 @@ impl FerroCadApp {
                 ToolPanel::PushPull { input: fid, face, distance: 5.0 }
             }
             ToolKind::SweepCircle => ToolPanel::SweepCircle { radius: 5.0, path: [0.0, 0.0, 50.0] },
+            ToolKind::Counterbore => ToolPanel::Counterbore { input, hole_radius: 3.0, bore_radius: 6.0, bore_depth: 4.0, depth: 20.0 },
         });
     }
 
@@ -160,6 +161,7 @@ impl FerroCadApp {
             ToolPanel::Loft { .. } => "⌁ ロフト",
             ToolPanel::PushPull { .. } => "↕ 面を押出し・引込み",
             ToolPanel::SweepCircle { .. } => "⌒ Sweep（円形・直線）",
+            ToolPanel::Counterbore { .. } => "⊙ 座ぐり穴",
         };
         let mut confirm = false;
         let mut cancel = false;
@@ -376,6 +378,13 @@ impl FerroCadApp {
                             for value in path { ui.add(egui::DragValue::new(value).speed(0.5).suffix(" mm")); }
                         });
                         ui.small("原点の円形断面を、指定した一本の直線パスへ沿って掃引します。");
+                    }
+                    ToolPanel::Counterbore { input, hole_radius, bore_radius, bore_depth, depth } => {
+                        ui.label(format!("対象: 「{}」", self.feature_name(*input)));
+                        ui.horizontal(|ui| { ui.label("穴半径:"); ui.add(egui::DragValue::new(hole_radius).range(0.01..=1000.0).suffix(" mm")); });
+                        ui.horizontal(|ui| { ui.label("座ぐり半径:"); ui.add(egui::DragValue::new(bore_radius).range(0.01..=1000.0).suffix(" mm")); });
+                        ui.horizontal(|ui| { ui.label("座ぐり深さ:"); ui.add(egui::DragValue::new(bore_depth).range(0.01..=1000.0).suffix(" mm")); ui.label("全深さ:"); ui.add(egui::DragValue::new(depth).range(0.01..=1000.0).suffix(" mm")); });
+                        ui.small("初期版は対象ボディ座標の原点から +Z へ穴を作ります。");
                     }
                 }
 
@@ -622,6 +631,9 @@ impl FerroCadApp {
                 kind: FeatureKind::SweepCircle { radius: ScalarParam::Literal(radius), dx: ScalarParam::Literal(path[0]), dy: ScalarParam::Literal(path[1]), dz: ScalarParam::Literal(path[2]) },
                 visible: true, color_rgba: [0.5, 0.75, 0.9, 1.0],
             }),
+            ToolPanel::Counterbore { input, hole_radius, bore_radius, bore_depth, depth } => self.add_replacing(
+                format!("Counterbore_{n}"), FeatureKind::Counterbore { input, hole_radius: ScalarParam::Literal(hole_radius), bore_radius: ScalarParam::Literal(bore_radius), bore_depth: ScalarParam::Literal(bore_depth), depth: ScalarParam::Literal(depth) }, input, &[input],
+            ),
         }
     }
 }
