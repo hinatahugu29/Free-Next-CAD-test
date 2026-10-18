@@ -160,27 +160,46 @@ impl FerroCadApp {
         }
     }
 
-    /// Candidate snap points for the sketch canvas: midpoints of edges belonging to
-    /// every *other* feature's currently cached shape, projected onto the sketch's XY
-    /// plane (Z dropped). Centroids/midpoints are what `cad_geometry::Edge` exposes
-    /// today; true vertex endpoints would need the OCCT FFI bridge to additionally
-    /// report per-vertex positions, which it does not yet do.
-    fn sketch_snap_targets_from_existing_geometry(&self) -> Vec<[f64; 2]> {
-        let mut pts = Vec::new();
+    /// Existing visible geometry projected onto the sketch's XY plane (Z dropped), taken
+    /// from each feature's tessellated B-Rep edge polylines: returns the outline segments
+    /// to draw as a reference underlay, plus snap targets at every edge's true endpoints
+    /// (B-Rep vertices) and midpoints.
+    fn sketch_reference_geometry(&self) -> (Vec<[[f64; 2]; 2]>, Vec<[f64; 2]>) {
+        let mut segments = Vec::new();
+        let mut snaps = Vec::new();
         for feat in self.controller.document.features.values() {
             if !feat.visible {
                 continue;
             }
-            let Some(shape_id) = feat.cached_shape else {
+            let Some(mesh) = feat.cached_mesh.as_ref() else {
                 continue;
             };
-            if let Ok(shape) = self.store.inspect_shape(shape_id) {
-                for edge in &shape.edges {
-                    pts.push([edge.centroid.x, edge.centroid.y]);
+            let mut edges: std::collections::BTreeMap<u32, Vec<[[f64; 2]; 2]>> =
+                std::collections::BTreeMap::new();
+            for (seg, &eid) in mesh.edge_segments.iter().zip(&mesh.edge_segment_ids) {
+                let s = [
+                    [seg[0][0] as f64, seg[0][1] as f64],
+                    [seg[1][0] as f64, seg[1][1] as f64],
+                ];
+                segments.push(s);
+                edges.entry(eid).or_default().push(s);
+            }
+            for segs in edges.values() {
+                let (Some(first), Some(last)) = (segs.first(), segs.last()) else {
+                    continue;
+                };
+                snaps.push(first[0]);
+                snaps.push(last[1]);
+                if let Some(mid) = segs.get(segs.len() / 2) {
+                    snaps.push(if segs.len() % 2 == 0 {
+                        mid[0]
+                    } else {
+                        [(mid[0][0] + mid[1][0]) * 0.5, (mid[0][1] + mid[1][1]) * 0.5]
+                    });
                 }
             }
         }
-        pts
+        (segments, snaps)
     }
 
     pub fn recompute_and_refresh(&mut self) {
@@ -777,6 +796,13 @@ impl FerroCadApp {
             FeatureKind::Chamfer { distance, .. } => {
                 kind_changed |= edit_scalar_param(ui, "面取り距離", distance);
             }
+            FeatureKind::SketchExtrude { depth, .. } | FeatureKind::ExtrudePolygon { depth, .. } => {
+                kind_changed |= edit_scalar_param(ui, "押し出し量", depth);
+            }
+            FeatureKind::ExtrudeCircle { radius, depth } => {
+                kind_changed |= edit_scalar_param(ui, "半径", radius);
+                kind_changed |= edit_scalar_param(ui, "押し出し量", depth);
+            }
             FeatureKind::Boolean {
                 op,
                 primary,
@@ -938,22 +964,24 @@ impl FerroCadApp {
             egui::Stroke::new(1.5_f32, Color32::from_rgb(60, 90, 60)),
         );
 
-        // Snap candidates: the sketch's own vertices (closing the loop exactly), 10mm
-        // grid intersections, and edge midpoints of other already-built features.
+        // Existing geometry is always drawn as a faint top-view outline so the user can
+        // see what they are sketching against; snap targets (edge endpoints and
+        // midpoints) are marked only while snapping is on.
         const SNAP_RADIUS_PX: f32 = 9.0;
+        let (reference_segments, reference_snaps) = self.sketch_reference_geometry();
+        let outline = egui::Stroke::new(1.2_f32, Color32::from_rgb(110, 125, 145));
+        for seg in &reference_segments {
+            painter.line_segment([to_screen(seg[0]), to_screen(seg[1])], outline);
+        }
         let existing_geometry_snaps = if self.sketch_snap_enabled {
-            self.sketch_snap_targets_from_existing_geometry()
+            reference_snaps
         } else {
             Vec::new()
         };
-        if self.sketch_snap_enabled {
-            for p in &existing_geometry_snaps {
-                let s = to_screen(*p);
-                if rect.contains(s) {
-                    let stroke = egui::Stroke::new(1.5_f32, Color32::from_rgb(90, 230, 210));
-                    painter.line_segment([s - Vec2::new(5.0, 0.0), s + Vec2::new(5.0, 0.0)], stroke);
-                    painter.line_segment([s - Vec2::new(0.0, 5.0), s + Vec2::new(0.0, 5.0)], stroke);
-                }
+        for p in &existing_geometry_snaps {
+            let s = to_screen(*p);
+            if rect.contains(s) {
+                painter.circle_stroke(s, 3.0, egui::Stroke::new(1.2_f32, Color32::from_rgb(90, 230, 210)));
             }
         }
 
@@ -1013,7 +1041,7 @@ impl FerroCadApp {
                     ui.label(format!("頂点数: {}  (3点以上で押し出し可能)", self.sketch_points.len()));
                     ui.checkbox(
                         &mut self.sketch_snap_enabled,
-                        "スナップ (自分の頂点 / 10mmグリッド / 他フィーチャーの辺の中点 ✛)",
+                        "スナップ (自分の頂点 / 10mmグリッド / 既存形状の角・辺の中点 ○)",
                     );
 
                     // Inline dimensioning for the most recently drawn segment: typing an
@@ -1328,6 +1356,14 @@ impl FerroCadApp {
                         }
                         FeatureKind::Chamfer { distance, .. } => {
                             kind_changed |= edit_scalar_param(ui, "面取り距離", distance);
+                        }
+                        FeatureKind::SketchExtrude { depth, .. }
+                        | FeatureKind::ExtrudePolygon { depth, .. } => {
+                            kind_changed |= edit_scalar_param(ui, "押し出し量", depth);
+                        }
+                        FeatureKind::ExtrudeCircle { radius, depth } => {
+                            kind_changed |= edit_scalar_param(ui, "半径", radius);
+                            kind_changed |= edit_scalar_param(ui, "押し出し量", depth);
                         }
                         _ => {
                             ui.label("この形状はここでは編集できません。\n右側のプロパティパネルをご利用ください。");
