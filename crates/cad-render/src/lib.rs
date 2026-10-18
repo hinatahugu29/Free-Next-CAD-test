@@ -299,6 +299,19 @@ pub struct ViewportRenderConfig {
     pub selected_feature: Option<FeatureId>,
     pub selected_face: Option<(FeatureId, u32)>,
     pub selected_edge: Option<(FeatureId, u32)>,
+    /// Additional selected faces / edges (multi-selection), highlighted like the above.
+    pub selected_faces: Vec<(FeatureId, u32)>,
+    pub selected_edges: Vec<(FeatureId, u32)>,
+}
+
+impl ViewportRenderConfig {
+    pub fn is_face_selected(&self, face: (FeatureId, u32)) -> bool {
+        self.selected_face == Some(face) || self.selected_faces.contains(&face)
+    }
+
+    pub fn is_edge_selected(&self, edge: (FeatureId, u32)) -> bool {
+        self.selected_edge == Some(edge) || self.selected_edges.contains(&edge)
+    }
 }
 
 #[repr(C)]
@@ -588,7 +601,7 @@ impl CadRenderer {
             if config.display_mode != DisplayMode::Wireframe {
                 for (tri_idx, &[i0, i1, i2]) in mesh.indices.iter().enumerate() {
                     let face_id = mesh.triangle_face_ids.get(tri_idx).copied().unwrap_or(0);
-                    let tri_color = if config.selected_face == Some((feat.id, face_id)) {
+                    let tri_color = if config.is_face_selected((feat.id, face_id)) {
                         [0.98, 0.78, 0.22, 1.0] // Gold highlight for selected Face
                     } else {
                         base_color
@@ -613,7 +626,7 @@ impl CadRenderer {
             if config.display_mode != DisplayMode::Shaded {
                 for (seg_idx, &[a, b]) in mesh.edge_segments.iter().enumerate() {
                     let edge_id = mesh.edge_segment_ids.get(seg_idx).copied().unwrap_or(0);
-                    let edge_color = if config.selected_edge == Some((feat.id, edge_id)) {
+                    let edge_color = if config.is_edge_selected((feat.id, edge_id)) {
                         [1.0, 0.35, 0.12, 1.0] // Bright orange highlight for selected Edge
                     } else if is_feat_selected {
                         [0.88, 0.96, 1.0, 1.0]
@@ -936,6 +949,7 @@ mod tests {
             selected_feature: Some(final_id),
             selected_face: Some((hit.feature_id, hit.face_index)),
             selected_edge: None,
+            ..Default::default()
         };
         let rgba = renderer
             .render_to_rgba(&ctrl.document, &camera, &cfg, 320, 200)

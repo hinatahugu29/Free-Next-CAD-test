@@ -1109,6 +1109,10 @@ pub enum CadCommand {
     RemoveFeature {
         id: FeatureId,
     },
+    /// Removes a feature and everything downstream of it.
+    RemoveFeatureCascade {
+        id: FeatureId,
+    },
     SetSuppressed {
         id: FeatureId,
         suppressed: bool,
@@ -1663,6 +1667,30 @@ impl Document {
         }
     }
 
+    /// Removes a feature together with everything that depends on it (in one step).
+    /// Returns the removed ids, dependents first.
+    pub fn remove_feature_cascade(
+        &mut self,
+        id: FeatureId,
+        mut store: Option<&mut ShapeStore>,
+    ) -> Result<Vec<FeatureId>, CoreError> {
+        if !self.features.contains_key(&id) {
+            return Err(CoreError::FeatureNotFound(id));
+        }
+        // Later timeline entries can only depend on earlier ones, so removing in
+        // reverse timeline order never trips the "still in use" check.
+        let mut doomed = self.downstream_of(id);
+        doomed.reverse();
+        doomed.push(id);
+        for &f in &doomed {
+            self.remove_feature(f, store.as_deref_mut())?;
+            self.operation_history.pop();
+        }
+        self.operation_history
+            .push(CadCommand::RemoveFeatureCascade { id });
+        Ok(doomed)
+    }
+
     /// Removes a feature if no downstream features depend on it.
     pub fn remove_feature(
         &mut self,
@@ -1692,6 +1720,19 @@ impl Document {
         let removed = self.features.remove(&id).unwrap();
         if let (Some(shape_store), Some(shape_id)) = (store, removed.cached_shape) {
             let _ = shape_store.remove(shape_id);
+        }
+        // A body hidden because this feature replaced it on screen (join/cut, fillet,
+        // pattern, ...) becomes the visible result again once nothing else uses it.
+        let mut inputs: Vec<FeatureId> = removed.kind.primary_input().into_iter().collect();
+        if let FeatureKind::Boolean { secondary, .. } = removed.kind {
+            inputs.push(secondary);
+        }
+        for input in inputs {
+            if self.direct_dependents(input).is_empty()
+                && let Some(f) = self.features.get_mut(&input)
+            {
+                f.visible = true;
+            }
         }
         self.revision += 1;
         self.operation_history
@@ -2599,6 +2640,10 @@ impl DocumentController {
             }
             CadCommand::RemoveFeature { id } => {
                 self.document.remove_feature(id, store)?;
+                Ok(None)
+            }
+            CadCommand::RemoveFeatureCascade { id } => {
+                self.document.remove_feature_cascade(id, store)?;
                 Ok(None)
             }
             CadCommand::SetSuppressed { id, suppressed } => {
@@ -3652,6 +3697,22 @@ mod tests {
         let report = doc.recompute(&mut store, tess).unwrap();
         assert!(report.is_all_clean(), "{:?}", report.failed_features);
         assert!(doc.features[&cut].failure.is_none());
+
+        // Deleting the plate takes everything built on it in one go.
+        let mut ctrl = DocumentController::new(doc.clone());
+        let removed = ctrl
+            .document
+            .remove_feature_cascade(plate, Some(&mut store))
+            .unwrap();
+        assert_eq!(removed, vec![mirror, cut, plate]);
+        assert!(ctrl.document.features.is_empty());
+
+        // Deleting a cut that had replaced (hidden) its target shows the target again.
+        let mut doc2 = doc.clone();
+        doc2.features.get_mut(&plate).unwrap().visible = false;
+        doc2.remove_feature(mirror, None).unwrap();
+        doc2.remove_feature(cut, None).unwrap();
+        assert!(doc2.features[&plate].visible, "the plate is the visible result again");
 
         // Order and rollback survive a save/load round trip.
         doc.set_rollback(Some(plate)).unwrap();

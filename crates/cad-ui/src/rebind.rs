@@ -50,7 +50,9 @@ impl FerroCadApp {
         self.floating_editor_pos = None;
         self.render_config.selected_feature = Some(id);
         self.render_config.selected_face = None;
+        self.render_config.selected_faces.clear();
         self.render_config.selected_edge = None;
+        self.render_config.selected_edges.clear();
         self.viewport_dirty = true;
         let what = if slot.is_edge() { "辺" } else { "面" };
         self.status_logs.push(format!(

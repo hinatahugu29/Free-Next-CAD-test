@@ -4,6 +4,7 @@ mod explain;
 mod files;
 mod measure;
 mod rebind;
+mod selection;
 
 pub use files::default_app_dir;
 mod sketch_editor;
@@ -180,6 +181,8 @@ pub struct FerroCadApp {
     pub pending_action: Option<files::PendingAction>,
     pub allow_close: bool,
     pub measure: Option<measure::MeasureState>,
+    /// A delete waiting for confirmation: the feature and everything built on it.
+    pub delete_confirm: Option<(FeatureId, Vec<FeatureId>)>,
     last_title: String,
 }
 
@@ -314,6 +317,7 @@ impl FerroCadApp {
             selected_feature: Some(final_id),
             selected_face: None,
             selected_edge: None,
+            ..Default::default()
         };
 
         Self {
@@ -372,6 +376,7 @@ impl FerroCadApp {
             pending_action: None,
             allow_close: false,
             measure: None,
+            delete_confirm: None,
             last_title: String::new(),
         }
         .mark_saved()
@@ -409,6 +414,7 @@ impl FerroCadApp {
         self.sketch_selection.clear();
         if self.hover_face.take().is_some() {
             self.render_config.selected_face = None;
+            self.render_config.selected_faces.clear();
             self.viewport_dirty = true;
         }
     }
@@ -427,6 +433,7 @@ impl FerroCadApp {
         self.sketch_plane_picking = false;
         self.hover_face = None;
         self.render_config.selected_face = None;
+        self.render_config.selected_faces.clear();
         self.sketch_plane = plane;
         self.sketch_frame = frame;
         self.sketch_target = target;
@@ -597,7 +604,9 @@ impl FerroCadApp {
                 if self.render_config.selected_feature == Some(id) {
                     self.render_config.selected_feature = None;
                     self.render_config.selected_face = None;
+                    self.render_config.selected_faces.clear();
                     self.render_config.selected_edge = None;
+                    self.render_config.selected_edges.clear();
                 }
                 self.status_logs.push(format!("「{name}」を削除しました（Ctrl+Zで元に戻せます）"));
                 self.recompute_and_refresh();
@@ -636,39 +645,68 @@ impl FerroCadApp {
     /// reference so the edge is re-identified (not trusted by raw index) after upstream
     /// edits. Returns false when no edge is selected.
     fn add_edge_modifier_on_selection(&mut self, chamfer: bool) -> bool {
-        let Some((fid, edge_idx)) = self.render_config.selected_edge else {
-            return false;
+        let (fid, edge_indices) = match self.edges_on_one_body() {
+            Ok(sel) => sel,
+            Err(reason) => {
+                self.status_logs.push(reason.to_string());
+                return false;
+            }
         };
         let Some(feat) = self.controller.document.features.get(&fid).cloned() else {
             return false;
         };
-        let semantic_refs = feat
-            .cached_shape
-            .and_then(|sid| SemanticReference::from_edge(fid, &self.store, sid, edge_idx).ok())
-            .map(|r| vec![r])
-            .unwrap_or_default();
+        // One semantic reference per edge, so each can be re-bound on its own later.
+        let semantic_refs: Vec<SemanticReference> = match feat.cached_shape {
+            Some(sid) => edge_indices
+                .iter()
+                .filter_map(|&e| SemanticReference::from_edge(fid, &self.store, sid, e).ok())
+                .collect(),
+            None => Vec::new(),
+        };
+        let semantic_refs = if semantic_refs.len() == edge_indices.len() {
+            semantic_refs
+        } else {
+            Vec::new()
+        };
         let kind = if chamfer {
             FeatureKind::Chamfer {
                 input: fid,
                 distance: ScalarParam::mm(1.0),
-                edge_indices: vec![edge_idx],
+                edge_indices: edge_indices.clone(),
                 semantic_refs,
             }
         } else {
             FeatureKind::Fillet {
                 input: fid,
                 radius: ScalarParam::mm(1.5),
-                edge_indices: vec![edge_idx],
+                edge_indices: edge_indices.clone(),
                 semantic_refs,
             }
         };
         let base = if chamfer { "Chamfer" } else { "Fillet" };
+        let name = if edge_indices.len() == 1 {
+            format!("{base}_Edge{}", edge_indices[0])
+        } else {
+            format!("{base}_{}Edges", edge_indices.len())
+        };
         self.execute_cmd(CadCommand::AddFeature {
-            name: format!("{base}_Edge{edge_idx}"),
+            name,
             kind,
             visible: true,
             color_rgba: feat.color_rgba,
         });
+        // The modified body is what the user now looks at.
+        if let Some(new_id) = self.render_config.selected_feature.filter(|&n| n != fid) {
+            self.execute_cmd(CadCommand::UpdateFeature {
+                id: fid,
+                name: None,
+                kind: None,
+                visible: Some(false),
+                color_rgba: None,
+            });
+            self.render_config.selected_feature = Some(new_id);
+        }
+        self.clear_selection();
         true
     }
 
@@ -693,7 +731,13 @@ impl FerroCadApp {
         });
         ui.separator();
 
-        let edge_selected = self.render_config.selected_edge.is_some();
+        let edge_selection = self.edges_on_one_body();
+        let edge_selected = edge_selection.is_ok();
+        let edge_hint = match &edge_selection {
+            Ok((_, e)) if e.len() == 1 => "選択中の辺に適用します（Shift+クリックで辺を追加）".to_string(),
+            Ok((_, e)) => format!("選択中の{}本の辺にまとめて適用します", e.len()),
+            Err(reason) => reason.to_string(),
+        };
         ui.horizontal(|ui| match self.ribbon_tab {
             RibbonTab::Solid => {
                 ribbon_group(ui, "スケッチ", |ui| {
@@ -751,25 +795,20 @@ impl FerroCadApp {
                     }
                 });
                 ribbon_group(ui, "修正", |ui| {
-                    let hint = if edge_selected {
-                        "選択中の辺に適用"
-                    } else {
-                        "先に3Dビューで辺をクリックして選択してください"
-                    };
-                    if ribbon_button(ui, "⌒", "フィレット", edge_selected, hint) {
+                    if ribbon_button(ui, "⌒", "フィレット", edge_selected, &edge_hint) {
                         self.add_edge_modifier_on_selection(false);
                     }
-                    if ribbon_button(ui, "◣", "面取り", edge_selected, hint) {
+                    if ribbon_button(ui, "◣", "面取り", edge_selected, &edge_hint) {
                         self.add_edge_modifier_on_selection(true);
                     }
-                    let face_selected = self.render_config.selected_face.is_some();
+                    let face_selected = !self.render_config.selected_faces.is_empty();
                     if ribbon_button(
                         ui,
                         "□",
                         "シェル",
                         face_selected,
                         if face_selected {
-                            "選択中の面を開口にして、内側をくり抜きます"
+                            "選択中の面を開口にして、内側をくり抜きます（Shift+クリックで面を追加）"
                         } else {
                             "先に3Dビューで開口にしたい面をクリックしてください"
                         },
@@ -913,6 +952,23 @@ impl FerroCadApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &Context) {
+        let idle = !ctx.wants_keyboard_input()
+            && !self.sketch_mode
+            && !self.sketch_plane_picking
+            && self.rebind.is_none()
+            && self.measure.is_none()
+            && self.tool_panel.is_none()
+            && self.delete_confirm.is_none()
+            && self.pending_action.is_none()
+            && self.floating_editor_pos.is_none();
+        if idle && ctx.input(|i| i.key_pressed(Key::Delete))
+            && let Some(id) = self.render_config.selected_feature
+        {
+            self.request_delete(id);
+        }
+        if idle && ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.clear_selection();
+        }
         if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::S)) {
             self.save_document(None);
         }
@@ -1260,7 +1316,9 @@ impl FerroCadApp {
                                 if resp.clicked() {
                                     self.render_config.selected_feature = Some(feat.id);
                                     self.render_config.selected_face = None;
+                                    self.render_config.selected_faces.clear();
                                     self.render_config.selected_edge = None;
+                                    self.render_config.selected_edges.clear();
                                     self.viewport_dirty = true;
                                 }
                                 if resp.double_clicked() && is_sketch {
@@ -1325,7 +1383,7 @@ impl FerroCadApp {
                 self.rename_target = Some((id, self.feature_name(id)));
             }
             Some(ChipAction::ToggleSuppress(id)) => self.toggle_suppressed(id),
-            Some(ChipAction::Delete(id)) => self.delete_feature(id),
+            Some(ChipAction::Delete(id)) => self.request_delete(id),
             None => {}
         }
 
@@ -1606,27 +1664,45 @@ impl FerroCadApp {
             }
         }
 
-        if let Some((fid, edge_idx)) = self.render_config.selected_edge
-            && fid == feat.id
-        {
+        let edge_count = self.render_config.selected_edges.len();
+        if edge_count > 0 {
             ui.separator();
             ui.colored_label(
                 Color32::from_rgb(255, 110, 50),
-                format!("📏 選択中の辺: Edge #{edge_idx}"),
+                format!(
+                    "📏 選択中の辺: {edge_count}本（合計 {:.2} mm）",
+                    self.selected_edges_length()
+                ),
             );
-            if let Some(sid) = feat.cached_shape
-                && let Ok(shape_info) = self.store.inspect_shape(sid)
-                && let Some(edge) = shape_info.edges.iter().find(|e| e.index == edge_idx)
-            {
-                ui.label(format!("長さ: {:.2} mm", edge.length_mm));
-                ui.label(format!(
-                    "中点: ({:.2}, {:.2}, {:.2})",
-                    edge.centroid.x, edge.centroid.y, edge.centroid.z
-                ));
-                if ui.button("この辺に 1.5mm フィレットを追加").clicked() {
-                    self.add_edge_modifier_on_selection(false);
+            ui.small("Shift+クリックで辺を追加・解除、Escで選択解除");
+            match self.edges_on_one_body() {
+                Ok(_) => {
+                    ui.horizontal(|ui| {
+                        if ui.button(format!("⌒ {edge_count}本にフィレット")).clicked() {
+                            self.add_edge_modifier_on_selection(false);
+                        }
+                        if ui.button(format!("◣ {edge_count}本を面取り")).clicked() {
+                            self.add_edge_modifier_on_selection(true);
+                        }
+                    });
+                }
+                Err(reason) => {
+                    ui.colored_label(Color32::from_rgb(240, 150, 65), reason);
                 }
             }
+        }
+        let face_count = self.render_config.selected_faces.len();
+        if face_count > 1 {
+            ui.small(format!("選択中の面: {face_count}面"));
+        }
+
+        ui.separator();
+        if ui
+            .button("🗑 このフィーチャーを削除 (Delete)")
+            .on_hover_text("使っている後の操作がある場合は、まとめて削除するか確認します")
+            .clicked()
+        {
+            self.request_delete(feat.id);
         }
     }
 
@@ -1782,31 +1858,45 @@ impl FerroCadApp {
             && let Some(pos) = response.interact_pointer_pos()
         {
             let (uv_x, uv_y) = uv(pos);
+            let additive = ctx.input(|i| i.modifiers.shift || i.modifiers.ctrl);
             if let Some(hit) =
                 pick_document(&self.view_document(), &self.camera, uv_x, uv_y, aspect)
             {
-                self.render_config.selected_feature = Some(hit.feature_id);
-                self.render_config.selected_face = Some((hit.feature_id, hit.face_index));
-                self.render_config.selected_edge =
-                    hit.nearest_edge_index.map(|eid| (hit.feature_id, eid));
-                self.status_logs.push(format!(
-                    "「{}」の面を選択しました",
-                    self.controller
-                        .document
-                        .features
-                        .get(&hit.feature_id)
-                        .map(|f| f.name.as_str())
-                        .unwrap_or("形状")
-                ));
+                // The second click of a double-click opens the editor; it must not
+                // toggle the selection back off.
                 if response.double_clicked() {
                     self.floating_editor_pos = Some(pos);
+                } else {
+                    self.select_pick(hit.feature_id, hit.face_index, hit.nearest_edge_index, additive);
                 }
-            } else {
-                self.render_config.selected_face = None;
-                self.render_config.selected_edge = None;
+            } else if !additive {
+                self.clear_selection();
                 self.floating_editor_pos = None;
             }
             self.viewport_dirty = true;
+        }
+
+        // Right-click on a body: select it (unless it is already part of the selection)
+        // and offer the actions that apply to it.
+        if !self.sketch_plane_picking
+            && !self.sketch_mode
+            && self.rebind.is_none()
+            && self.measure.is_none()
+        {
+            if response.secondary_clicked()
+                && let Some(pos) = response.interact_pointer_pos()
+            {
+                let (u, v) = uv(pos);
+                match pick_document(&self.view_document(), &self.camera, u, v, aspect) {
+                    Some(hit) if self.render_config.selected_feature != Some(hit.feature_id) => {
+                        self.select_pick(hit.feature_id, hit.face_index, hit.nearest_edge_index, false);
+                    }
+                    Some(_) => {}
+                    None => self.clear_selection(),
+                }
+                self.viewport_dirty = true;
+            }
+            response.context_menu(|ui| self.render_selection_menu(ui));
         }
 
         self.render_floating_editor(ctx);
@@ -2147,6 +2237,7 @@ impl eframe::App for FerroCadApp {
             self.render_measure_panel(ctx);
         }
         self.render_file_dialogs(ctx);
+        self.render_delete_confirm(ctx);
 
         // Autosave, window title, and asking before closing with unsaved work.
         self.tick_autosave(std::time::Instant::now());
@@ -2455,6 +2546,24 @@ mod tests {
         shoot("m6_unsaved.png", &|app| {
             app.pending_action = Some(files::PendingAction::New);
         });
+        shoot("multi_edges.png", &|app| {
+            let plate = FeatureId(5);
+            let shape = app.controller.document.features[&plate].cached_shape.unwrap();
+            let info = app.store.inspect_shape(shape).unwrap();
+            let top = app.store.resolve_face_by_signature(shape, glam::DVec3::Z, None, 0.99).unwrap();
+            let top_edges: Vec<u32> = info
+                .edges
+                .iter()
+                .filter(|e| (e.centroid.z - 10.0).abs() < 1e-6 && e.length_mm > 50.0)
+                .map(|e| e.index)
+                .collect();
+            for (i, e) in top_edges.iter().enumerate() {
+                app.select_pick(plate, top.index, Some(*e), i > 0);
+            }
+        });
+        shoot("delete_confirm.png", &|app| {
+            app.request_delete(FeatureId(1));
+        });
         shoot("m4_revolve_sketch.png", &|app| {
             app.start_sketch_with(SketchStart::Revolve);
             app.begin_sketch(SketchPlane::XZ, None);
@@ -2675,6 +2784,95 @@ mod tests {
         assert_eq!(app2.recent_files.first(), Some(&saved));
         assert!(app2.recovery_offer.is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Multi-selection: Shift+click toggles edges; a fillet takes all selected edges of
+    /// one body (mixed bodies are refused); deleting a used body asks and then removes
+    /// it with its dependents in one undo step; deleting a fillet shows its body again;
+    /// a shell opens every selected face.
+    #[test]
+    fn multi_select_fillet_and_cascade_delete() {
+        let mut app = FerroCadApp::new_with_mvp_demo();
+        let plate = FeatureId(5);
+        let shape = app.controller.document.features[&plate].cached_shape.unwrap();
+        let info = app.store.inspect_shape(shape).unwrap();
+        let top = app.store.resolve_face_by_signature(shape, glam::DVec3::Z, None, 0.99).unwrap();
+        // The two long top edges of the plate (100 mm, at z = 10).
+        let long_top: Vec<u32> = info
+            .edges
+            .iter()
+            .filter(|e| (e.length_mm - 100.0).abs() < 1e-6 && (e.centroid.z - 10.0).abs() < 1e-6)
+            .map(|e| e.index)
+            .collect();
+        assert_eq!(long_top.len(), 2);
+
+        app.select_pick(plate, top.index, Some(long_top[0]), false);
+        app.select_pick(plate, top.index, Some(long_top[1]), true);
+        assert_eq!(app.render_config.selected_edges.len(), 2);
+        app.select_pick(plate, top.index, Some(long_top[1]), true);
+        assert_eq!(app.render_config.selected_edges.len(), 1, "Shift+click again removes it");
+        app.select_pick(plate, top.index, Some(long_top[1]), true);
+        assert!(app.render_config.is_edge_selected((plate, long_top[0])));
+
+        let plate_vol = app.controller.document.features[&plate].cached_summary.unwrap().volume_mm3;
+        assert!(app.add_edge_modifier_on_selection(false));
+        let fillet = *app.controller.document.features.keys().next_back().unwrap();
+        let f = &app.controller.document.features[&fillet];
+        assert_eq!(f.state, FeatureState::Clean);
+        assert_eq!(f.kind.reference_slots().len(), 2, "one reference per edge");
+        assert!(f.cached_summary.unwrap().volume_mm3 < plate_vol);
+        assert!(!app.controller.document.features[&plate].visible, "the filleted body replaces it");
+        assert!(app.render_config.selected_edges.is_empty());
+
+        // Edges from two different bodies cannot be filleted together.
+        app.add_primitive(
+            "Box",
+            FeatureKind::Box {
+                width: ScalarParam::mm(40.0),
+                height: ScalarParam::mm(30.0),
+                depth: ScalarParam::mm(20.0),
+            },
+            [1.0; 4],
+        );
+        let boxed = *app.controller.document.features.keys().next_back().unwrap();
+        app.select_pick(plate, top.index, Some(long_top[0]), false);
+        app.select_pick(boxed, 0, Some(0), true);
+        assert!(app.edges_on_one_body().unwrap_err().contains("別々のボディ"));
+
+        // Shell the box with two open faces (top and +X side), Shift-selected.
+        let bshape = app.controller.document.features[&boxed].cached_shape.unwrap();
+        let btop = app.store.resolve_face_by_signature(bshape, glam::DVec3::Z, None, 0.99).unwrap();
+        let bside = app.store.resolve_face_by_signature(bshape, glam::DVec3::X, None, 0.99).unwrap();
+        app.select_pick(boxed, btop.index, None, false);
+        app.select_pick(boxed, bside.index, None, true);
+        app.open_tool_panel(ToolKind::Shell);
+        let panel = app.tool_panel.take().unwrap();
+        app.confirm_tool(panel);
+        let shell = *app.controller.document.features.keys().next_back().unwrap();
+        let s = &app.controller.document.features[&shell];
+        assert_eq!(s.state, FeatureState::Clean, "{:?}", s.failure);
+        assert_eq!(s.kind.reference_slots().len(), 2);
+
+        // Deleting the fillet alone: the plate is shown again.
+        app.request_delete(fillet);
+        assert!(app.delete_confirm.is_none());
+        assert!(!app.controller.document.features.contains_key(&fillet));
+        assert!(app.controller.document.features[&plate].visible);
+
+        // Deleting the plate (used by nothing now) vs. a used base: ask, then cascade.
+        let base = FeatureId(1);
+        let before = app.controller.document.features.len();
+        app.request_delete(base);
+        let (id, deps) = app.delete_confirm.clone().expect("asks before deleting dependents");
+        assert_eq!(id, base);
+        assert!(deps.contains(&plate));
+        app.delete_confirm = None;
+        app.delete_with_dependents(base);
+        assert!(!app.controller.document.features.contains_key(&base));
+        assert!(!app.controller.document.features.contains_key(&plate));
+        app.controller.undo(&mut app.store).unwrap();
+        app.recompute_and_refresh();
+        assert_eq!(app.controller.document.features.len(), before, "one Ctrl+Z restores them all");
     }
 
     /// M3 flow: draw a rectangle with a circle inside, constrain it fully with

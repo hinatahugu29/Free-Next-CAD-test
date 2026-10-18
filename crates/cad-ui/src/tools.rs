@@ -23,6 +23,16 @@ impl FerroCadApp {
         }
     }
 
+    /// Selected faces that lie on `body` (the shell's open faces).
+    fn open_faces_on(&self, body: FeatureId) -> Vec<u32> {
+        self.render_config
+            .selected_faces
+            .iter()
+            .filter(|(f, _)| *f == body)
+            .map(|(_, i)| *i)
+            .collect()
+    }
+
     fn bbox_center(&self, id: FeatureId) -> Option<[f64; 3]> {
         let f = self.controller.document.features.get(&id)?;
         let b = f.cached_summary.or(f.last_valid_summary)?.bounds;
@@ -209,13 +219,14 @@ impl FerroCadApp {
                             *input = fid;
                         }
                         ui.label(format!("対象: 「{}」", self.feature_name(*input)));
-                        match self.render_config.selected_face {
-                            Some((fid, idx)) if fid == *input => {
-                                ui.label(format!("開口にする面: 面 #{idx}（3Dビューでクリックして変更できます）"));
-                            }
-                            _ => {
-                                ui.colored_label(Color32::from_rgb(240, 150, 65), "開口にする面を3Dビューでクリックしてください");
-                            }
+                        let open = self.open_faces_on(*input);
+                        if open.is_empty() {
+                            ui.colored_label(Color32::from_rgb(240, 150, 65), "開口にする面を3Dビューでクリックしてください");
+                        } else {
+                            ui.label(format!(
+                                "開口にする面: {}面（Shift+クリックで追加・解除）",
+                                open.len()
+                            ));
                         }
                         ui.horizontal(|ui| {
                             ui.label("壁の厚さ:");
@@ -228,9 +239,7 @@ impl FerroCadApp {
                 ui.separator();
                 let ready = match &panel {
                     ToolPanel::Boolean { b, .. } => b.is_some(),
-                    ToolPanel::Shell { input, .. } => {
-                        matches!(self.render_config.selected_face, Some((fid, _)) if fid == *input)
-                    }
+                    ToolPanel::Shell { input, .. } => !self.open_faces_on(*input).is_empty(),
                     _ => true,
                 };
                 ui.horizontal(|ui| {
@@ -295,7 +304,9 @@ impl FerroCadApp {
         }
         self.render_config.selected_feature = new_feature;
         self.render_config.selected_face = None;
+        self.render_config.selected_faces.clear();
         self.render_config.selected_edge = None;
+        self.render_config.selected_edges.clear();
     }
 
     pub(crate) fn confirm_tool(&mut self, panel: ToolPanel) {
@@ -368,13 +379,15 @@ impl FerroCadApp {
             ),
             ToolPanel::Boolean { b: None, .. } => {}
             ToolPanel::Shell { input, thickness } => {
-                let Some((fid, face_index)) = self.render_config.selected_face else {
+                let Some(shape) = self.controller.document.features.get(&input).and_then(|f| f.cached_shape) else {
                     return;
                 };
-                let Some(shape) = self.controller.document.features.get(&fid).and_then(|f| f.cached_shape) else {
-                    return;
-                };
-                let Ok(face) = SemanticReference::from_face(fid, &self.store, shape, face_index) else {
+                let faces: Option<Vec<SemanticReference>> = self
+                    .open_faces_on(input)
+                    .into_iter()
+                    .map(|idx| SemanticReference::from_face(input, &self.store, shape, idx).ok())
+                    .collect();
+                let Some(faces) = faces.filter(|f| !f.is_empty()) else {
                     self.status_logs.push("選んだ面を基準にできませんでした".to_string());
                     return;
                 };
@@ -383,7 +396,7 @@ impl FerroCadApp {
                     FeatureKind::Shell {
                         input,
                         thickness: ScalarParam::Literal(thickness),
-                        open_faces: vec![face],
+                        open_faces: faces,
                     },
                     input,
                     &[input],

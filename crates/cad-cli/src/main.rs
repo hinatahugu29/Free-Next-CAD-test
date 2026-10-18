@@ -144,6 +144,7 @@ fn run_m2_demo(output_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
             selected_feature: None,
             selected_face: None,
             selected_edge: None,
+            ..Default::default()
         };
         let path = output_dir.join(name);
         renderer.render_to_png(doc, &camera, &cfg, 960, 600, &path)?;
@@ -239,6 +240,7 @@ fn run_milestone_m1_demo(output_dir: &Path) -> Result<(), Box<dyn std::error::Er
         selected_feature: Some(final_id),
         selected_face: Some((hit_info.feature_id, hit_info.face_index)),
         selected_edge: None,
+        ..Default::default()
     };
     let png_path1 = output_dir.join("perforated_plate_m1_iso.png");
     renderer.render_to_png(&ctrl.document, &camera, &render_cfg1, 960, 600, &png_path1)?;
@@ -299,6 +301,7 @@ fn run_milestone_m1_demo(output_dir: &Path) -> Result<(), Box<dyn std::error::Er
         selected_feature: None,
         selected_face: None,
         selected_edge: None,
+        ..Default::default()
     };
     let png_path2 = output_dir.join("perforated_plate_modified_iso.png");
     renderer.render_to_png(&ctrl.document, &camera, &render_cfg2, 960, 600, &png_path2)?;

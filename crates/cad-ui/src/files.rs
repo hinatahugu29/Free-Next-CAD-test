@@ -159,7 +159,9 @@ impl FerroCadApp {
         self.controller = DocumentController::new(doc);
         self.render_config.selected_feature = None;
         self.render_config.selected_face = None;
+        self.render_config.selected_faces.clear();
         self.render_config.selected_edge = None;
+        self.render_config.selected_edges.clear();
         self.tool_panel = None;
         self.rebind = None;
         self.measure = None;

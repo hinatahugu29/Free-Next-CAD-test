@@ -178,6 +178,7 @@ impl FerroCadApp {
         if close || ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.measure = None;
             self.render_config.selected_face = None;
+            self.render_config.selected_faces.clear();
             self.viewport_dirty = true;
         }
     }
